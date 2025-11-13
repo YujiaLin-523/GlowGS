@@ -13,6 +13,7 @@ import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
+import torch.nn.functional as F
 import os
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
@@ -89,8 +90,15 @@ class HybridFeatureEncoder(torch.nn.Module):
             plane_res=config.vm_plane_res,
             out_dim=out_dim,  # VM outputs directly to out_dim
             basis=config.vm_basis,
-            use_checkpoint=config.vm_checkpoint
+            use_checkpoint=config.vm_checkpoint,
+            lpf_enable=config.vm_lpf_enable,
+            lpf_kernel=config.vm_lpf_kernel
         )
+        
+        # [CHECKLIST 6] Enable tri-plane rotation perturbation if configured
+        # This is set at training time via hybrid_config, not here
+        self.vm.rotation_perturb_enable = False
+        self.vm.rotation_perturb_angle = 3.0
         
         # Projection layers to align dimensions
         # Hash needs projection from hash_dim to out_dim
@@ -99,14 +107,31 @@ class HybridFeatureEncoder(torch.nn.Module):
         # VM already outputs out_dim, so identity projection
         self.proj_vm = torch.nn.Identity()
         
-        # Initial hash gain - reduce to give VM more influence
-        # Lower gain allows VM gradients to be more significant
-        self.register_buffer('hash_gain', torch.tensor(0.5))  # Reduced from config value
+        # [NEW] VM auxiliary head for low-frequency proxy loss (created at init to avoid torch.compile issues)
+        self.head_vm = torch.nn.Linear(out_dim, 3, bias=False)
+        torch.nn.init.xavier_uniform_(self.head_vm.weight, gain=0.5)
         
-        # Feature scaling to amplify gradients
-        # Encoder outputs may be too small, causing weak gradients downstream
-        # This learnable scale factor amplifies features before passing to heads
-        self.feature_scale = torch.nn.Parameter(torch.tensor(15.0))  # Start at 15x amplification (increased)
+        # [FIX] Hash gain starts small (warm-up via runtime setter)
+        # [ORIG] self.register_buffer('hash_gain', torch.tensor(0.5))
+        self.register_buffer('hash_gain', torch.tensor(config.init_hash_gain))  # Start at 0.05
+        
+        # [FIX] Fusion floor parameter (beta_min) for convex blend to ensure VM always gets gradients
+        # beta = beta_min + (1 - 2*beta_min) * beta_raw ensures both branches receive gradients
+        self.beta_min = config.beta_min_start  # Will be annealed by trainer
+        
+        # [FIX] Feature scaling kept safe (constant 1.0 or trainable with clamp)
+        # [ORIG] self.feature_scale = torch.nn.Parameter(torch.tensor(15.0))
+        if config.feature_scale_trainable:
+            self.feature_scale = torch.nn.Parameter(torch.tensor(config.feature_scale_init))
+            self.feature_scale_trainable = True
+        else:
+            self.register_buffer('feature_scale', torch.tensor(config.feature_scale_init))
+            self.feature_scale_trainable = False
+        
+        # [FIX] Gate schedule parameters (annealed at runtime)
+        # [ORIG] gate_alpha/tau were static config values
+        self.gate_alpha = config.gate_alpha_start  # Will be updated by trainer
+        self.gate_tau = config.gate_tau_start      # Will be updated by trainer
         
         # Initialize projection weights with smaller gain to prevent instability
         torch.nn.init.xavier_uniform_(self.proj_hash.weight, gain=0.5)
@@ -147,14 +172,39 @@ class HybridFeatureEncoder(torch.nn.Module):
         return torch.clamp(m, lo, hi)
     
     def _scale_to_gate(self, sigma_max: torch.Tensor) -> torch.Tensor:
-        """Wrapper that uses config parameters."""
+        """
+        Wrapper that uses runtime-annealed gate parameters.
+        [FIX] Uses self.gate_alpha/tau (updated by trainer) instead of static config.
+        """
         return self._scale_to_gate_impl(
             sigma_max, 
-            self.config.gate_alpha,
-            self.config.gate_tau,
+            self.gate_alpha,  # Runtime value (annealed)
+            self.gate_tau,    # Runtime value (annealed)
             self.config.gate_kappa,
-            (0.0, 1.0)  # gate_clamp
+            self.config.gate_clamp
         )
+    
+    def set_hash_gain(self, value: float):
+        """
+        Runtime setter for hash_gain (warm-up schedule).
+        [FIX] Allows trainer to gradually increase hash influence from 0.05 → 1.0.
+        """
+        self.hash_gain.fill_(float(value))
+    
+    def set_gate_sched(self, alpha: float, tau: float):
+        """
+        Set gate schedule parameters at runtime (annealing).
+        [FIX] Allows trainer to anneal alpha (3→8) and tau (1→0) over warm-up period.
+        """
+        self.gate_alpha = float(alpha)
+        self.gate_tau = float(tau)
+    
+    def set_beta_min(self, beta_min: float):
+        """
+        Set fusion floor parameter at runtime (annealing).
+        [FIX] Allows trainer to anneal beta_min from 0.10 → 0.05 over warm-up period.
+        """
+        self.beta_min = float(beta_min)
     
     def forward(self, xyz: torch.Tensor, sigma_max: torch.Tensor = None) -> torch.Tensor:
         """
@@ -168,29 +218,75 @@ class HybridFeatureEncoder(torch.nn.Module):
         Returns:
             [N, out_dim] fused features (same shape as original encoder output)
         """
+        # [FIX A-1] Unify the spatial domain to [0,1]^3 for both branches.
+        # This aligns neighborhood semantics and stabilizes gradients.
+        # Coordinate sanitization: handle NaN/Inf and clamp to [0,1]
+        xyz01 = torch.nan_to_num(xyz, nan=0.5, posinf=0.5, neginf=0.5).clamp(0.0, 1.0)
+        
         # Hash branch (existing encoder, unchanged API)
         # tcnn outputs half precision, convert to float for consistency
-        h = self.hash(xyz)              # [N, hash_dim], dtype=half
+        h = self.hash(xyz01)            # [N, hash_dim], dtype=half
         h = h.float()                   # Convert to float32
         h = self.proj_hash(h)           # [N, out_dim]
         
-        # VM branch (new low-frequency path)
-        v = self.vm(xyz)                # [N, out_dim], dtype=float32
+        # VM branch
+        v = self.vm(xyz01)              # [N, out_dim], dtype=float32
         
-        # Compute frequency gate from scale
-        if sigma_max is not None:
-            m_hf = self._scale_to_gate(sigma_max).unsqueeze(-1)  # [N, 1]
+        # [FIX A-1] Ephemeral feature cache for VM aux loss (kept in the graph).
+        # Must be cleared right after loss/backward to avoid graph growth.
+        if self.training:
+            self._vm_feat_for_aux = v  # No detach - need gradients for aux loss
+            self._last_vm_feat = v.detach()    # For debug only
+            self._last_hash_feat = h.detach()  # For debug only
         else:
-            # Default: use balanced gating (0.5) when scale info unavailable
-            m_hf = torch.ones(xyz.shape[0], 1, device=xyz.device) * 0.5
+            # Inference mode: don't cache to save memory
+            self._vm_feat_for_aux = None
+            self._last_vm_feat = None
+            self._last_hash_feat = None
         
-        # Residual fusion: VM base + gated Hash details
-        # VM provides stable low-freq base, Hash adds adaptive high-freq
-        out = v + (self.hash_gain * m_hf) * h
+        # [FIX A-1] Compute frequency gate from scale with numeric safeguards.
+        # Use single-sigmoid mapping from _scale_to_gate to avoid double compression of gradients.
+        if sigma_max is not None:
+            # Sanitize sigma_max to prevent NaN/Inf in log operations
+            sigma_max = torch.nan_to_num(sigma_max, nan=1.0, posinf=1.0, neginf=1.0).clamp(min=1e-6)
+            m_hf = self._scale_to_gate(sigma_max)  # [N], already sigmoid output
+        else:
+            # Default: assume medium-scale Gaussians (neutral gate)
+            m_hf = torch.ones(xyz01.shape[0], device=xyz01.device) * 0.5
         
-        # Amplify features to strengthen gradients
-        # Learnable scale ensures proper gradient magnitude for downstream heads
-        out = out * self.feature_scale
+        # Clamp gate output to valid range
+        m_hf = m_hf.clamp(self.config.gate_clamp[0], self.config.gate_clamp[1])  # [N]
+        
+        # [FIX] Floored convex blend ensures BOTH branches always receive gradients
+        # [ORIG] out = v + (self.hash_gain * m_hf) * h  (residual: VM gradients killed when hash dominates)
+        # Floored convex: beta = beta_min + (1 - 2*beta_min) * beta_raw
+        # This ensures beta ∈ [beta_min, 1-beta_min], guaranteeing VM weight ≥ beta_min
+        beta_raw = (self.hash_gain * m_hf).unsqueeze(-1)  # [N, 1], raw blend weight 0..1
+        beta = self.beta_min + (1.0 - 2.0 * self.beta_min) * beta_raw.clamp(0.0, 1.0)  # [N, 1], floored
+        
+        out = (1.0 - beta) * v + beta * h  # Convex combination
+        
+        # [FIX] Feature scaling kept safe (constant 1.0, trainable removed to prevent instability)
+        # [ORIG] out = out * self.feature_scale (could grow unbounded if trainable)
+        scale = self.feature_scale
+        out = out * scale
+        
+        # [FIX] Final NaN guard before returning
+        out = torch.nan_to_num(out, nan=0.0, posinf=1e4, neginf=-1e4)
+        
+        # ========================================
+        # [DEBUG] Cache intermediate values for gradient diagnostics
+        # These are read-only references, do NOT detach - must stay in computation graph
+        # ========================================
+        try:
+            from arguments import DEBUG_CFG
+            if DEBUG_CFG.ON:
+                self._dbg_vm = v              # [N, out_dim] VM features (in graph)
+                self._dbg_hash = h            # [N, out_dim] Hash features (in graph)
+                self._dbg_beta = beta         # [N, 1] floored blend weight (in graph)
+                self._dbg_gate = m_hf         # [N] gate after sigmoid (in graph)
+        except:
+            pass  # If DEBUG_CFG not imported, silently skip
         
         return out
 
@@ -268,7 +364,7 @@ class GaussianModel:
         self._rotation_init = torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float, device='cuda')
         self._opacity_init = torch.tensor([[np.log(0.1 / (1 - 0.1))]], dtype=torch.float, device='cuda')
 
-    def __init__(self, sh_degree : int, hash_size = 19, width = 64, depth = 2, hybrid_config=None):
+    def __init__(self, sh_degree : int, hash_size = 19, width = 64, depth = 2, hybrid_config=None, aniso_config=None):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0).cuda()
@@ -296,6 +392,7 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.hybrid_config = hybrid_config  # Store for later use
+        self.aniso_config = aniso_config    # [NEW] Store anisotropy constraint config (CHECKLIST 2)
         self.setup_functions()
         self.setup_configs(hash_size, width, depth)
         self.setup_params()
@@ -361,27 +458,80 @@ class GaussianModel:
         # [HYBRID] Conditional encoder call with scale-based gating
         # Use get_contracted_xyz which has detach() to match original behavior
         contracted_xyz = self.get_contracted_xyz
+        N = contracted_xyz.shape[0]
         
-        if self.hybrid_config and self.hybrid_config.hybrid_enable and isinstance(self._grid, HybridFeatureEncoder):
-            # Hybrid mode: pass scale for frequency gating
-            # Use maximum anisotropic scale as frequency proxy
-            # Check if scaling tensors have been initialized AND sizes match current points
-            # (after densify/prune operations, _scaling may be stale while _scaling_base is updated)
-            current_N = contracted_xyz.shape[0]
-            if (self._scaling.numel() > 0 and 
-                self._scaling_base.numel() > 0 and 
-                self._scaling.shape[0] == current_N):
-                # Detach sigma_max to prevent graph reuse error
-                # sigma_max is only used for gating weight computation, not for gradients
-                sigma_max = self.get_scaling.max(dim=-1).values.detach()  # [N]
-                feats = self._grid(contracted_xyz, sigma_max=sigma_max)
-            else:
-                # Fallback: skip sigma_max if sizes mismatch (during densify/prune)
-                # or during initialization phase
-                feats = self._grid(contracted_xyz)
+        # [FIX D] Encoder micro-batching: only when memory is constrained
+        # Only batch if N exceeds BOTH batch_size AND oom_threshold
+        # This allows full-batch training when memory is sufficient
+        micro_batch_size = 0
+        oom_threshold = float('inf')  # Default: never batch
+        
+        if self.hybrid_config and hasattr(self.hybrid_config, 'update_batch_size'):
+            micro_batch_size = self.hybrid_config.update_batch_size
+            if hasattr(self.hybrid_config, 'oom_threshold'):
+                oom_threshold = self.hybrid_config.oom_threshold
+        
+        # Only use micro-batching if both conditions met:
+        # 1. N exceeds OOM threshold (memory constraint)
+        # 2. Batch size is configured (micro_batch_size > 0)
+        use_micro_batch = (micro_batch_size > 0 and N > oom_threshold)
+        
+        if use_micro_batch:
+            # [ACCEPTANCE CHECK D] Log micro-batch usage (first time only to avoid spam)
+            if not hasattr(self, '_logged_microbatch'):
+                print(f"[MICRO-BATCH] Memory-constrained mode activated: N={N} > threshold={oom_threshold}")
+                print(f"[MICRO-BATCH] Using chunked forward: batch_size={micro_batch_size}, "
+                      f"num_batches={(N + micro_batch_size - 1) // micro_batch_size}")
+                self._logged_microbatch = True
+            
+            # Process encoder in chunks to save VRAM
+            feat_list = []
+            num_batches = (N + micro_batch_size - 1) // micro_batch_size
+            
+            for i in range(num_batches):
+                start_idx = i * micro_batch_size
+                end_idx = min((i + 1) * micro_batch_size, N)
+                xyz_chunk = contracted_xyz[start_idx:end_idx]
+                
+                if self.hybrid_config and self.hybrid_config.hybrid_enable and isinstance(self._grid, HybridFeatureEncoder):
+                    # Hybrid mode: pass scale for frequency gating
+                    current_N = contracted_xyz.shape[0]
+                    if (self._scaling.numel() > 0 and 
+                        self._scaling_base.numel() > 0 and 
+                        self._scaling.shape[0] == current_N):
+                        sigma_max_chunk = self.get_scaling[start_idx:end_idx].max(dim=-1).values.detach()
+                        feats_chunk = self._grid(xyz_chunk, sigma_max=sigma_max_chunk)
+                    else:
+                        feats_chunk = self._grid(xyz_chunk)
+                else:
+                    # Original mode: standard encoder call
+                    feats_chunk = self._grid(xyz_chunk)
+                
+                feat_list.append(feats_chunk)
+            
+            feats = torch.cat(feat_list, dim=0)
         else:
-            # Original mode: standard encoder call
-            feats = self._grid(contracted_xyz)
+            # Normal path: process all points at once
+            if self.hybrid_config and self.hybrid_config.hybrid_enable and isinstance(self._grid, HybridFeatureEncoder):
+                # Hybrid mode: pass scale for frequency gating
+                # Use maximum anisotropic scale as frequency proxy
+                # Check if scaling tensors have been initialized AND sizes match current points
+                # (after densify/prune operations, _scaling may be stale while _scaling_base is updated)
+                current_N = contracted_xyz.shape[0]
+                if (self._scaling.numel() > 0 and 
+                    self._scaling_base.numel() > 0 and 
+                    self._scaling.shape[0] == current_N):
+                    # Detach sigma_max to prevent graph reuse error
+                    # sigma_max is only used for gating weight computation, not for gradients
+                    sigma_max = self.get_scaling.max(dim=-1).values.detach()  # [N]
+                    feats = self._grid(contracted_xyz, sigma_max=sigma_max)
+                else:
+                    # Fallback: skip sigma_max if sizes mismatch (during densify/prune)
+                    # or during initialization phase
+                    feats = self._grid(contracted_xyz)
+            else:
+                # Original mode: standard encoder call
+                feats = self._grid(contracted_xyz)
         
         # Rest of attribute updates unchanged
         self._opacity = self._opacity_head(feats).float() + self._opacity_init
@@ -399,6 +549,77 @@ class GaussianModel:
     @property
     def get_scaling(self):
         return self.get_scaling_base * self.scaling_activation(self._scaling)
+    
+    @property
+    def get_scaling_with_aniso_clamp(self):
+        """
+        Get scaled Gaussians with anisotropy hard-clamp applied.
+        
+        Clamps aspect ratio r = max(s)/min(s) to r_max to prevent paint-roller artifacts.
+        Only modifies internal _scaling_raw before activation (no external API change).
+        
+        Returns:
+            [N, 3] scaling with aspect ratio clamped
+        """
+        if not self.aniso_config or not self.aniso_config.aniso_constraint_enable:
+            return self.get_scaling
+        
+        # Get raw scaling (before activation)
+        scaling_raw = self.get_scaling  # [N, 3]
+        
+        # Compute aspect ratio for each Gaussian
+        s_min = scaling_raw.min(dim=-1)[0]  # [N]
+        s_max = scaling_raw.max(dim=-1)[0]  # [N]
+        aspect_ratio = s_max / (s_min.clamp(min=1e-8))  # [N]
+        
+        # Hard clamp: if r > r_max, scale down the max dimensions
+        r_max = self.aniso_config.aniso_r_max
+        scale_factor = torch.ones_like(aspect_ratio)
+        exceed_mask = aspect_ratio > r_max
+        scale_factor[exceed_mask] = (s_max / (aspect_ratio * s_min)).clamp(max=1.0)[exceed_mask]
+        
+        # Apply clamping
+        scaling_clamped = scaling_raw * scale_factor.unsqueeze(-1)
+        return scaling_clamped
+    
+    def compute_aniso_regularizer(self, iteration: int) -> torch.Tensor:
+        """
+        Compute soft regularizer for anisotropy: lambda_aniso * ReLU(r - r_t)^2
+        
+        Anneals from aniso_lambda (5k iter) to 0 (15k iter).
+        
+        Args:
+            iteration: Current training iteration
+        
+        Returns:
+            Scalar loss tensor
+        """
+        if not self.aniso_config or not self.aniso_config.aniso_constraint_enable:
+            return torch.tensor(0.0, device=self.get_scaling.device)
+        
+        scaling = self.get_scaling  # [N, 3]
+        s_min = scaling.min(dim=-1)[0]  # [N]
+        s_max = scaling.max(dim=-1)[0]  # [N]
+        aspect_ratio = s_max / (s_min.clamp(min=1e-8))  # [N]
+        
+        # Anneal regularizer weight from start to end iteration
+        start = self.aniso_config.aniso_lambda_anneal_start
+        end = self.aniso_config.aniso_lambda_anneal_end
+        if iteration < start:
+            lambda_w = 0.0
+        elif iteration > end:
+            lambda_w = 0.0
+        else:
+            # Linear decay: 1.0 at start, 0.0 at end
+            progress = (iteration - start) / (end - start)
+            lambda_w = 1.0 - progress  # Decaying from 1 to 0
+        
+        # Soft penalty: only on aspect ratios exceeding threshold
+        r_t = self.aniso_config.aniso_r_threshold
+        excess = F.relu(aspect_ratio - r_t)  # [N]
+        loss = (excess ** 2).mean()
+        
+        return lambda_w * self.aniso_config.aniso_lambda * loss
     
     @property
     def get_rotation(self):
@@ -441,7 +662,16 @@ class GaussianModel:
             self.active_sh_degree += 1
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
+        """
+        Initialize Gaussians from point cloud (LocoGS original: no downsampling).
+        
+        Args:
+            pcd: Input point cloud with points, colors, normals
+            spatial_lr_scale: Spatial learning rate scale factor
+        """
         self.spatial_lr_scale = spatial_lr_scale
+        
+        # Use full SfM point cloud for healthy densification growth
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
@@ -450,7 +680,7 @@ class GaussianModel:
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        dist2 = torch.clamp_min(distCUDA2(fused_point_cloud), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None]
 
         # explicit attributes
@@ -480,31 +710,44 @@ class GaussianModel:
         param_groups_i = []
         
         if self.hybrid_config and self.hybrid_config.hybrid_enable and isinstance(self._grid, HybridFeatureEncoder):
-            # Hybrid mode: separate param groups for Hash and VM branches
-            # Hash branch (wrapped inside hybrid encoder)
+            # [FIX] Hybrid mode: use optimizer param groups with higher LR for VM, no weight decay
+            # [ORIG] Manual grad scaling removed; optimizer handles VM learning rate boost
+            
+            # Hash branch (wrapped inside hybrid encoder) - base learning rate
             param_groups_i.append({
                 'params': self._grid.hash.parameters(), 
                 'lr': 0.0, 
+                'weight_decay': 0.0,
                 "name": "grid"
             })
-            # VM encoder (planes + MLP)
+            
+            # VM encoder: unified param group with boosted LR and no weight decay
+            # VM planes have inherently weak gradients -> need higher LR multiplier
+            vm_params = [self._grid.vm.xy, self._grid.vm.xz, self._grid.vm.yz]
+            vm_params.extend(self._grid.vm.mlp.parameters())
             param_groups_i.append({
-                'params': self._grid.vm.parameters(), 
-                'lr': 0.0, 
-                "name": "vm"
+                'params': vm_params, 
+                'lr': 0.0,  # Will be set to base_lr * vm_lr_multiplier in update_learning_rate
+                'weight_decay': 0.0,  # No weight decay preserves VM capacity
+                "name": "vm_encoder"
             })
-            # Projection layers
+            
+            # Projection layers - base learning rate
             param_groups_i.append({
                 'params': self._grid.proj_hash.parameters(), 
                 'lr': 0.0, 
+                'weight_decay': 0.0,
                 "name": "proj_hash"
             })
-            # Feature scale parameter (gradient amplification)
-            param_groups_i.append({
-                'params': [self._grid.feature_scale], 
-                'lr': 0.0, 
-                "name": "feature_scale"
-            })
+            
+            # Feature scale parameter (if trainable)
+            if self._grid.feature_scale_trainable:
+                param_groups_i.append({
+                    'params': [self._grid.feature_scale], 
+                    'lr': 0.0, 
+                    'weight_decay': 0.0,
+                    "name": "feature_scale"
+                })
         else:
             # Original mode: single grid param group
             param_groups_i.append({
@@ -522,6 +765,38 @@ class GaussianModel:
         ])
         
         self.optimizer_i = torch.optim.Adam(param_groups_i, lr=0.0, eps=1e-15)
+        
+        # ========================================
+        # [DEBUG] Optimizer parameter group validation
+        # ========================================
+        try:
+            from arguments import DEBUG_CFG
+            if DEBUG_CFG.ON:
+                total_params = sum(len(list(g['params'])) for g in param_groups_i)
+                print(f"[DEBUG-OPTIMIZER] Total param_groups in optimizer_i: {len(param_groups_i)}, total params: {total_params}")
+                
+                if self.hybrid_config and self.hybrid_config.hybrid_enable:
+                    vm_group = next((g for g in param_groups_i if g['name'] == 'vm_encoder'), None)
+                    if vm_group:
+                        vm_param_count = len(list(vm_group['params']))
+                        print(f"[DEBUG-OPTIMIZER] VM encoder group found: {vm_param_count} parameters")
+                        
+                        # Verify VM parameters are actually in the group
+                        vm_actual = [self._grid.vm.xy, self._grid.vm.xz, self._grid.vm.yz]
+                        vm_actual.extend(self._grid.vm.mlp.parameters())
+                        vm_actual_ids = set(id(p) for p in vm_actual)
+                        vm_group_ids = set(id(p) for p in vm_group['params'])
+                        
+                        if vm_actual_ids == vm_group_ids:
+                            print(f"[DEBUG-OPTIMIZER] ✓ VM parameters correctly registered in optimizer")
+                        else:
+                            missing = len(vm_actual_ids - vm_group_ids)
+                            extra = len(vm_group_ids - vm_actual_ids)
+                            print(f"[DEBUG-OPTIMIZER] ✗ VM parameter mismatch: {missing} missing, {extra} extra")
+                    else:
+                        print(f"[DEBUG-OPTIMIZER] ✗ WARNING: VM encoder group not found!")
+        except:
+            pass
 
         # Learning rate schedulers
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -559,17 +834,14 @@ class GaussianModel:
                                                          lr_delay_mult=training_args.rotation_lr_delay_mult,
                                                          max_steps=training_args.rotation_lr_max_steps)
         
-        # [HYBRID ENCODER PARAMS] VM encoder scheduler
-        if self.hybrid_config and self.hybrid_config.hybrid_enable:
-            self.vm_scheduler_args = get_expon_lr_func(lr_init=self.hybrid_config.vm_lr_init,
-                                                       lr_final=self.hybrid_config.vm_lr_final,
-                                                       lr_delay_steps=self.hybrid_config.vm_lr_delay_steps,
-                                                       lr_delay_mult=self.hybrid_config.vm_lr_delay_mult,
-                                                       max_steps=self.hybrid_config.vm_lr_max_steps)
+        # [FIX] VM encoder scheduler removed (now uses base grid scheduler with multiplier)
 
 
     def update_learning_rate(self, iteration):
-        ''' Learning rate scheduling per step '''
+        '''
+        Learning rate scheduling per step.
+        [FIX] Simplified: VM uses base grid LR with multiplier (no separate schedule).
+        '''
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "xyz":
                 lr = self.xyz_scheduler_args(iteration)
@@ -594,30 +866,21 @@ class GaussianModel:
             elif param_group["name"] == "rotation":
                 lr = self.rotation_scheduler_args(iteration)
                 param_group['lr'] = lr
-            # [HYBRID ENCODER PARAMS] VM encoder and projection layers
-            elif param_group["name"] == "vm" and self.hybrid_config and self.hybrid_config.hybrid_enable:
-                lr = self.vm_scheduler_args(iteration)
+            # [FIX] VM encoder: use base grid LR with multiplier (no manual grad scaling)
+            # [ORIG] Separate vm_planes/vm_mlp with different LRs
+            elif param_group["name"] == "vm_encoder" and self.hybrid_config and self.hybrid_config.hybrid_enable:
+                base_lr = self.grid_scheduler_args(iteration)
+                lr = base_lr * self.hybrid_config.vm_lr_multiplier  # 1.5x boost
                 param_group['lr'] = lr
             elif param_group["name"] == "proj_hash" and self.hybrid_config and self.hybrid_config.hybrid_enable:
-                lr = self.vm_scheduler_args(iteration)  # Same schedule as VM
+                lr = self.grid_scheduler_args(iteration)  # Same as grid
                 param_group['lr'] = lr
             elif param_group["name"] == "feature_scale" and self.hybrid_config and self.hybrid_config.hybrid_enable:
-                lr = self.vm_scheduler_args(iteration)  # Same schedule as VM
+                lr = self.grid_scheduler_args(iteration) * 0.1  # Small LR if trainable
                 param_group['lr'] = lr
         
-        # Scheduler of hash_gain for hybrid encoder
-        # Start with VM-dominant (gain=0.5), transition to balanced (gain=1.5) by iter 10000
-        if self.hybrid_config and self.hybrid_config.hybrid_enable and isinstance(self._grid, HybridFeatureEncoder):
-            gain_start = 0.5
-            gain_end = 1.5
-            gain_ramp_iters = 10000
-            if iteration < gain_ramp_iters:
-                # Linear ramp from 0.5 to 1.5
-                alpha = iteration / gain_ramp_iters
-                new_gain = gain_start + (gain_end - gain_start) * alpha
-                self._grid.hash_gain.fill_(new_gain)
-            else:
-                self._grid.hash_gain.fill_(gain_end)
+        # [FIX] hash_gain and gate annealing now handled by trainer (not here)
+        # [ORIG] Old hash_gain scheduler with gain_start/gain_end removed
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
@@ -826,28 +1089,52 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_scaling_base, new_mask, new_sh_mask)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, opt=None, iteration=None):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        self.update_attributes()
-        self.densify_and_clone(grads, max_grad, extent)
-        self.update_attributes()
-        self.densify_and_split(grads, max_grad, extent)
+        # [UNIVERSAL ENHANCEMENT] Adaptive densification using universal parameters
+        # These parameters help all scenes with fine details and prevent over-smoothing
+        if opt:
+            # Use universal adaptive factors instead of dataset-specific modes
+            densify_grad_threshold = max_grad * opt.densify_grad_threshold_factor  # 70% of default
+            densify_until_iter = int(opt.iterations * opt.densify_until_iter_factor)  # 150% of iterations
+            size_threshold = max_screen_size * opt.size_threshold_multiplier if max_screen_size else 0.1 * extent
+            final_opacity_thr = opt.prune_opacity_threshold_final  # 0.01 (stricter)
+        else:
+            # Fallback to original parameters if opt not provided
+            densify_grad_threshold = max_grad
+            densify_until_iter = float('inf')
+            size_threshold = max_screen_size
+            final_opacity_thr = min_opacity
+
+        # Only densify before extended densification window
+        if iteration is None or iteration < densify_until_iter:
+            self.update_attributes()
+            self.densify_and_clone(grads, densify_grad_threshold, extent)
+            self.update_attributes()
+            self.densify_and_split(grads, densify_grad_threshold, extent)
 
         self.update_attributes()
-        prune_mask = torch.logical_or((self.get_mask <= 0.01).squeeze(), (self.get_opacity < min_opacity).squeeze())
-        if max_screen_size:
-            big_points_vs = self.max_radii2D > max_screen_size
+        
+        # Pruning logic with adaptive opacity threshold
+        prune_mask = torch.logical_or((self.get_mask <= 0.01).squeeze(), (self.get_opacity < final_opacity_thr).squeeze())
+        if size_threshold:
+            big_points_vs = self.max_radii2D > size_threshold
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
+
+        # 重新同步派生属性，避免 _scaling 等张量尺寸滞后
+        self.update_attributes()
 
         torch.cuda.empty_cache()
 
     def mask_prune(self):
         prune_mask = (self.get_mask <= 0.01).squeeze()
         self.prune_points(prune_mask)
+        # Pruning 后立即刷新派生属性，保持张量长度一致
+        self.update_attributes()
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
@@ -874,7 +1161,28 @@ class GaussianModel:
         f_dc = self._features_dc.detach().cpu().numpy()
         scale_base = self._scaling_base.detach().cpu().numpy()
         sh_mask = self.get_sh_mask.detach().cpu().numpy()
-        grid_params = self._grid.state_dict()["params"].detach().cpu().numpy()
+        
+        # [HYBRID] Handle both original HashGrid and HybridFeatureEncoder
+        if self.hybrid_config and self.hybrid_config.hybrid_enable and isinstance(self._grid, HybridFeatureEncoder):
+            # For hybrid encoder, extract hash params from wrapped encoder
+            grid_params = self._grid.hash.state_dict()["params"].detach().cpu().numpy()
+            
+            # Save VM encoder parameters (planes, MLP, projections, feature_scale)
+            vm_xy = self._grid.vm.xy.detach().cpu().numpy()
+            vm_xz = self._grid.vm.xz.detach().cpu().numpy()
+            vm_yz = self._grid.vm.yz.detach().cpu().numpy()
+            vm_mlp = self._grid.vm.mlp.weight.detach().cpu().numpy()
+            proj_hash = self._grid.proj_hash.weight.detach().cpu().numpy()
+            feature_scale = self._grid.feature_scale.detach().cpu().item()
+            
+            np.savez_compressed(os.path.join(path, "vm_planes.npz"), 
+                              xy=vm_xy, xz=vm_xz, yz=vm_yz)
+            np.savez_compressed(os.path.join(path, "vm_mlp.npz"), data=vm_mlp)
+            np.savez_compressed(os.path.join(path, "proj_hash.npz"), data=proj_hash)
+            np.savez_compressed(os.path.join(path, "feature_scale.npz"), data=np.array([feature_scale]))
+        else:
+            # Original path: direct grid params
+            grid_params = self._grid.state_dict()["params"].detach().cpu().numpy()
 
         # G-PCC encoding
         encode_xyz(xyz, path)
@@ -922,6 +1230,21 @@ class GaussianModel:
         print("scale.npz", os.path.getsize(os.path.join(path, "scale.npz")) / 1e6)
         size += os.path.getsize(os.path.join(path, "rotation.npz"))
         print("rotation.npz", os.path.getsize(os.path.join(path, "rotation.npz")) / 1e6)
+        
+        # [HYBRID] VM encoder files if present
+        if self.hybrid_config and self.hybrid_config.hybrid_enable and isinstance(self._grid, HybridFeatureEncoder):
+            if os.path.exists(os.path.join(path, "vm_planes.npz")):
+                size += os.path.getsize(os.path.join(path, "vm_planes.npz"))
+                print("vm_planes.npz", os.path.getsize(os.path.join(path, "vm_planes.npz")) / 1e6)
+            if os.path.exists(os.path.join(path, "vm_mlp.npz")):
+                size += os.path.getsize(os.path.join(path, "vm_mlp.npz"))
+                print("vm_mlp.npz", os.path.getsize(os.path.join(path, "vm_mlp.npz")) / 1e6)
+            if os.path.exists(os.path.join(path, "proj_hash.npz")):
+                size += os.path.getsize(os.path.join(path, "proj_hash.npz"))
+                print("proj_hash.npz", os.path.getsize(os.path.join(path, "proj_hash.npz")) / 1e6)
+            if os.path.exists(os.path.join(path, "feature_scale.npz")):
+                size += os.path.getsize(os.path.join(path, "feature_scale.npz"))
+                print("feature_scale.npz", os.path.getsize(os.path.join(path, "feature_scale.npz")) / 1e6)
 
         print(f"Total size: {(size / 1e6)} MB")
 
@@ -941,8 +1264,40 @@ class GaussianModel:
 
         self._features_dc = torch.from_numpy(np.asarray(f_dc)).cuda()
         self._scaling_base = torch.from_numpy(np.asarray(scaling_base)).cuda()
-        self._grid.params = nn.Parameter(torch.from_numpy(np.asarray(grid_params)).half().cuda())
         
+        # [HYBRID] Handle both original HashGrid and HybridFeatureEncoder
+        if self.hybrid_config and self.hybrid_config.hybrid_enable and isinstance(self._grid, HybridFeatureEncoder):
+            # For hybrid encoder, load into wrapped hash encoder
+            self._grid.hash.params = nn.Parameter(torch.from_numpy(np.asarray(grid_params)).half().cuda())
+            
+            # Load VM encoder parameters if they exist
+            if os.path.exists(os.path.join(path, "vm_planes.npz")):
+                vm_planes = np.load(os.path.join(path, "vm_planes.npz"))
+                self._grid.vm.xy.data = torch.from_numpy(vm_planes['xy']).cuda()
+                self._grid.vm.xz.data = torch.from_numpy(vm_planes['xz']).cuda()
+                self._grid.vm.yz.data = torch.from_numpy(vm_planes['yz']).cuda()
+            if os.path.exists(os.path.join(path, "vm_mlp.npz")):
+                vm_mlp = np.load(os.path.join(path, "vm_mlp.npz"))['data']
+                self._grid.vm.mlp.weight.data = torch.from_numpy(vm_mlp).cuda()
+            if os.path.exists(os.path.join(path, "proj_hash.npz")):
+                proj_hash = np.load(os.path.join(path, "proj_hash.npz"))['data']
+                self._grid.proj_hash.weight.data = torch.from_numpy(proj_hash).cuda()
+            if os.path.exists(os.path.join(path, "feature_scale.npz")):
+                feature_scale = np.load(os.path.join(path, "feature_scale.npz"))['data'][0]
+                self._grid.feature_scale.data = torch.tensor(feature_scale).cuda()
+        else:
+            # Original path: direct grid params
+            self._grid.params = nn.Parameter(torch.from_numpy(np.asarray(grid_params)).half().cuda())
+        
+        # Recover params for hybrid encoder
+        if self.hybrid_config and self.hybrid_config.hybrid_enable and isinstance(self._grid, HybridFeatureEncoder):
+             try:
+                 self._grid.set_hash_gain(1.0)
+                 self._grid.set_gate_sched(self.hybrid_config.gate_alpha_end, self.hybrid_config.gate_tau_end)
+                 self._grid.set_beta_min(self.hybrid_config.beta_min_end)
+             except Exception:
+                 pass
+
         # sh_mask
         sh_mask = np.load(os.path.join(path, 'sh_mask.npz'))['data'].astype(np.float32)
         self._sh_mask = torch.from_numpy(np.asarray(sh_mask)).cuda()

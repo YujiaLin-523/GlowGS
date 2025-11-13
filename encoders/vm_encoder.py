@@ -47,7 +47,9 @@ class VMEncoder(nn.Module):
         plane_res: int = 192,
         out_dim: int = 32, 
         basis: str = 'bilinear', 
-        use_checkpoint: bool = False
+        use_checkpoint: bool = False,
+        lpf_enable: bool = True,
+        lpf_kernel: int = 3
     ):
         super().__init__()
         assert in_dim == 3, "VMEncoder currently assumes 3D coordinates (xyz)"
@@ -57,6 +59,14 @@ class VMEncoder(nn.Module):
         self.out_dim = out_dim
         self.basis = basis
         self.use_checkpoint = use_checkpoint
+        
+        # Forward-only low-pass filter configuration
+        self.lpf_enable = lpf_enable
+        self.lpf_kernel = lpf_kernel
+        
+        # [CHECKLIST 6] Tri-plane coordinate perturbation for axis-aligned bias mitigation
+        self.rotation_perturb_enable = False  # Set True for drjohnson
+        self.rotation_perturb_angle = 3.0  # degrees (±2-5° range)
         
         # Three axis-aligned planes: XY, XZ, YZ (TensoRF-VM style).
         # Each plane has 'rank' channels; features are sampled, aggregated, then projected.
@@ -69,13 +79,93 @@ class VMEncoder(nn.Module):
         # No bias to keep it as a pure linear combination (residual-friendly)
         self.mlp = nn.Linear(3 * rank, out_dim, bias=False)
         
-        # [FIX] Initialization: increase std for stronger initial gradients
-        # std=0.3 provides sufficient signal without overwhelming Hash encoder
-        nn.init.trunc_normal_(self.xy, std=0.3)
-        nn.init.trunc_normal_(self.xz, std=0.3)
-        nn.init.trunc_normal_(self.yz, std=0.3)
-        # [FIX] MLP with higher gain to amplify plane features
+        # Balanced initialization: strong enough for VM to learn, not too dominant
+        # [ORIG] std=0.15 was too strong
+        # [FIX] std=0.01 was too weak, restored to 0.1 for sufficient signal
+        # hash_gain annealing (0.05->1.0) provides the actual protection mechanism
+        nn.init.trunc_normal_(self.xy, std=0.1)
+        nn.init.trunc_normal_(self.xz, std=0.1)
+        nn.init.trunc_normal_(self.yz, std=0.1)
+        # MLP: standard xavier (gain=1.0) for full capacity
         nn.init.xavier_uniform_(self.mlp.weight, gain=1.0)
+        
+        # [ACCEPTANCE CHECK A] Confirm align_corners=False in grid sampling (startup log)
+        print(f"[VM-ENCODER] Initialized with align_corners=False (kills vertical streaks), "
+              f"rank={rank}, res={plane_res}, lpf={lpf_enable}")
+    
+    def _apply_lpf(self, plane: torch.Tensor) -> torch.Tensor:
+        """
+        Apply forward-only low-pass filter to plane parameters.
+        
+        Forward-only view: the pooling operation creates a smoothed view of plane parameters
+        in the computation graph. Gradients still flow back to the underlying nn.Parameter
+        tensors without any detachment, ensuring normal gradient propagation to VM planes.
+        
+        This operation is applied ONLY during forward pass to stabilize training.
+        The underlying nn.Parameter tensors are NOT modified, ensuring normal
+        gradient backpropagation to the original plane parameters.
+        
+        Args:
+            plane: [R, H, W] plane parameter tensor
+        
+        Returns:
+            [R, H, W] low-pass filtered plane (in computation graph)
+        """
+        if not self.lpf_enable:
+            return plane
+        
+        # Apply average pooling as a robust, cheap low-pass filter
+        # [FIX] Don't detach - let gradients flow back to plane parameters
+        k = self.lpf_kernel
+        pad = k // 2
+        plane_lpf = F.avg_pool2d(
+            plane.unsqueeze(0),  # [1, R, H, W]
+            kernel_size=k,
+            stride=1,
+            padding=pad
+        ).squeeze(0)  # [R, H, W]
+        
+        return plane_lpf
+    
+    def _apply_3d_rotation_perturb(self, xyz: torch.Tensor) -> torch.Tensor:
+        """
+        Apply random 3D rotation perturbation to coordinates (training only, no gradient).
+        
+        [CHECKLIST 6] Breaks fixed axis alignment of tri-planes, reducing direction-dependent
+        artifacts (horizontal/vertical streaking). Applied only during training; inference uses
+        original coordinates.
+        
+        Args:
+            xyz: [N, 3] coordinates in [0,1]^3
+        
+        Returns:
+            [N, 3] perturbed coordinates, still clamped to [0,1]^3
+        """
+        if not self.training or not self.rotation_perturb_enable or xyz.shape[0] == 0:
+            return xyz
+        
+        # Random rotation angles (radians): ±angle_deg
+        angle_rad = (self.rotation_perturb_angle * 3.14159 / 180.0)
+        angles = (torch.rand(3, device=xyz.device) - 0.5) * 2 * angle_rad  # [3] in [-angle, +angle]
+        
+        # Build 3D rotation matrix (ZYX Euler)
+        cx, cy, cz = torch.cos(angles)
+        sx, sy, sz = torch.sin(angles)
+        
+        # Rotation matrix (row-major, will apply as xyz @ R.T)
+        R = torch.tensor([
+            [cy*cz, -cy*sz, sy],
+            [sx*sy*cz + cx*sz, -sx*sy*sz + cx*cz, -sx*cy],
+            [-cx*sy*cz + sx*sz, cx*sy*sz + sx*cz, cx*cy]
+        ], device=xyz.device, dtype=xyz.dtype)
+        
+        # Center coordinates around 0.5, rotate, then shift back
+        xyz_centered = xyz - 0.5
+        xyz_rotated = torch.mm(xyz_centered, R.T)  # [N, 3] @ [3, 3].T
+        xyz_perturbed = xyz_rotated + 0.5
+        
+        # Clamp back to [0, 1] (important for boundary preservation)
+        return xyz_perturbed.clamp(0.0, 1.0)
     
     def _sample_plane(
         self, 
@@ -86,46 +176,56 @@ class VMEncoder(nn.Module):
         """
         Bilinear sampling on a [rank, H, W] plane.
         
-        Uses F.grid_sample for efficient vectorized interpolation.
-        Coordinates are clamped to plane boundaries (border padding mode).
+        Optimized for GPU efficiency: minimizes temporary allocations.
         
         Args:
-            plane: [rank, H, W] learnable plane parameters
+            plane: [rank, H, W] learnable plane parameters (may be LPF-filtered)
             u, v: [N] normalized coordinates in [0, 1] range
         
         Returns:
             [N, rank] sampled features from the plane
         """
         N = u.shape[0]
-        R, H, W = plane.shape
+        H, W = plane.shape[-2:]
         
-        # Convert [0,1] coords to [-1,1] range expected by grid_sample
-        # Reshape to [1, H', W', 2] where H'=1, W'=N (batch of N points)
-        grid = torch.stack([u * 2 - 1, v * 2 - 1], dim=-1).view(1, 1, N, 2)
+        # [FIX A] Optional coordinate jitter to damp grid aliasing (training only)
+        # Tiny jitter prevents repetitive sampling patterns on pixel grid boundaries
+        if self.training:
+            jitter_u = (torch.rand_like(u) - 0.5) * (0.3 / W)  # ~0.3 pixels max
+            jitter_v = (torch.rand_like(v) - 0.5) * (0.3 / H)
+            u = (u + jitter_u.detach()).clamp(0.0, 1.0)
+            v = (v + jitter_v.detach()).clamp(0.0, 1.0)
         
-        # Add batch dimension to plane: [1, R, H, W]
-        plane_b = plane.unsqueeze(0)
+        # [FIX A] Convert [0,1] coords to [-1,1] with inner margin to avoid border stretching
+        # Use align_corners=False to prevent column/row edge artifacts (vertical streaking)
+        # [FIX CHECKLIST A4] Increase margin to 2 pixels (was 1) to further reduce border artifacts
+        eps_u = 2.0 / W  # Two pixel margin in U (more conservative)
+        eps_v = 2.0 / H  # Two pixel margin in V (more conservative)
+        u_norm = (u * 2.0 - 1.0).clamp(-1.0 + eps_u, 1.0 - eps_u)
+        v_norm = (v * 2.0 - 1.0).clamp(-1.0 + eps_v, 1.0 - eps_v)
         
-        # Sample with align_corners=True for stable interpolation semantics
-        # Input: [1, R, H, W], Grid: [1, 1, N, 2] -> Output: [1, R, 1, N]
+        # Stack and reshape in one go: [N, 2] -> [1, 1, N, 2]
+        grid = torch.stack([u_norm, v_norm], dim=-1).unsqueeze(0).unsqueeze(1)
+        
+        # [FIX A] Use align_corners=False to eliminate vertical streaking
+        # Input: [R, H, W], Grid: [1, 1, N, 2] -> Output: [1, R, 1, N]
         sampled = F.grid_sample(
-            plane_b, 
+            plane.unsqueeze(0),  # [1, R, H, W]
             grid, 
             mode='bilinear', 
-            padding_mode='border',  # clamp to edge for stability
-            align_corners=True
+            padding_mode='border',
+            align_corners=False
         )
         
-        # Reshape to [N, R]: squeeze spatial dims and transpose
-        sampled = sampled.squeeze(2).squeeze(0).transpose(0, 1)  # [1,R,1,N] -> [R,N] -> [N,R]
-        return sampled
+        # Efficient reshape: [1, R, 1, N] -> [N, R]
+        return sampled[0, :, 0, :].t().contiguous()  # Transpose to [N, R]
     
     def forward(self, xyz: torch.Tensor) -> torch.Tensor:
         """
         Forward pass: sample three planes and aggregate to output features.
         
         Args:
-            xyz: [N, 3] coordinates in normalized [0,1]^3 space.
+            xyz: [N, 3] coordinates expected in [0,1]^3 (hybrid wrapper converts if needed).
                  Typically obtained from Gaussian centers after contraction.
         
         Returns:
@@ -141,71 +241,42 @@ class VMEncoder(nn.Module):
         """
         N = xyz.shape[0]
         
-        # [MEMORY FIX] Batch processing to prevent OOM with large point clouds
-        # grid_sample creates large intermediate tensors, so we split into chunks
-        chunk_size = 16384  # Process 16k points at a time (balanced for 24GB VRAM)
+        # [FIX] Coordinate sanitization: handle NaN/Inf and clamp to [0,1]
+        # This prevents grid_sample from producing undefined gradients at boundaries
+        xyz = torch.nan_to_num(xyz, nan=0.5, posinf=0.5, neginf=0.5).clamp(0.0, 1.0)
         
-        if N > chunk_size and self.training:
-            # Chunked processing for large batches
-            num_chunks = (N + chunk_size - 1) // chunk_size
-            outputs = []
-            
-            for i in range(num_chunks):
-                start_idx = i * chunk_size
-                end_idx = min((i + 1) * chunk_size, N)
-                xyz_chunk = xyz[start_idx:end_idx]
-                
-                # Extract coordinates for this chunk
-                x, y, z = xyz_chunk[..., 0], xyz_chunk[..., 1], xyz_chunk[..., 2]
-                
-                # Sample three planes
-                if self.use_checkpoint:
-                    f_xy = torch.utils.checkpoint.checkpoint(
-                        self._sample_plane, self.xy, x, y, use_reentrant=False
-                    )
-                    f_xz = torch.utils.checkpoint.checkpoint(
-                        self._sample_plane, self.xz, x, z, use_reentrant=False
-                    )
-                    f_yz = torch.utils.checkpoint.checkpoint(
-                        self._sample_plane, self.yz, y, z, use_reentrant=False
-                    )
-                else:
-                    f_xy = self._sample_plane(self.xy, x, y)
-                    f_xz = self._sample_plane(self.xz, x, z)
-                    f_yz = self._sample_plane(self.yz, y, z)
-                
-                # Concatenate and project
-                f = torch.cat([f_xy, f_xz, f_yz], dim=-1)
-                out_chunk = self.mlp(f)
-                outputs.append(out_chunk)
-            
-            # Concatenate all chunks
-            return torch.cat(outputs, dim=0)
+        # [CHECKLIST 6] Apply random 3D rotation perturbation (training only, drjohnson mode)
+        # Breaks axis-aligned bias of tri-planes, reducing directional streaking
+        xyz = self._apply_3d_rotation_perturb(xyz)
         
+        # [FIX] Apply forward-only low-pass filter to planes (stabilizes training)
+        # Parameters themselves are NOT modified; gradients still flow to original tensors
+        Pxy = self._apply_lpf(self.xy)
+        Pxz = self._apply_lpf(self.xz)
+        Pyz = self._apply_lpf(self.yz)
+        
+        # Extract coordinates
+        x, y, z = xyz[..., 0], xyz[..., 1], xyz[..., 2]
+        
+        # Sample three planes (using LPF-filtered versions)
+        # Use checkpointing if enabled to trade compute for memory
+        if self.use_checkpoint and self.training:
+            f_xy = torch.utils.checkpoint.checkpoint(
+                self._sample_plane, Pxy, x, y, use_reentrant=False
+            )
+            f_xz = torch.utils.checkpoint.checkpoint(
+                self._sample_plane, Pxz, x, z, use_reentrant=False
+            )
+            f_yz = torch.utils.checkpoint.checkpoint(
+                self._sample_plane, Pyz, y, z, use_reentrant=False
+            )
         else:
-            # Original path for small batches or inference
-            # Extract coordinates
-            x, y, z = xyz[..., 0], xyz[..., 1], xyz[..., 2]
-            
-            # Sample three planes (vectorized for speed)
-            # Use checkpointing if enabled to trade compute for memory
-            if self.use_checkpoint and self.training:
-                f_xy = torch.utils.checkpoint.checkpoint(
-                    self._sample_plane, self.xy, x, y, use_reentrant=False
-                )
-                f_xz = torch.utils.checkpoint.checkpoint(
-                    self._sample_plane, self.xz, x, z, use_reentrant=False
-                )
-                f_yz = torch.utils.checkpoint.checkpoint(
-                    self._sample_plane, self.yz, y, z, use_reentrant=False
-                )
-            else:
-                f_xy = self._sample_plane(self.xy, x, y)  # [N, rank]
-                f_xz = self._sample_plane(self.xz, x, z)  # [N, rank]
-                f_yz = self._sample_plane(self.yz, y, z)  # [N, rank]
-            
-            # Concatenate plane features: [N, 3*rank]
-            f = torch.cat([f_xy, f_xz, f_yz], dim=-1)
-            
-            # Final linear projection to output dimension
-            return self.mlp(f)
+            f_xy = self._sample_plane(Pxy, x, y)  # [N, rank]
+            f_xz = self._sample_plane(Pxz, x, z)  # [N, rank]
+            f_yz = self._sample_plane(Pyz, y, z)  # [N, rank]
+        
+        # Concatenate plane features: [N, 3*rank]
+        f = torch.cat([f_xy, f_xz, f_yz], dim=-1)
+        
+        # Final linear projection to output dimension
+        return self.mlp(f)
