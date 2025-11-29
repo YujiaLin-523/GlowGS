@@ -55,9 +55,15 @@ class ModelParams(ParamGroup):
         self.pcd_path = "none"
         self.data_device = "cuda"
         self.eval = False
-        self.hash_size = 19
-        self.width = 64
-        self.depth = 2
+        # Hash grid parameters
+        self.hash_size = 19          # log2_hashmap_size: 19 → 512K entries (balance of size/quality)
+        self.width = 64              # MLP hidden width
+        self.depth = 2               # MLP depth
+        # GeoEncoder (tri-plane) parameters - tuned for size/quality balance
+        self.geo_resolution = 48     # Tri-plane resolution (48x48, reduced from 64 for smaller model)
+        self.geo_rank = 6            # Low-rank factorization rank (reduced from 8)
+        self.geo_channels = 8        # Output feature channels
+        self.feature_role_split = True  # Enable geometry/appearance feature disentanglement
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -151,4 +157,18 @@ def get_combined_args(parser : ArgumentParser):
     for k,v in vars(args_cmdline).items():
         if v != None:
             merged_dict[k] = v
+    
+    # Ensure GeoEncoder parameters have defaults for backward compatibility
+    # with models trained before these parameters were added
+    geo_defaults = {
+        'geo_resolution': 48,
+        'geo_rank': 6,
+        'geo_channels': 8,
+        'feature_role_split': True
+    }
+    for key, default_val in geo_defaults.items():
+        if key not in merged_dict:
+            merged_dict[key] = default_val
+            print(f"[INFO] Using default {key}={default_val}")
+    
     return Namespace(**merged_dict)

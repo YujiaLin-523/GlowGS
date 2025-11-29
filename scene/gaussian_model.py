@@ -22,7 +22,7 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation, contract_to_unisphere, mortonEncode
 from utils.quantization_utils import half_ste, quantize, dequantize
 from utils.gpcc_utils import encode_xyz, decode_xyz
-from encoders.hierarchical_dual_branch import HierarchicalDualBranchEncoder
+from encoders.geometry_appearance_encoder import GeometryAppearanceEncoder
 import tinycudann as tcnn
 
 class GaussianModel:
@@ -70,25 +70,26 @@ class GaussianModel:
         }
     
     def setup_params(self):
-        # define implicit attributes
-        # Create base hash encoder first (tcnn automatically uses CUDA)
+        # Create base hash encoder
         hash_encoder = tcnn.Encoding(n_input_dims=3, encoding_config=self.encoding_config)
         
-        # Wrap with HierarchicalDualBranchEncoder and move to CUDA
-        self._grid = HierarchicalDualBranchEncoder(
+        # GeometryAppearanceEncoder with feature role split support
+        # Uses stored GeoEncoder parameters for flexible size/quality tradeoff
+        self._grid = GeometryAppearanceEncoder(
             hash_encoder=hash_encoder,
-            out_dim=hash_encoder.n_output_dims,  # Keep same output dimension
-            glf_channels=8,
-            glf_resolution=64,
-            glf_rank=8,
-            beta=0.1
+            out_dim=hash_encoder.n_output_dims,
+            geo_channels=self._geo_channels,
+            geo_resolution=self._geo_resolution,
+            geo_rank=self._geo_rank,
+            feature_role_split=self._feature_role_split
         )
-        # Explicitly move all components to CUDA
         self._grid = self._grid.cuda()
-        # Double-check: ensure GLF encoder is on CUDA
-        self._grid.glf_encoder = self._grid.glf_encoder.cuda()
+        self._grid.geo_encoder = self._grid.geo_encoder.cuda()
+        self._grid.appearance_projection = self._grid.appearance_projection.cuda()
+        self._grid.geometry_projection = self._grid.geometry_projection.cuda()
         self._grid.fusion_layer = self._grid.fusion_layer.cuda()
         
+        # MLP heads for Gaussian attributes
         self._features_rest_head = tcnn.Network(n_input_dims=self._grid.n_output_dims, n_output_dims=(self.max_sh_degree + 1) ** 2 * 3 - 3, network_config=self.network_config)
         self._scaling_head = tcnn.Network(n_input_dims=self._grid.n_output_dims, n_output_dims=3, network_config=self.network_config)
         self._rotation_head = tcnn.Network(n_input_dims=self._grid.n_output_dims, n_output_dims=4, network_config=self.network_config)
@@ -98,9 +99,15 @@ class GaussianModel:
         self._rotation_init = torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float, device='cuda')
         self._opacity_init = torch.tensor([[np.log(0.1 / (1 - 0.1))]], dtype=torch.float, device='cuda')
 
-    def __init__(self, sh_degree : int, hash_size = 19, width = 64, depth = 2):
+    def __init__(self, sh_degree: int, hash_size=19, width=64, depth=2, feature_role_split=True,
+                 geo_resolution=48, geo_rank=6, geo_channels=8):
         self.active_sh_degree = 0
-        self.max_sh_degree = sh_degree  
+        self.max_sh_degree = sh_degree
+        self._feature_role_split = feature_role_split  # Geometry/appearance disentanglement flag
+        # Store GeoEncoder parameters for serialization/deserialization
+        self._geo_resolution = geo_resolution
+        self._geo_rank = geo_rank
+        self._geo_channels = geo_channels
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
@@ -184,23 +191,55 @@ class GaussianModel:
         self.optimizer_i.load_state_dict(opt_i_dict)
 
     def update_attributes(self):
-        feats = self._grid(self.get_contracted_xyz)
+        """
+        Update implicit Gaussian attributes from encoder output.
         
-        # Safety check: replace NaN/Inf with zeros to prevent propagation
-        # This is critical for training stability with new encoder architecture
+        Feature role split routing:
+            - geometry_latent → scale, rotation, opacity heads
+            - appearance_latent → SH/color head (features_rest)
+        """
+        contracted_xyz = self.get_contracted_xyz
+        encoder_output = self._grid(contracted_xyz)
+        
+        if self._feature_role_split and isinstance(encoder_output, tuple):
+            # Geometry/appearance disentanglement enabled
+            geometry_latent, appearance_latent = encoder_output
+            
+            # Stability check
+            geometry_latent = self._stabilize_features(geometry_latent)
+            appearance_latent = self._stabilize_features(appearance_latent)
+            
+            # Store for debug logging
+            self._last_geometry_latent = geometry_latent
+            self._last_appearance_latent = appearance_latent
+            
+            # Geometric attributes from geometry branch (structure-focused)
+            self._opacity = self._opacity_head(geometry_latent).float() + self._opacity_init
+            self._scaling = self._scaling_head(geometry_latent).float()
+            self._rotation = self._rotation_head(geometry_latent).float() + self._rotation_init
+            
+            # Appearance attributes from appearance branch (texture-focused)
+            if self.max_sh_degree > 0:
+                self._features_rest = self._features_rest_head(appearance_latent).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3).float()
+        else:
+            # Fallback: single fused latent for all heads
+            feats = encoder_output if not isinstance(encoder_output, tuple) else encoder_output[0]
+            feats = self._stabilize_features(feats)
+            
+            self._opacity = self._opacity_head(feats).float() + self._opacity_init
+            self._scaling = self._scaling_head(feats).float()
+            self._rotation = self._rotation_head(feats).float() + self._rotation_init
+            if self.max_sh_degree > 0:
+                self._features_rest = self._features_rest_head(feats).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3).float()
+        
+        # NOTE: Removed torch.cuda.empty_cache() here for real-time performance
+        # empty_cache() is expensive (~1-2ms) and should only be called when necessary
+    
+    def _stabilize_features(self, feats: torch.Tensor) -> torch.Tensor:
+        """Numerical stability for feature tensors."""
         if torch.isnan(feats).any() or torch.isinf(feats).any():
             feats = torch.nan_to_num(feats, nan=0.0, posinf=10.0, neginf=-10.0)
-        
-        # Clamp features to prevent extreme values in MLP heads
-        feats = torch.clamp(feats, -10.0, 10.0)
-        
-        self._opacity = self._opacity_head(feats).float() + self._opacity_init
-        self._scaling = self._scaling_head(feats).float()
-        self._rotation = self._rotation_head(feats).float() + self._rotation_init
-        if self.max_sh_degree > 0:
-            self._features_rest = self._features_rest_head(feats).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3).float()
-        
-        torch.cuda.empty_cache()
+        return torch.clamp(feats, -10.0, 10.0)
 
     @property
     def get_scaling_base(self):
@@ -633,23 +672,36 @@ class GaussianModel:
         scale_base = self._scaling_base.detach().cpu().numpy()
         sh_mask = self.get_sh_mask.detach().cpu().numpy()
         
-        # Save the complete HierarchicalDualBranchEncoder state_dict
-        # This includes hash_encoder, glf_encoder, and fusion_layer parameters
+        # Save model configuration for correct loading
+        config = {
+            'feature_role_split': self._feature_role_split,
+            'geo_resolution': self._geo_resolution,
+            'geo_rank': self._geo_rank,
+            'geo_channels': self._geo_channels,
+            'max_sh_degree': self.max_sh_degree,
+        }
+        np.savez(os.path.join(path, "config.npz"), **config)
+        
+        # Save the complete GeometryAppearanceEncoder state_dict
+        # This includes hash_encoder, geo_encoder, and fusion_layer parameters
         # All files use underscore naming format for consistency
         
         grid_state_dict = self._grid.state_dict()
-        # Save each component with underscore naming (convert dots to underscores)
+        # Pack all grid components into a single compressed archive to reduce header
+        # overhead and improve compression across parameters.
+        grid_save_dict = {}
         for key, value in grid_state_dict.items():
             normalized_key = key.replace('.', '_')  # e.g., "hash_encoder.params" -> "hash_encoder_params"
             param_data = value.detach().cpu().numpy()
+            # Quantize grid parameters (log quantization) to uint8
             param_quant, param_scale, param_min = quantize(param_data, bit=6, log=True)
-            np.savez_compressed(
-                os.path.join(path, f"grid_{normalized_key}.npz"),
-                data=param_quant.astype(np.uint8),
-                scale=param_scale,
-                min=param_min,
-                orig_key=np.array(key)
-            )
+            grid_save_dict[f"{normalized_key}_data"] = param_quant.astype(np.uint8)
+            grid_save_dict[f"{normalized_key}_scale"] = param_scale
+            grid_save_dict[f"{normalized_key}_min"] = param_min
+            grid_save_dict[f"{normalized_key}_orig"] = np.array(key)
+
+        # Save single combined file
+        np.savez_compressed(os.path.join(path, "grid_all.npz"), **grid_save_dict)
 
         # G-PCC encoding
         encode_xyz(xyz, path)
@@ -665,16 +717,32 @@ class GaussianModel:
         sh_mask = (sh_mask > 0.01).cumprod(axis=-1).astype(np.uint8)
         np.savez_compressed(os.path.join(path, "sh_mask.npz"), data=sh_mask)
 
-        # mlps
-        opacity_params = self._opacity_head.state_dict()['params'].half().cpu().detach().numpy()
-        f_rest_params = self._features_rest_head.state_dict()['params'].half().cpu().detach().numpy()
-        scale_params = self._scaling_head.state_dict()['params'].half().cpu().detach().numpy()
-        rotation_params = self._rotation_head.state_dict()['params'].half().cpu().detach().numpy()
+        # mlps: quantize MLP parameter tensors to 8-bit (log) and pack into one file
+        mlp_save = {}
+        opacity_params = self._opacity_head.state_dict()['params'].cpu().detach().numpy()
+        f_rest_params = self._features_rest_head.state_dict()['params'].cpu().detach().numpy()
+        scale_params = self._scaling_head.state_dict()['params'].cpu().detach().numpy()
+        rotation_params = self._rotation_head.state_dict()['params'].cpu().detach().numpy()
 
-        np.savez_compressed(os.path.join(path, "opacity.npz"), data=opacity_params)
-        np.savez_compressed(os.path.join(path, "f_rest.npz"), data=f_rest_params)
-        np.savez_compressed(os.path.join(path, "scale.npz"), data=scale_params)
-        np.savez_compressed(os.path.join(path, "rotation.npz"), data=rotation_params)
+        o_q, o_s, o_m = quantize(opacity_params, bit=8, log=True)
+        fr_q, fr_s, fr_m = quantize(f_rest_params, bit=8, log=True)
+        sc_q, sc_s, sc_m = quantize(scale_params, bit=8, log=True)
+        rt_q, rt_s, rt_m = quantize(rotation_params, bit=8, log=True)
+
+        mlp_save['opacity_data'] = o_q.astype(np.uint8)
+        mlp_save['opacity_scale'] = o_s
+        mlp_save['opacity_min'] = o_m
+        mlp_save['f_rest_data'] = fr_q.astype(np.uint8)
+        mlp_save['f_rest_scale'] = fr_s
+        mlp_save['f_rest_min'] = fr_m
+        mlp_save['scale_data'] = sc_q.astype(np.uint8)
+        mlp_save['scale_scale'] = sc_s
+        mlp_save['scale_min'] = sc_m
+        mlp_save['rotation_data'] = rt_q.astype(np.uint8)
+        mlp_save['rotation_scale'] = rt_s
+        mlp_save['rotation_min'] = rt_m
+
+        np.savez_compressed(os.path.join(path, "mlps.npz"), **mlp_save)
 
         # Calculate and print total size
         size = 0
@@ -685,31 +753,56 @@ class GaussianModel:
         size += os.path.getsize(os.path.join(path, "scale_base.npz"))
         print("scale_base.npz", os.path.getsize(os.path.join(path, "scale_base.npz")) / 1e6)
         
-        # Calculate total size of all grid components
+        # Calculate total size of grid archive (prefer combined file)
         grid_total_size = 0
-        for filename in os.listdir(path):
-            if filename.startswith("grid_") and filename.endswith(".npz"):
-                file_path = os.path.join(path, filename)
-                file_size = os.path.getsize(file_path)
-                grid_total_size += file_size
-                print(f"{filename}", file_size / 1e6)
+        grid_all_path = os.path.join(path, "grid_all.npz")
+        if os.path.exists(grid_all_path):
+            grid_total_size = os.path.getsize(grid_all_path)
+            print("grid_all.npz", grid_total_size / 1e6)
+        else:
+            for filename in os.listdir(path):
+                if filename.startswith("grid_") and filename.endswith(".npz"):
+                    file_path = os.path.join(path, filename)
+                    file_size = os.path.getsize(file_path)
+                    grid_total_size += file_size
+                    print(f"{filename}", file_size / 1e6)
         size += grid_total_size
         print(f"grid_total (all components)", grid_total_size / 1e6)
         
         size += os.path.getsize(os.path.join(path, "sh_mask.npz"))
         print("sh_mask.npz", os.path.getsize(os.path.join(path, "sh_mask.npz")) / 1e6)
-        size += os.path.getsize(os.path.join(path, "opacity.npz"))
-        print("opacity.npz", os.path.getsize(os.path.join(path, "opacity.npz")) / 1e6)
-        size += os.path.getsize(os.path.join(path, "f_rest.npz"))
-        print("f_rest.npz", os.path.getsize(os.path.join(path, "f_rest.npz")) / 1e6)
-        size += os.path.getsize(os.path.join(path, "scale.npz"))
-        print("scale.npz", os.path.getsize(os.path.join(path, "scale.npz")) / 1e6)
-        size += os.path.getsize(os.path.join(path, "rotation.npz"))
-        print("rotation.npz", os.path.getsize(os.path.join(path, "rotation.npz")) / 1e6)
+        # mlps are saved in a single file now
+        if os.path.exists(os.path.join(path, "mlps.npz")):
+            size += os.path.getsize(os.path.join(path, "mlps.npz"))
+            print("mlps.npz", os.path.getsize(os.path.join(path, "mlps.npz")) / 1e6)
+        else:
+            # backward-compatible individual mlp files
+            for name in ["opacity.npz", "f_rest.npz", "scale.npz", "rotation.npz"]:
+                if os.path.exists(os.path.join(path, name)):
+                    size += os.path.getsize(os.path.join(path, name))
+                    print(name, os.path.getsize(os.path.join(path, name)) / 1e6)
 
         print(f"Total size: {(size / 1e6)} MB")
 
     def decompress_attributes(self, path):
+        # Load and verify configuration
+        config_path = os.path.join(path, 'config.npz')
+        if os.path.exists(config_path):
+            config = np.load(config_path)
+            # Verify config matches current model (print warnings if mismatch)
+            saved_feature_role_split = bool(config['feature_role_split'])
+            if saved_feature_role_split != self._feature_role_split:
+                print(f"[WARNING] Model feature_role_split mismatch: saved={saved_feature_role_split}, current={self._feature_role_split}")
+            # Support both old 'glf_*' and new 'geo_*' config key names
+            if 'geo_resolution' in config:
+                saved_geo_resolution = int(config['geo_resolution'])
+            elif 'glf_resolution' in config:
+                saved_geo_resolution = int(config['glf_resolution'])
+            else:
+                saved_geo_resolution = self._geo_resolution
+            if saved_geo_resolution != self._geo_resolution:
+                print(f"[WARNING] GeoEncoder resolution mismatch: saved={saved_geo_resolution}, current={self._geo_resolution}")
+        
         # G-PCC decoding
         xyz = decode_xyz(path)
         self._xyz = torch.from_numpy(np.asarray(xyz)).cuda()
@@ -725,13 +818,30 @@ class GaussianModel:
         self._scaling_base = torch.from_numpy(np.asarray(scaling_base)).cuda()
         
         grid_state_dict = {}
-        for filename in os.listdir(path):
-            if filename.startswith("grid_") and filename.endswith(".npz"):
-                grid_dict = np.load(os.path.join(path, filename))
-                grid_params = dequantize(grid_dict['data'], grid_dict['scale'], grid_dict['min'], log=True)
-
-                orig_key = grid_dict['orig_key'].item() if grid_dict['orig_key'].shape == () else str(grid_dict['orig_key'])
+        # Prefer loading combined grid archive if present
+        grid_all_path = os.path.join(path, "grid_all.npz")
+        if os.path.exists(grid_all_path):
+            grid_npz = np.load(grid_all_path)
+            # find unique normalized keys by scanning files ending with _data
+            for name in grid_npz.files:
+                if not name.endswith("_data"):
+                    continue
+                base = name[:-5]  # remove '_data'
+                data = grid_npz[f"{base}_data"]
+                scale = grid_npz[f"{base}_scale"]
+                mn = grid_npz[f"{base}_min"]
+                grid_params = dequantize(data, scale, mn, log=True)
+                orig_arr = grid_npz[f"{base}_orig"]
+                orig_key = orig_arr.item() if np.asarray(orig_arr).shape == () else str(orig_arr)
                 grid_state_dict[orig_key] = torch.from_numpy(np.asarray(grid_params)).half().cuda()
+        else:
+            for filename in os.listdir(path):
+                if filename.startswith("grid_") and filename.endswith(".npz"):
+                    grid_dict = np.load(os.path.join(path, filename))
+                    grid_params = dequantize(grid_dict['data'], grid_dict['scale'], grid_dict['min'], log=True)
+
+                    orig_key = grid_dict['orig_key'].item() if grid_dict['orig_key'].shape == () else str(grid_dict['orig_key'])
+                    grid_state_dict[orig_key] = torch.from_numpy(np.asarray(grid_params)).half().cuda()
 
         if grid_state_dict:
             self._grid.load_state_dict(grid_state_dict, strict=True)
@@ -740,16 +850,30 @@ class GaussianModel:
         sh_mask = np.load(os.path.join(path, 'sh_mask.npz'))['data'].astype(np.float32)
         self._sh_mask = torch.from_numpy(np.asarray(sh_mask)).cuda()
 
-        # mlps
-        opacity_params = np.load(os.path.join(path, 'opacity.npz'))['data']
-        f_rest_params = np.load(os.path.join(path, 'f_rest.npz'))['data']
-        scale_params = np.load(os.path.join(path, 'scale.npz'))['data']
-        rotation_params = np.load(os.path.join(path, 'rotation.npz'))['data']
+        # mlps: prefer combined mlps.npz (quantized) else fallback to older float16 files
+        mlps_path = os.path.join(path, 'mlps.npz')
+        if os.path.exists(mlps_path):
+            mlp_npz = np.load(mlps_path)
+            o = dequantize(mlp_npz['opacity_data'], mlp_npz['opacity_scale'], mlp_npz['opacity_min'], log=True)
+            fr = dequantize(mlp_npz['f_rest_data'], mlp_npz['f_rest_scale'], mlp_npz['f_rest_min'], log=True)
+            sc = dequantize(mlp_npz['scale_data'], mlp_npz['scale_scale'], mlp_npz['scale_min'], log=True)
+            rt = dequantize(mlp_npz['rotation_data'], mlp_npz['rotation_scale'], mlp_npz['rotation_min'], log=True)
 
-        self._opacity_head.params = nn.Parameter(torch.from_numpy(np.asarray(opacity_params)).half().cuda())
-        self._features_rest_head.params = nn.Parameter(torch.from_numpy(np.asarray(f_rest_params)).half().cuda())
-        self._scaling_head.params = nn.Parameter(torch.from_numpy(np.asarray(scale_params)).half().cuda())
-        self._rotation_head.params = nn.Parameter(torch.from_numpy(np.asarray(rotation_params)).half().cuda())
+            self._opacity_head.params = nn.Parameter(torch.from_numpy(np.asarray(o)).half().cuda())
+            self._features_rest_head.params = nn.Parameter(torch.from_numpy(np.asarray(fr)).half().cuda())
+            self._scaling_head.params = nn.Parameter(torch.from_numpy(np.asarray(sc)).half().cuda())
+            self._rotation_head.params = nn.Parameter(torch.from_numpy(np.asarray(rt)).half().cuda())
+        else:
+            # backward compatible loading
+            opacity_params = np.load(os.path.join(path, 'opacity.npz'))['data']
+            f_rest_params = np.load(os.path.join(path, 'f_rest.npz'))['data']
+            scale_params = np.load(os.path.join(path, 'scale.npz'))['data']
+            rotation_params = np.load(os.path.join(path, 'rotation.npz'))['data']
+
+            self._opacity_head.params = nn.Parameter(torch.from_numpy(np.asarray(opacity_params)).half().cuda())
+            self._features_rest_head.params = nn.Parameter(torch.from_numpy(np.asarray(f_rest_params)).half().cuda())
+            self._scaling_head.params = nn.Parameter(torch.from_numpy(np.asarray(scale_params)).half().cuda())
+            self._rotation_head.params = nn.Parameter(torch.from_numpy(np.asarray(rotation_params)).half().cuda())
 
         self.active_sh_degree = self.max_sh_degree
 

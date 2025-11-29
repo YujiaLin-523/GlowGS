@@ -1,15 +1,15 @@
 """
-Feature Encoders for TinyGS
+Feature Encoders for GlowGS
 
-This package provides hierarchical feature encoding components for 3D Gaussian Splatting:
-- GLFEncoder: Global Low-Frequency encoder using tri-plane factorization
-- HierarchicalDualBranchEncoder: Dual-branch architecture combining Hash + GLF
+Provides geometry-appearance dual-branch encoding for 3D Gaussian Splatting:
+- GeoEncoder: Geometry encoder using tri-plane factorization
+- GeometryAppearanceEncoder: Dual-branch with explicit feature role split
 
-Author: TinyGS Project
+Author: GlowGS Project
 License: See LICENSE.md
 """
 
-from .glf_encoder import GLFEncoder
-from .hierarchical_dual_branch import HierarchicalDualBranchEncoder
+from .geo_encoder import GeoEncoder
+from .geometry_appearance_encoder import GeometryAppearanceEncoder
 
-__all__ = ['GLFEncoder', 'HierarchicalDualBranchEncoder']
+__all__ = ['GeoEncoder', 'GeometryAppearanceEncoder']

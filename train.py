@@ -32,7 +32,10 @@ except ImportError:
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.sh_degree, dataset.hash_size, dataset.width, dataset.depth)
+    gaussians = GaussianModel(
+        dataset.sh_degree, dataset.hash_size, dataset.width, dataset.depth, 
+        dataset.feature_role_split, dataset.geo_resolution, dataset.geo_rank, dataset.geo_channels
+    )
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     if checkpoint:
@@ -138,6 +141,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print(f"  Gaussians:")
                 print(f"    Count       : {n_gaussians:,} ({n_gaussians//1000}k points)")
                 print(f"    SH Degree   : {gaussians.active_sh_degree}/{gaussians.max_sh_degree}")
+                
+                # Feature role split debug: geometry/appearance latent norms
+                if dataset.feature_role_split and hasattr(gaussians, '_last_geometry_latent'):
+                    geom_norm = gaussians._last_geometry_latent.norm(dim=-1).mean().item()
+                    app_norm = gaussians._last_appearance_latent.norm(dim=-1).mean().item()
+                    print(f"  FeatureRoleSplit:")
+                    print(f"    ||geometry_latent||  : {geom_norm:.4f}")
+                    print(f"    ||appearance_latent||: {app_norm:.4f}")
                 print(f"  Learning Rates:")
                 print(f"    Grid        : {grid_lr:.6f}")
                 print(f"    Implicit    : {other_lr:.6f}")
