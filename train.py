@@ -142,15 +142,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print(f"    Count       : {n_gaussians:,} ({n_gaussians//1000}k points)")
                 print(f"    SH Degree   : {gaussians.active_sh_degree}/{gaussians.max_sh_degree}")
                 
-                # Feature role split debug: geometry/appearance latent norms
+                # Feature role split debug: concise latent norm logging
                 if dataset.feature_role_split and hasattr(gaussians, '_last_geometry_norm'):
                     shared_norm = getattr(gaussians, '_last_shared_norm', 0.0)
                     geom_norm = getattr(gaussians, '_last_geometry_norm', 0.0)
                     app_norm = getattr(gaussians, '_last_appearance_norm', 0.0)
-                    print(f"  FeatureRoleSplit:")
-                    print(f"    ||shared_latent||   : {shared_norm:.4f}")
-                    print(f"    ||geometry_latent|| : {geom_norm:.4f}")
-                    print(f"    ||appearance_latent||: {app_norm:.4f}")
+                    print(f"  [FeatureRoleSplit] iter={iteration} ||shared||={shared_norm:.4f} ||geometry||={geom_norm:.4f} ||appearance||={app_norm:.4f}")
                 print(f"  Learning Rates:")
                 print(f"    Grid        : {grid_lr:.6f}")
                 print(f"    Implicit    : {other_lr:.6f}")

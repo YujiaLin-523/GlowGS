@@ -93,15 +93,31 @@ class GaussianModel:
         self._opacity_head = tcnn.Network(n_input_dims=self._grid.n_output_dims, n_output_dims=1, network_config=self.network_config)
         
         self._aabb = torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], dtype=torch.float, device='cuda')
-        # Small projection layers to accept concatenated inputs while preserving baseline input dim
-        # These projections are only used in feature_role_split path to map concat([role_latent, shared_latent])
-        # back to the expected input dimension for the tcnn heads.
-        self._opacity_input_proj = nn.Linear(self._grid.n_output_dims * 2, self._grid.n_output_dims, bias=True).cuda()
-        self._sh_input_proj = nn.Linear(self._grid.n_output_dims * 2, self._grid.n_output_dims, bias=True).cuda()
-        nn.init.normal_(self._opacity_input_proj.weight, std=0.01)
-        nn.init.zeros_(self._opacity_input_proj.bias)
-        nn.init.normal_(self._sh_input_proj.weight, std=0.01)
-        nn.init.zeros_(self._sh_input_proj.bias)
+        # Lightweight projection layers for feature_role_split path
+        # Map geometry_latent/appearance_latent (C_shared + C_role) to head input dim (C_shared)
+        # Only used when feature_role_split=True to preserve head capacity
+        if self._feature_role_split and hasattr(self._grid, 'geometry_dim'):
+            geometry_input_dim = self._grid.geometry_dim  # C_shared + C_role
+            appearance_input_dim = self._grid.appearance_dim  # C_shared + C_role
+            base_dim = self._grid.n_output_dims  # C_shared
+            # Projection for geometry heads (scale, rotation, opacity)
+            self._geometry_input_proj = nn.Linear(geometry_input_dim, base_dim, bias=True).cuda()
+            # Projection for appearance head (SH)
+            self._appearance_input_proj = nn.Linear(appearance_input_dim, base_dim, bias=True).cuda()
+            nn.init.normal_(self._geometry_input_proj.weight, std=0.01)
+            nn.init.zeros_(self._geometry_input_proj.bias)
+            nn.init.normal_(self._appearance_input_proj.weight, std=0.01)
+            nn.init.zeros_(self._appearance_input_proj.bias)
+        else:
+            # Fallback: legacy projection layers for backward compatibility
+            self._opacity_input_proj = nn.Linear(self._grid.n_output_dims * 2, self._grid.n_output_dims, bias=True).cuda()
+            self._sh_input_proj = nn.Linear(self._grid.n_output_dims * 2, self._grid.n_output_dims, bias=True).cuda()
+            nn.init.normal_(self._opacity_input_proj.weight, std=0.01)
+            nn.init.zeros_(self._opacity_input_proj.bias)
+            nn.init.normal_(self._sh_input_proj.weight, std=0.01)
+            nn.init.zeros_(self._sh_input_proj.bias)
+            self._geometry_input_proj = None
+            self._appearance_input_proj = None
         self._rotation_init = torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float, device='cuda')
         self._opacity_init = torch.tensor([[np.log(0.1 / (1 - 0.1))]], dtype=torch.float, device='cuda')
 
@@ -261,31 +277,32 @@ class GaussianModel:
                 geometry_chunk = self._stabilize_features(geometry_chunk)
                 appearance_chunk = self._stabilize_features(appearance_chunk)
 
-                # Accumulate norms
+                # Accumulate norms for debug logging
                 shared_norm_sum += shared_chunk.norm(dim=-1).sum().item()
                 geometry_norm_sum += geometry_chunk.norm(dim=-1).sum().item()
                 appearance_norm_sum += appearance_chunk.norm(dim=-1).sum().item()
                 total_count += shared_chunk.shape[0]
 
-                # Opacity: geometry-dominant with shared complement -> concat then project
-                try:
-                    opacity_input = torch.cat([geometry_chunk, shared_chunk], dim=-1)
-                    opacity_proj = self._opacity_input_proj(opacity_input)
-                except Exception:
-                    opacity_proj = geometry_chunk
+                # Geometry heads: scale, rotation, opacity
+                # Project geometry_latent (C_shared + C_role) to head input dim (C_shared)
+                if hasattr(self, '_geometry_input_proj') and self._geometry_input_proj is not None:
+                    geometry_proj = self._geometry_input_proj(geometry_chunk)  # [N, C_shared]
+                else:
+                    # Fallback: use geometry_chunk directly (may fail if dim mismatch)
+                    geometry_proj = geometry_chunk
+                
+                scaling_chunks.append(self._scaling_head(geometry_proj).float())
+                rotation_chunks.append(self._rotation_head(geometry_proj).float() + self._rotation_init)
+                opacity_chunks.append(self._opacity_head(geometry_proj).float() + self._opacity_init)
 
-                opacity_chunks.append(self._opacity_head(opacity_proj).float() + self._opacity_init)
-                scaling_chunks.append(self._scaling_head(geometry_chunk).float())
-                rotation_chunks.append(self._rotation_head(geometry_chunk).float() + self._rotation_init)
-
-                # Appearance / SH
+                # Appearance / SH head
                 if self.max_sh_degree > 0:
-                    try:
-                        sh_input = torch.cat([appearance_chunk, shared_chunk], dim=-1)
-                        sh_proj = self._sh_input_proj(sh_input)
-                    except Exception:
-                        sh_proj = appearance_chunk
-                    features_rest_chunks.append(self._features_rest_head(sh_proj).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3).float())
+                    if hasattr(self, '_appearance_input_proj') and self._appearance_input_proj is not None:
+                        appearance_proj = self._appearance_input_proj(appearance_chunk)  # [N, C_shared]
+                    else:
+                        # Fallback: use appearance_chunk directly
+                        appearance_proj = appearance_chunk
+                    features_rest_chunks.append(self._features_rest_head(appearance_proj).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3).float())
 
             # Concatenate all chunk outputs to full tensors
             if len(opacity_chunks) > 0:
@@ -456,10 +473,21 @@ class GaussianModel:
             {'params': self._scaling_head.parameters(), 'lr': 0.0, "name": "scaling"},
             {'params': list(self._rotation_head.parameters()), 'lr': 0.0, "name": "rotation"},
         ]
-        # Include small projection layers into implicit optimizer so they can adapt
+        # Include projection layers into implicit optimizer so they can adapt
         try:
-            proj_params = list(self._opacity_input_proj.parameters()) + list(self._sh_input_proj.parameters())
-            param_groups_i.append({'params': proj_params, 'lr': 0.0, "name": "proj"})
+            proj_params = []
+            if hasattr(self, '_geometry_input_proj') and self._geometry_input_proj is not None:
+                proj_params.extend(list(self._geometry_input_proj.parameters()))
+            if hasattr(self, '_appearance_input_proj') and self._appearance_input_proj is not None:
+                proj_params.extend(list(self._appearance_input_proj.parameters()))
+            # Fallback: legacy projection layers
+            if len(proj_params) == 0:
+                if hasattr(self, '_opacity_input_proj'):
+                    proj_params.extend(list(self._opacity_input_proj.parameters()))
+                if hasattr(self, '_sh_input_proj'):
+                    proj_params.extend(list(self._sh_input_proj.parameters()))
+            if len(proj_params) > 0:
+                param_groups_i.append({'params': proj_params, 'lr': 0.0, "name": "proj"})
         except Exception:
             pass
         self.optimizer_i = torch.optim.Adam(param_groups_i, lr=0.0, eps=1e-15)

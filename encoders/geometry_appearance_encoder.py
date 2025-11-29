@@ -66,28 +66,24 @@ class GeometryAppearanceEncoder(nn.Module):
         )
         self.geo_dim = geo_channels
         
-        # Shared latent projector and lightweight role-specific adapters
+        # Shared latent projector: unified local code from dual-branch features
         # shared_latent dimension equals baseline out_dim to preserve downstream compatibility
         self.shared_projector = nn.Sequential(
             nn.Linear(self.hash_dim + self.geo_dim, out_dim, bias=True),
             nn.SiLU()
         )
 
-        # Very-light residual adapters: act on shared_latent and produce small deltas
-        self.geometry_adapter = nn.Sequential(
-            nn.Linear(out_dim, out_dim, bias=True),
-            nn.SiLU()
-        )
-        self.appearance_adapter = nn.Sequential(
-            nn.Linear(out_dim, out_dim, bias=True),
-            nn.SiLU()
-        )
+        # Small-dimension residual adapters: lightweight role-specific specialization
+        # C_role << C_shared (e.g., 16 vs 64) to reduce computation and memory
+        self._role_dim = 16  # Fixed small dimension for residual, not exposed as CLI param
+        self.geometry_adapter = nn.Linear(out_dim, self._role_dim, bias=True)
+        self.appearance_adapter = nn.Linear(out_dim, self._role_dim, bias=True)
 
         # Fallback fusion layer for non-split mode (preserve original behavior)
         self.fusion_layer = nn.Linear(self.hash_dim + self.geo_dim, out_dim, bias=True)
 
         # Initialize small weights for stability
-        for layer in [self.shared_projector[0], self.geometry_adapter[0], self.appearance_adapter[0], self.fusion_layer]:
+        for layer in [self.shared_projector[0], self.geometry_adapter, self.appearance_adapter, self.fusion_layer]:
             nn.init.normal_(layer.weight, std=0.01)
             nn.init.zeros_(layer.bias)
         
@@ -99,10 +95,25 @@ class GeometryAppearanceEncoder(nn.Module):
         """Output dimension per branch (compatible with tcnn interface)."""
         return self._out_dim
     
+    @property
+    def role_dim(self) -> int:
+        """Dimension of role-specific residual (C_role)."""
+        return self._role_dim if self.feature_role_split else 0
+    
+    @property
+    def geometry_dim(self) -> int:
+        """Output dimension for geometry_latent when feature_role_split=True."""
+        return self._out_dim + self._role_dim if self.feature_role_split else self._out_dim
+    
+    @property
+    def appearance_dim(self) -> int:
+        """Output dimension for appearance_latent when feature_role_split=True."""
+        return self._out_dim + self._role_dim if self.feature_role_split else self._out_dim
+    
     def forward(
         self, 
         coordinates: torch.Tensor
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         Forward pass with optional feature role specialization.
         
@@ -111,7 +122,10 @@ class GeometryAppearanceEncoder(nn.Module):
         
         Returns:
             If feature_role_split=True:
-                (geometry_latent, appearance_latent): Both [N, out_dim]
+                (shared_latent, geometry_latent, appearance_latent)
+                - shared_latent: [N, C_shared] unified local code
+                - geometry_latent: [N, C_shared + C_role] for scale/rotation/opacity
+                - appearance_latent: [N, C_shared + C_role] for SH/color
             If feature_role_split=False:
                 fused_latent: [N, out_dim] single feature vector
         """
@@ -127,12 +141,13 @@ class GeometryAppearanceEncoder(nn.Module):
             shared_input = torch.cat([hash_latent, geo_latent], dim=1)
             shared_latent = self.shared_projector(shared_input)
 
-            # Lightweight residual adapters produce role-specific deltas
-            geometry_delta = self.geometry_adapter(shared_latent)
-            appearance_delta = self.appearance_adapter(shared_latent)
+            # Small-dimension residual adapters: lightweight role-specific specialization
+            geometry_residual = self.geometry_adapter(shared_latent)   # [N, C_role]
+            appearance_residual = self.appearance_adapter(shared_latent)  # [N, C_role]
 
-            geometry_latent = shared_latent + geometry_delta
-            appearance_latent = shared_latent + appearance_delta
+            # Concatenate shared_latent with role-specific residual
+            geometry_latent = torch.cat([shared_latent, geometry_residual], dim=-1)   # [N, C_shared + C_role]
+            appearance_latent = torch.cat([shared_latent, appearance_residual], dim=-1)  # [N, C_shared + C_role]
 
             # Stability clamp
             geometry_latent = self._stabilize(geometry_latent)
