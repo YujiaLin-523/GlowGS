@@ -83,11 +83,8 @@ class GaussianModel:
             geo_rank=self._geo_rank,
             feature_role_split=self._feature_role_split
         )
+        # Move encoder and its submodules to GPU
         self._grid = self._grid.cuda()
-        self._grid.geo_encoder = self._grid.geo_encoder.cuda()
-        self._grid.appearance_projection = self._grid.appearance_projection.cuda()
-        self._grid.geometry_projection = self._grid.geometry_projection.cuda()
-        self._grid.fusion_layer = self._grid.fusion_layer.cuda()
         
         # MLP heads for Gaussian attributes
         self._features_rest_head = tcnn.Network(n_input_dims=self._grid.n_output_dims, n_output_dims=(self.max_sh_degree + 1) ** 2 * 3 - 3, network_config=self.network_config)
@@ -96,6 +93,15 @@ class GaussianModel:
         self._opacity_head = tcnn.Network(n_input_dims=self._grid.n_output_dims, n_output_dims=1, network_config=self.network_config)
         
         self._aabb = torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], dtype=torch.float, device='cuda')
+        # Small projection layers to accept concatenated inputs while preserving baseline input dim
+        # These projections are only used in feature_role_split path to map concat([role_latent, shared_latent])
+        # back to the expected input dimension for the tcnn heads.
+        self._opacity_input_proj = nn.Linear(self._grid.n_output_dims * 2, self._grid.n_output_dims, bias=True).cuda()
+        self._sh_input_proj = nn.Linear(self._grid.n_output_dims * 2, self._grid.n_output_dims, bias=True).cuda()
+        nn.init.normal_(self._opacity_input_proj.weight, std=0.01)
+        nn.init.zeros_(self._opacity_input_proj.bias)
+        nn.init.normal_(self._sh_input_proj.weight, std=0.01)
+        nn.init.zeros_(self._sh_input_proj.bias)
         self._rotation_init = torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float, device='cuda')
         self._opacity_init = torch.tensor([[np.log(0.1 / (1 - 0.1))]], dtype=torch.float, device='cuda')
 
@@ -199,38 +205,137 @@ class GaussianModel:
             - appearance_latent → SH/color head (features_rest)
         """
         contracted_xyz = self.get_contracted_xyz
-        encoder_output = self._grid(contracted_xyz)
-        
-        if self._feature_role_split and isinstance(encoder_output, tuple):
-            # Geometry/appearance disentanglement enabled
-            geometry_latent, appearance_latent = encoder_output
-            
-            # Stability check
-            geometry_latent = self._stabilize_features(geometry_latent)
-            appearance_latent = self._stabilize_features(appearance_latent)
-            
-            # Store for debug logging
-            self._last_geometry_latent = geometry_latent
-            self._last_appearance_latent = appearance_latent
-            
-            # Geometric attributes from geometry branch (structure-focused)
-            self._opacity = self._opacity_head(geometry_latent).float() + self._opacity_init
-            self._scaling = self._scaling_head(geometry_latent).float()
-            self._rotation = self._rotation_head(geometry_latent).float() + self._rotation_init
-            
-            # Appearance attributes from appearance branch (texture-focused)
-            if self.max_sh_degree > 0:
-                self._features_rest = self._features_rest_head(appearance_latent).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3).float()
+
+        # Chunked evaluation to reduce peak memory usage when many Gaussians are present
+        N = contracted_xyz.shape[0]
+        if N == 0:
+            return
+
+        chunk_size = 16384  # conservative default; reduces peak memory
+
+        if self._feature_role_split:
+            # We'll compute heads per-chunk and concatenate results to avoid large intermediate tensors.
+            opacity_chunks = []
+            scaling_chunks = []
+            rotation_chunks = []
+            features_rest_chunks = []
+
+            # For debug stats (mean norms) compute weighted average without storing full latents
+            shared_norm_sum = 0.0
+            geometry_norm_sum = 0.0
+            appearance_norm_sum = 0.0
+            total_count = 0
+
+            for i in range(0, N, chunk_size):
+                coords = contracted_xyz[i: i + chunk_size]
+                encoder_out = self._grid(coords)
+
+                # Support both 2-tuple legacy and 3-tuple new encoder outputs
+                if isinstance(encoder_out, tuple):
+                    if len(encoder_out) == 3:
+                        shared_chunk, geometry_chunk, appearance_chunk = encoder_out
+                    elif len(encoder_out) == 2:
+                        geometry_chunk, appearance_chunk = encoder_out
+                        shared_chunk = geometry_chunk
+                else:
+                    # Unexpected fused output; treat as fused latent
+                    fused = encoder_out
+                    fused = self._stabilize_features(fused)
+                    try:
+                        opacity_chunks.append(self._opacity_head(fused).float() + self._opacity_init)
+                        scaling_chunks.append(self._scaling_head(fused).float())
+                        rotation_chunks.append(self._rotation_head(fused).float() + self._rotation_init)
+                        if self.max_sh_degree > 0:
+                            features_rest_chunks.append(self._features_rest_head(fused).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3).float())
+                    except Exception:
+                        # As last resort, skip this chunk
+                        opacity_chunks.append(torch.zeros((fused.shape[0], 1), device=fused.device))
+                        scaling_chunks.append(torch.zeros((fused.shape[0], self._scaling_head.n_output_dims if hasattr(self._scaling_head, 'n_output_dims') else 3), device=fused.device))
+                        rotation_chunks.append(torch.zeros((fused.shape[0], 4), device=fused.device))
+                    # Stats
+                    total_count += fused.shape[0]
+                    continue
+
+                # Stabilize per-chunk
+                shared_chunk = self._stabilize_features(shared_chunk)
+                geometry_chunk = self._stabilize_features(geometry_chunk)
+                appearance_chunk = self._stabilize_features(appearance_chunk)
+
+                # Accumulate norms
+                shared_norm_sum += shared_chunk.norm(dim=-1).sum().item()
+                geometry_norm_sum += geometry_chunk.norm(dim=-1).sum().item()
+                appearance_norm_sum += appearance_chunk.norm(dim=-1).sum().item()
+                total_count += shared_chunk.shape[0]
+
+                # Opacity: geometry-dominant with shared complement -> concat then project
+                try:
+                    opacity_input = torch.cat([geometry_chunk, shared_chunk], dim=-1)
+                    opacity_proj = self._opacity_input_proj(opacity_input)
+                except Exception:
+                    opacity_proj = geometry_chunk
+
+                opacity_chunks.append(self._opacity_head(opacity_proj).float() + self._opacity_init)
+                scaling_chunks.append(self._scaling_head(geometry_chunk).float())
+                rotation_chunks.append(self._rotation_head(geometry_chunk).float() + self._rotation_init)
+
+                # Appearance / SH
+                if self.max_sh_degree > 0:
+                    try:
+                        sh_input = torch.cat([appearance_chunk, shared_chunk], dim=-1)
+                        sh_proj = self._sh_input_proj(sh_input)
+                    except Exception:
+                        sh_proj = appearance_chunk
+                    features_rest_chunks.append(self._features_rest_head(sh_proj).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3).float())
+
+            # Concatenate all chunk outputs to full tensors
+            if len(opacity_chunks) > 0:
+                self._opacity = torch.cat(opacity_chunks, dim=0)
+            else:
+                self._opacity = torch.zeros((N, 1), device=self._xyz.device)
+            if len(scaling_chunks) > 0:
+                self._scaling = torch.cat(scaling_chunks, dim=0)
+            else:
+                self._scaling = torch.zeros((N, self._scaling_head.n_output_dims if hasattr(self._scaling_head, 'n_output_dims') else 3), device=self._xyz.device)
+            if len(rotation_chunks) > 0:
+                self._rotation = torch.cat(rotation_chunks, dim=0)
+            else:
+                self._rotation = torch.zeros((N, 4), device=self._xyz.device)
+            if self.max_sh_degree > 0 and len(features_rest_chunks) > 0:
+                self._features_rest = torch.cat(features_rest_chunks, dim=0)
+
+            # Store mean-norm scalars for light-weight debug logging
+            if total_count > 0:
+                self._last_shared_norm = shared_norm_sum / total_count
+                self._last_geometry_norm = geometry_norm_sum / total_count
+                self._last_appearance_norm = appearance_norm_sum / total_count
+            else:
+                self._last_shared_norm = 0.0
+                self._last_geometry_norm = 0.0
+                self._last_appearance_norm = 0.0
         else:
             # Fallback: single fused latent for all heads
-            feats = encoder_output if not isinstance(encoder_output, tuple) else encoder_output[0]
-            feats = self._stabilize_features(feats)
-            
-            self._opacity = self._opacity_head(feats).float() + self._opacity_init
-            self._scaling = self._scaling_head(feats).float()
-            self._rotation = self._rotation_head(feats).float() + self._rotation_init
+            # Compute in chunks as well to control peak memory
+            feats_chunks = []
+            opacity_chunks = []
+            scaling_chunks = []
+            rotation_chunks = []
+            features_rest_chunks = []
+            for i in range(0, N, chunk_size):
+                coords = contracted_xyz[i: i + chunk_size]
+                encoder_out = self._grid(coords)
+                feats = encoder_out if not isinstance(encoder_out, tuple) else encoder_out[0]
+                feats = self._stabilize_features(feats)
+                opacity_chunks.append(self._opacity_head(feats).float() + self._opacity_init)
+                scaling_chunks.append(self._scaling_head(feats).float())
+                rotation_chunks.append(self._rotation_head(feats).float() + self._rotation_init)
+                if self.max_sh_degree > 0:
+                    features_rest_chunks.append(self._features_rest_head(feats).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3).float())
+
+            self._opacity = torch.cat(opacity_chunks, dim=0)
+            self._scaling = torch.cat(scaling_chunks, dim=0)
+            self._rotation = torch.cat(rotation_chunks, dim=0)
             if self.max_sh_degree > 0:
-                self._features_rest = self._features_rest_head(feats).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3).float()
+                self._features_rest = torch.cat(features_rest_chunks, dim=0)
         
         # NOTE: Removed torch.cuda.empty_cache() here for real-time performance
         # empty_cache() is expensive (~1-2ms) and should only be called when necessary
@@ -351,6 +456,12 @@ class GaussianModel:
             {'params': self._scaling_head.parameters(), 'lr': 0.0, "name": "scaling"},
             {'params': list(self._rotation_head.parameters()), 'lr': 0.0, "name": "rotation"},
         ]
+        # Include small projection layers into implicit optimizer so they can adapt
+        try:
+            proj_params = list(self._opacity_input_proj.parameters()) + list(self._sh_input_proj.parameters())
+            param_groups_i.append({'params': proj_params, 'lr': 0.0, "name": "proj"})
+        except Exception:
+            pass
         self.optimizer_i = torch.optim.Adam(param_groups_i, lr=0.0, eps=1e-15)
 
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,

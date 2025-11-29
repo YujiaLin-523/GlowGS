@@ -94,7 +94,7 @@ class GeoEncoder(nn.Module):
     
     def _sample_plane(
         self,
-        plane: torch.Tensor,
+        plane_features: torch.Tensor,
         coordinates: torch.Tensor
     ) -> torch.Tensor:
         """
@@ -108,13 +108,10 @@ class GeoEncoder(nn.Module):
         Returns:
             torch.Tensor: Sampled features [N, rank]
         """
-        # Use contiguous() only if needed, and avoid unnecessary reshape operations
-        # Reshape plane: [H, W, rank] -> [1, rank, H, W] for grid_sample
-        plane_features = plane.permute(2, 0, 1).unsqueeze(0)
-        
+        # plane_features: [1, rank, H, W], precomputed in forward to avoid repeated permute
         # Reshape coordinates: [N, 2] -> [1, 1, N, 2] for grid_sample
         grid = coordinates.view(1, 1, -1, 2)
-        
+
         # Bilinear interpolation - use mode='bilinear' for smooth features
         # Output: [1, rank, 1, N] -> [N, rank]
         sampled = F.grid_sample(
@@ -124,7 +121,7 @@ class GeoEncoder(nn.Module):
             padding_mode='border',
             align_corners=False
         )
-        
+
         # Efficient reshape: [1, rank, 1, N] -> [N, rank]
         return sampled.view(self.rank, -1).t()
     
@@ -145,13 +142,18 @@ class GeoEncoder(nn.Module):
         coords = coordinates.clamp(-1.0, 1.0)
         
         # Efficient tri-plane sampling using slicing instead of separate cat operations
+        # Precompute plane features in the shape expected by grid_sample: [1, rank, H, W]
+        plane_xy_feat = self.plane_xy.permute(2, 0, 1).unsqueeze(0)
+        plane_xz_feat = self.plane_xz.permute(2, 0, 1).unsqueeze(0)
+        plane_yz_feat = self.plane_yz.permute(2, 0, 1).unsqueeze(0)
+
         # XY plane: sample with (x, y)
-        xy_features = self._sample_plane(self.plane_xy, coords[:, :2])
-        # XZ plane: sample with (x, z)  
-        xz_features = self._sample_plane(self.plane_xz, coords[:, [0, 2]])
+        xy_features = self._sample_plane(plane_xy_feat, coords[:, :2])
+        # XZ plane: sample with (x, z)
+        xz_features = self._sample_plane(plane_xz_feat, coords[:, [0, 2]])
         # YZ plane: sample with (y, z)
-        yz_features = self._sample_plane(self.plane_yz, coords[:, 1:])
-        
+        yz_features = self._sample_plane(plane_yz_feat, coords[:, 1:])
+
         # Concatenate features from all three planes
         triplane_features = torch.cat([xy_features, xz_features, yz_features], dim=1)
         

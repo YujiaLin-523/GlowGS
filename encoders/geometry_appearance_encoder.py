@@ -66,15 +66,28 @@ class GeometryAppearanceEncoder(nn.Module):
         )
         self.geo_dim = geo_channels
         
-        # Projection layers for each branch
-        self.appearance_projection = nn.Linear(self.hash_dim, out_dim, bias=True)
-        self.geometry_projection = nn.Linear(self.geo_dim, out_dim, bias=True)
-        
-        # Fallback fusion layer for non-split mode
+        # Shared latent projector and lightweight role-specific adapters
+        # shared_latent dimension equals baseline out_dim to preserve downstream compatibility
+        self.shared_projector = nn.Sequential(
+            nn.Linear(self.hash_dim + self.geo_dim, out_dim, bias=True),
+            nn.SiLU()
+        )
+
+        # Very-light residual adapters: act on shared_latent and produce small deltas
+        self.geometry_adapter = nn.Sequential(
+            nn.Linear(out_dim, out_dim, bias=True),
+            nn.SiLU()
+        )
+        self.appearance_adapter = nn.Sequential(
+            nn.Linear(out_dim, out_dim, bias=True),
+            nn.SiLU()
+        )
+
+        # Fallback fusion layer for non-split mode (preserve original behavior)
         self.fusion_layer = nn.Linear(self.hash_dim + self.geo_dim, out_dim, bias=True)
-        
-        # Initialize with small weights for stability
-        for layer in [self.appearance_projection, self.geometry_projection, self.fusion_layer]:
+
+        # Initialize small weights for stability
+        for layer in [self.shared_projector[0], self.geometry_adapter[0], self.appearance_adapter[0], self.fusion_layer]:
             nn.init.normal_(layer.weight, std=0.01)
             nn.init.zeros_(layer.bias)
         
@@ -105,22 +118,30 @@ class GeometryAppearanceEncoder(nn.Module):
         # Hash branch: high-frequency for appearance
         # Note: tinycudann outputs float16, need to convert to float32
         hash_latent = self.hash_encoder(coordinates).float()
-        
+
         # Geo branch: low-frequency for geometry
         geo_latent = self.geo_encoder(coordinates)
-        
+
         if self.feature_role_split:
-            # Geometry latent from GeoEncoder (structural/low-frequency bias)
-            geometry_latent = self.geometry_projection(geo_latent)
+            # Build shared latent from concatenated multi-resolution features
+            shared_input = torch.cat([hash_latent, geo_latent], dim=1)
+            shared_latent = self.shared_projector(shared_input)
+
+            # Lightweight residual adapters produce role-specific deltas
+            geometry_delta = self.geometry_adapter(shared_latent)
+            appearance_delta = self.appearance_adapter(shared_latent)
+
+            geometry_latent = shared_latent + geometry_delta
+            appearance_latent = shared_latent + appearance_delta
+
+            # Stability clamp
             geometry_latent = self._stabilize(geometry_latent)
-            
-            # Appearance latent from Hash (detailed/high-frequency bias)
-            appearance_latent = self.appearance_projection(hash_latent)
             appearance_latent = self._stabilize(appearance_latent)
-            
-            return geometry_latent, appearance_latent
+            shared_latent = self._stabilize(shared_latent)
+
+            return shared_latent, geometry_latent, appearance_latent
         else:
-            # Fallback: fuse both branches into single latent
+            # Fallback: fuse both branches into single latent (legacy behaviour)
             combined = torch.cat([hash_latent, geo_latent], dim=1)
             fused_latent = self.fusion_layer(combined)
             return self._stabilize(fused_latent)
