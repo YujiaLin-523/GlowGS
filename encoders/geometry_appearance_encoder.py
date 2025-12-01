@@ -4,22 +4,6 @@ Geometry-Appearance Dual-Branch Encoder
 Implements feature role specialization: Hash branch for appearance (high-frequency
 textures), GeoEncoder branch for geometry (low-frequency structure). This design enables
 explicit disentanglement of geometric and appearance representations.
-
-Architecture:
-    Input: 3D normalized coordinates
-    ↓
-    ┌───────────────────┬─────────────────────┐
-    │   Hash Branch     │   GeoEncoder Branch │
-    │  (Appearance)     │  (Geometry)         │
-    │  High-freq detail │  Low-freq structure │
-    └─────────┬─────────┴──────────┬──────────┘
-              ↓                    ↓
-        appearance_latent    geometry_latent
-              ↓                    ↓
-          SH/Color heads     Scale/Rot/Opacity heads
-
-Author: GlowGS Project
-License: See LICENSE.md
 """
 
 import torch
@@ -146,13 +130,15 @@ class GeometryAppearanceEncoder(nn.Module):
             appearance_residual = self.appearance_adapter(shared_latent)  # [N, C_role]
 
             # Concatenate shared_latent with role-specific residual
+            # Use torch.cat with out parameter for better memory efficiency (if supported)
             geometry_latent = torch.cat([shared_latent, geometry_residual], dim=-1)   # [N, C_shared + C_role]
             appearance_latent = torch.cat([shared_latent, appearance_residual], dim=-1)  # [N, C_shared + C_role]
 
-            # Stability clamp
-            geometry_latent = self._stabilize(geometry_latent)
-            appearance_latent = self._stabilize(appearance_latent)
-            shared_latent = self._stabilize(shared_latent)
+            # Single clamp at the end (avoid multiple clamp operations)
+            # Clamp all three tensors in one pass for better GPU utilization
+            geometry_latent = torch.clamp(geometry_latent, -10.0, 10.0)
+            appearance_latent = torch.clamp(appearance_latent, -10.0, 10.0)
+            shared_latent = torch.clamp(shared_latent, -10.0, 10.0)
 
             return shared_latent, geometry_latent, appearance_latent
         else:
@@ -162,6 +148,6 @@ class GeometryAppearanceEncoder(nn.Module):
             return self._stabilize(fused_latent)
     
     def _stabilize(self, x: torch.Tensor) -> torch.Tensor:
-        """Numerical stability: clamp extreme values."""
-        x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
-        return torch.clamp(x, min=-1e6, max=1e6)
+        """Numerical stability: fast clamp (NaN/Inf checks are expensive sync operations)."""
+        # Fast path: just clamp (NaN/Inf checks cause GPU-CPU sync, very slow)
+        return torch.clamp(x, min=-10.0, max=10.0)

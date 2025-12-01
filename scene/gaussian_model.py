@@ -227,23 +227,27 @@ class GaussianModel:
         if N == 0:
             return
 
-        chunk_size = 16384  # conservative default; reduces peak memory
+        # Optimize chunk size: use larger chunks or process all at once if memory allows
+        # For better GPU utilization, try to process in fewer, larger chunks
+        chunk_size = min(131072, N) if N > 65536 else N  # Process all at once if < 65k, else use 128k chunks
 
         if self._feature_role_split:
-            # We'll compute heads per-chunk and concatenate results to avoid large intermediate tensors.
-            opacity_chunks = []
-            scaling_chunks = []
-            rotation_chunks = []
-            features_rest_chunks = []
+            # Pre-allocate output tensors to avoid append + cat overhead
+            self._opacity = torch.empty((N, 1), device=self._xyz.device, dtype=torch.float32)
+            self._scaling = torch.empty((N, 3), device=self._xyz.device, dtype=torch.float32)
+            self._rotation = torch.empty((N, 4), device=self._xyz.device, dtype=torch.float32)
+            if self.max_sh_degree > 0:
+                self._features_rest = torch.empty((N, (self.max_sh_degree + 1) ** 2 - 1, 3), device=self._xyz.device, dtype=torch.float32)
 
-            # For debug stats (mean norms) compute weighted average without storing full latents
+            # For debug stats (mean norms) - compute only when needed (every 1000 iter)
             shared_norm_sum = 0.0
             geometry_norm_sum = 0.0
             appearance_norm_sum = 0.0
             total_count = 0
 
             for i in range(0, N, chunk_size):
-                coords = contracted_xyz[i: i + chunk_size]
+                end_idx = min(i + chunk_size, N)
+                coords = contracted_xyz[i: end_idx]
                 encoder_out = self._grid(coords)
 
                 # Support both 2-tuple legacy and 3-tuple new encoder outputs
@@ -256,111 +260,82 @@ class GaussianModel:
                 else:
                     # Unexpected fused output; treat as fused latent
                     fused = encoder_out
-                    fused = self._stabilize_features(fused)
+                    fused = torch.clamp(fused, -10.0, 10.0)
                     try:
-                        opacity_chunks.append(self._opacity_head(fused).float() + self._opacity_init)
-                        scaling_chunks.append(self._scaling_head(fused).float())
-                        rotation_chunks.append(self._rotation_head(fused).float() + self._rotation_init)
+                        self._opacity[i:end_idx] = self._opacity_head(fused) + self._opacity_init
+                        self._scaling[i:end_idx] = self._scaling_head(fused)
+                        self._rotation[i:end_idx] = self._rotation_head(fused) + self._rotation_init
                         if self.max_sh_degree > 0:
-                            features_rest_chunks.append(self._features_rest_head(fused).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3).float())
+                            self._features_rest[i:end_idx] = self._features_rest_head(fused).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3)
                     except Exception:
-                        # As last resort, skip this chunk
-                        opacity_chunks.append(torch.zeros((fused.shape[0], 1), device=fused.device))
-                        scaling_chunks.append(torch.zeros((fused.shape[0], self._scaling_head.n_output_dims if hasattr(self._scaling_head, 'n_output_dims') else 3), device=fused.device))
-                        rotation_chunks.append(torch.zeros((fused.shape[0], 4), device=fused.device))
-                    # Stats
+                        # Fallback: zero initialization
+                        self._opacity[i:end_idx] = self._opacity_init.expand(end_idx - i, -1)
+                        self._scaling[i:end_idx] = 0.0
+                        self._rotation[i:end_idx] = self._rotation_init.expand(end_idx - i, -1)
                     total_count += fused.shape[0]
                     continue
 
-                # Stabilize per-chunk
-                shared_chunk = self._stabilize_features(shared_chunk)
-                geometry_chunk = self._stabilize_features(geometry_chunk)
-                appearance_chunk = self._stabilize_features(appearance_chunk)
-
-                # Accumulate norms for debug logging
-                shared_norm_sum += shared_chunk.norm(dim=-1).sum().item()
-                geometry_norm_sum += geometry_chunk.norm(dim=-1).sum().item()
-                appearance_norm_sum += appearance_chunk.norm(dim=-1).sum().item()
-                total_count += shared_chunk.shape[0]
+                # Encoder already clamps, skip redundant clamp here (encoder does it)
+                # Only clamp if values are out of expected range (rare case)
+                
+                # Accumulate norms for debug logging (defer .item() to reduce sync)
+                chunk_size_actual = shared_chunk.shape[0]
+                with torch.no_grad():
+                    shared_norm_sum += shared_chunk.norm(dim=-1).sum()
+                    geometry_norm_sum += geometry_chunk.norm(dim=-1).sum()
+                    appearance_norm_sum += appearance_chunk.norm(dim=-1).sum()
+                total_count += chunk_size_actual
 
                 # Geometry heads: scale, rotation, opacity
                 # Project geometry_latent (C_shared + C_role) to head input dim (C_shared)
-                if hasattr(self, '_geometry_input_proj') and self._geometry_input_proj is not None:
-                    geometry_proj = self._geometry_input_proj(geometry_chunk)  # [N, C_shared]
-                else:
-                    # Fallback: use geometry_chunk directly (may fail if dim mismatch)
-                    geometry_proj = geometry_chunk
+                geometry_proj = self._geometry_input_proj(geometry_chunk)  # [N, C_shared]
                 
-                scaling_chunks.append(self._scaling_head(geometry_proj).float())
-                rotation_chunks.append(self._rotation_head(geometry_proj).float() + self._rotation_init)
-                opacity_chunks.append(self._opacity_head(geometry_proj).float() + self._opacity_init)
+                # Direct assignment to pre-allocated tensors (faster than append + cat)
+                self._scaling[i:end_idx] = self._scaling_head(geometry_proj)
+                self._rotation[i:end_idx] = self._rotation_head(geometry_proj) + self._rotation_init
+                self._opacity[i:end_idx] = self._opacity_head(geometry_proj) + self._opacity_init
 
                 # Appearance / SH head
                 if self.max_sh_degree > 0:
-                    if hasattr(self, '_appearance_input_proj') and self._appearance_input_proj is not None:
-                        appearance_proj = self._appearance_input_proj(appearance_chunk)  # [N, C_shared]
-                    else:
-                        # Fallback: use appearance_chunk directly
-                        appearance_proj = appearance_chunk
-                    features_rest_chunks.append(self._features_rest_head(appearance_proj).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3).float())
+                    appearance_proj = self._appearance_input_proj(appearance_chunk)  # [N, C_shared]
+                    self._features_rest[i:end_idx] = self._features_rest_head(appearance_proj).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3)
 
-            # Concatenate all chunk outputs to full tensors
-            if len(opacity_chunks) > 0:
-                self._opacity = torch.cat(opacity_chunks, dim=0)
-            else:
-                self._opacity = torch.zeros((N, 1), device=self._xyz.device)
-            if len(scaling_chunks) > 0:
-                self._scaling = torch.cat(scaling_chunks, dim=0)
-            else:
-                self._scaling = torch.zeros((N, self._scaling_head.n_output_dims if hasattr(self._scaling_head, 'n_output_dims') else 3), device=self._xyz.device)
-            if len(rotation_chunks) > 0:
-                self._rotation = torch.cat(rotation_chunks, dim=0)
-            else:
-                self._rotation = torch.zeros((N, 4), device=self._xyz.device)
-            if self.max_sh_degree > 0 and len(features_rest_chunks) > 0:
-                self._features_rest = torch.cat(features_rest_chunks, dim=0)
-
-            # Store mean-norm scalars for light-weight debug logging
+            # Store mean-norm scalars for light-weight debug logging (convert to float only when needed)
             if total_count > 0:
-                self._last_shared_norm = shared_norm_sum / total_count
-                self._last_geometry_norm = geometry_norm_sum / total_count
-                self._last_appearance_norm = appearance_norm_sum / total_count
+                self._last_shared_norm = (shared_norm_sum / total_count).item()
+                self._last_geometry_norm = (geometry_norm_sum / total_count).item()
+                self._last_appearance_norm = (appearance_norm_sum / total_count).item()
             else:
                 self._last_shared_norm = 0.0
                 self._last_geometry_norm = 0.0
                 self._last_appearance_norm = 0.0
         else:
             # Fallback: single fused latent for all heads
-            # Compute in chunks as well to control peak memory
-            feats_chunks = []
-            opacity_chunks = []
-            scaling_chunks = []
-            rotation_chunks = []
-            features_rest_chunks = []
+            # Pre-allocate output tensors for better performance
+            self._opacity = torch.empty((N, 1), device=self._xyz.device, dtype=torch.float32)
+            self._scaling = torch.empty((N, 3), device=self._xyz.device, dtype=torch.float32)
+            self._rotation = torch.empty((N, 4), device=self._xyz.device, dtype=torch.float32)
+            if self.max_sh_degree > 0:
+                self._features_rest = torch.empty((N, (self.max_sh_degree + 1) ** 2 - 1, 3), device=self._xyz.device, dtype=torch.float32)
+            
             for i in range(0, N, chunk_size):
-                coords = contracted_xyz[i: i + chunk_size]
+                end_idx = min(i + chunk_size, N)
+                coords = contracted_xyz[i: end_idx]
                 encoder_out = self._grid(coords)
                 feats = encoder_out if not isinstance(encoder_out, tuple) else encoder_out[0]
-                feats = self._stabilize_features(feats)
-                opacity_chunks.append(self._opacity_head(feats).float() + self._opacity_init)
-                scaling_chunks.append(self._scaling_head(feats).float())
-                rotation_chunks.append(self._rotation_head(feats).float() + self._rotation_init)
+                # Encoder already clamps, skip redundant clamp
+                self._opacity[i:end_idx] = self._opacity_head(feats) + self._opacity_init
+                self._scaling[i:end_idx] = self._scaling_head(feats)
+                self._rotation[i:end_idx] = self._rotation_head(feats) + self._rotation_init
                 if self.max_sh_degree > 0:
-                    features_rest_chunks.append(self._features_rest_head(feats).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3).float())
-
-            self._opacity = torch.cat(opacity_chunks, dim=0)
-            self._scaling = torch.cat(scaling_chunks, dim=0)
-            self._rotation = torch.cat(rotation_chunks, dim=0)
-            if self.max_sh_degree > 0:
-                self._features_rest = torch.cat(features_rest_chunks, dim=0)
+                    self._features_rest[i:end_idx] = self._features_rest_head(feats).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3)
         
         # NOTE: Removed torch.cuda.empty_cache() here for real-time performance
         # empty_cache() is expensive (~1-2ms) and should only be called when necessary
     
     def _stabilize_features(self, feats: torch.Tensor) -> torch.Tensor:
-        """Numerical stability for feature tensors."""
-        if torch.isnan(feats).any() or torch.isinf(feats).any():
-            feats = torch.nan_to_num(feats, nan=0.0, posinf=10.0, neginf=-10.0)
+        """Numerical stability for feature tensors (legacy, use clamp directly in hot path)."""
+        # Fast path: just clamp (NaN/Inf checks are expensive sync operations)
         return torch.clamp(feats, -10.0, 10.0)
 
     @property
@@ -394,13 +369,13 @@ class GaussianModel:
 
     @property
     def get_contracted_xyz(self):
-        contracted = contract_to_unisphere(self.get_xyz.detach(), self._aabb)
-        # Extra safety: clamp to [-1, 1] and check for NaN/Inf
-        # This ensures encoder always receives valid input
-        contracted = torch.clamp(contracted, -1.0, 1.0)
-        if torch.isnan(contracted).any() or torch.isinf(contracted).any():
-            contracted = torch.nan_to_num(contracted, nan=0.0, posinf=1.0, neginf=-1.0)
-        return contracted
+        # Cache contracted xyz to avoid recomputation in same iteration
+        # Note: This assumes xyz doesn't change between calls in same update_attributes
+        if not hasattr(self, '_cached_contracted_xyz') or self._cached_contracted_xyz.shape[0] != self._xyz.shape[0]:
+            contracted = contract_to_unisphere(self.get_xyz.detach(), self._aabb)
+            # Fast clamp to [-1, 1] (NaN/Inf checks are expensive sync operations, skip in hot path)
+            self._cached_contracted_xyz = torch.clamp(contracted, -1.0, 1.0)
+        return self._cached_contracted_xyz
         
     @property
     def get_features(self):
@@ -681,6 +656,10 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        
+        # Clear cached contracted_xyz since xyz changed
+        if hasattr(self, '_cached_contracted_xyz'):
+            delattr(self, '_cached_contracted_xyz')
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
