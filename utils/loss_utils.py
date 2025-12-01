@@ -40,6 +40,45 @@ def ssim(img1, img2, window_size=11, size_average=True):
 
     return _ssim(img1, img2, window, window_size, channel, size_average)
 
+# 预定义Sobel算子（全局缓存，避免重复创建）
+_sobel_x = None
+_sobel_y = None
+
+def gradient_loss(img1, img2):
+    """
+    计算图像梯度损失，鼓励边缘和纹理更锐利
+    使用Sobel算子检测边缘，对梯度图计算L1损失
+    
+    性能优化：使用缓存的Sobel算子，减少重复创建开销
+    """
+    global _sobel_x, _sobel_y
+    
+    def get_gradient(img):
+        # 确保输入是4D (B, C, H, W) 或 3D (C, H, W)
+        if img.dim() == 3:
+            img = img.unsqueeze(0)
+        
+        # 使用缓存的Sobel算子
+        global _sobel_x, _sobel_y
+        if _sobel_x is None or _sobel_x.device != img.device or _sobel_x.dtype != img.dtype:
+            # 只在第一次或设备/类型变化时创建
+            _sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
+                                  dtype=img.dtype, device=img.device).view(1, 1, 3, 3)
+            _sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
+                                  dtype=img.dtype, device=img.device).view(1, 1, 3, 3)
+        
+        # 对每个通道计算梯度
+        channels = img.shape[-3]
+        grad_x = F.conv2d(img, _sobel_x.repeat(channels, 1, 1, 1), 
+                         padding=1, groups=channels)
+        grad_y = F.conv2d(img, _sobel_y.repeat(channels, 1, 1, 1), 
+                         padding=1, groups=channels)
+        return torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
+    
+    grad1 = get_gradient(img1)
+    grad2 = get_gradient(img2)
+    return l1_loss(grad1, grad2)
+
 def _ssim(img1, img2, window, window_size, channel, size_average=True):
     mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=channel)
     mu2 = F.conv2d(img2, window, padding=window_size // 2, groups=channel)

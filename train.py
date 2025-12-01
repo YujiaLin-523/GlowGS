@@ -13,7 +13,7 @@ import os
 import torch
 import torchvision
 from random import randint
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import l1_loss, ssim, gradient_loss
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -23,6 +23,23 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+
+# Enable TF32 tensor cores for faster matmul on Ampere+ GPUs
+try:
+    torch.set_float32_matmul_precision('high')
+except Exception:
+    pass
+
+try:
+    from torch.profiler import (
+        profile as torch_profile,
+        schedule as profiler_schedule,
+        ProfilerActivity,
+        tensorboard_trace_handler,
+    )
+    PROFILER_AVAILABLE = True
+except ImportError:
+    PROFILER_AVAILABLE = False
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -44,6 +61,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    
+    # Initialize AMP (Automatic Mixed Precision) if enabled
+    use_amp = getattr(opt, 'use_amp', False)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    if use_amp:
+        print("[AMP] Automatic Mixed Precision enabled - faster training with lower memory usage")
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -51,6 +74,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_stack = None
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+    profiler = None
+    profiler_logdir = None
+    profile_iter_count = 0
+    if getattr(opt, "profile_iters", 0) > 0:
+        if not PROFILER_AVAILABLE:
+            print("[WARN] torch.profiler not available, profiling disabled.")
+        else:
+            activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+            prof_schedule = profiler_schedule(
+                wait=getattr(opt, "profile_wait", 2),
+                warmup=getattr(opt, "profile_warmup", 2),
+                active=getattr(opt, "profile_active", 4),
+                repeat=1
+            )
+            profiler_logdir = getattr(opt, "profile_logdir", "") or os.path.join(scene.model_path, "profiler")
+            os.makedirs(profiler_logdir, exist_ok=True)
+            profiler = torch_profile(
+                activities=activities,
+                schedule=prof_schedule,
+                on_trace_ready=tensorboard_trace_handler(profiler_logdir),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+            )
+            profiler.start()
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):        
 
@@ -88,22 +136,38 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        # Use AMP autocast for forward pass
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
+            image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
-        # Loss
-        gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        pixel_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-        mask_loss = torch.mean(gaussians.get_mask)
-        sh_mask_loss = 0.0
-        if iteration > opt.densify_until_iter:
-            for degree in range(1, gaussians.active_sh_degree + 1):
-                lambda_degree = (2 * degree + 1) / ((gaussians.max_sh_degree + 1) ** 2 - 1)
-                sh_mask_loss += lambda_degree * torch.mean(gaussians.get_sh_mask[..., degree - 1])
+            # Loss
+            gt_image = viewpoint_cam.original_image.cuda()
+            Ll1 = l1_loss(image, gt_image)
+            pixel_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+            
+            # 新增：梯度损失，鼓励边缘和纹理更锐利
+            # 优化：降低计算频率以减少显存占用（每2次迭代计算一次）
+            if hasattr(opt, 'lambda_grad') and opt.lambda_grad > 0 and iteration % 2 == 0:
+                Lgrad = gradient_loss(image, gt_image)
+            else:
+                Lgrad = 0.0
+            
+            mask_loss = torch.mean(gaussians.get_mask)
+            sh_mask_loss = 0.0
+            if iteration > opt.densify_until_iter:
+                for degree in range(1, gaussians.active_sh_degree + 1):
+                    lambda_degree = (2 * degree + 1) / ((gaussians.max_sh_degree + 1) ** 2 - 1)
+                    # 改进：对高阶SH项使用更小的权重，避免过度抑制view-dependent效果
+                    weight = 1.0 if degree <= 2 else 0.3  # 3阶及以上权重降低
+                    sh_mask_loss += weight * lambda_degree * torch.mean(gaussians.get_sh_mask[..., degree - 1])
 
-        loss = pixel_loss + opt.lambda_mask * mask_loss + opt.lambda_sh_mask * sh_mask_loss
-        loss.backward()
+            loss = pixel_loss + opt.lambda_mask * mask_loss + opt.lambda_sh_mask * sh_mask_loss
+            if hasattr(opt, 'lambda_grad') and opt.lambda_grad > 0:
+                loss = loss + opt.lambda_grad * Lgrad
+        
+        # Backward pass with gradient scaling
+        scaler.scale(loss).backward()
 
         iter_end.record()
 
@@ -136,6 +200,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print(f"  Loss Breakdown:")
                 print(f"    Total       : {loss_total_val:.6f}")
                 print(f"    Pixel (RGB) : {loss_pixel_val:.6f} (L1={Ll1.item():.6f})")
+                if hasattr(opt, 'lambda_grad') and opt.lambda_grad > 0:
+                    loss_grad_val = Lgrad.item() if isinstance(Lgrad, torch.Tensor) else 0.0
+                    print(f"    Gradient    : {loss_grad_val:.6f} (weight={opt.lambda_grad:.4f})")
                 print(f"    Mask        : {loss_mask_val:.6f} (weight={opt.lambda_mask:.4f})")
                 print(f"    SH Mask     : {loss_sh_mask_val:.6f} (weight={opt.lambda_sh_mask:.4f})")
                 print(f"  Gaussians:")
@@ -154,6 +221,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print(f"  Resources:")
                 print(f"    GPU Memory  : {mem_allocated_gb:.2f}GB allocated, {mem_reserved_gb:.2f}GB reserved")
                 print(f"    Time/Iter   : {avg_iter_time:.3f}s")
+                
+                # Cache performance statistics
+                cache_stats = gaussians.get_cache_stats()
+                if cache_stats['total_calls'] > 0:
+                    print(f"  Cache Performance (update_attributes):")
+                    print(f"    Hit Rate    : {cache_stats['hit_rate_percent']:.1f}% ({cache_stats['cache_hits']}/{cache_stats['total_calls']} calls)")
+                    print(f"    Time Saved  : ~{cache_stats['cache_hits'] * 28:.0f}ms (est. 28ms per cache hit)")
+                    gaussians.reset_cache_stats()  # Reset for next interval
+                
                 print(f"{'='*80}\n")
             
             if iteration % 10 == 0:
@@ -176,7 +252,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    # 在densification前清理显存
+                    torch.cuda.empty_cache()
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+                    # densification后再次清理
+                    torch.cuda.empty_cache()
             else:
                 if iteration % opt.prune_interval == 0:
                     gaussians.mask_prune()
@@ -185,16 +265,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print(f"\n[ITER {iteration}] Saving Gaussians")
                 scene.save(iteration)
 
-            # Optimizer step
+            # Optimizer step with AMP gradient scaling
             if iteration < opt.iterations:
-                gaussians.optimizer.step()
-                gaussians.optimizer_i.step()
+                # Unscale gradients and step optimizers
+                scaler.step(gaussians.optimizer)
+                scaler.step(gaussians.optimizer_i)
+                scaler.update()
+                
                 gaussians.optimizer.zero_grad(set_to_none = True)
                 gaussians.optimizer_i.zero_grad(set_to_none = True)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+        if profiler:
+            profiler.step()
+            profile_iter_count += 1
+            if profile_iter_count >= getattr(opt, "profile_iters", 0):
+                profiler.stop()
+                print(f"[Profiler] Trace captured. Logs stored at {profiler_logdir}")
+                profiler = None
+
+    if profiler:
+        profiler.stop()
+        print(f"[Profiler] Trace captured. Logs stored at {profiler_logdir}")
 
 def prepare_output_and_logger(args):    
     if not args.model_path:

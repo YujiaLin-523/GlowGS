@@ -212,32 +212,57 @@ class GaussianModel:
         self.optimizer.load_state_dict(opt_dict)
         self.optimizer_i.load_state_dict(opt_i_dict)
 
-    def update_attributes(self):
+    def update_attributes(self, force_update=False):
         """
         Update implicit Gaussian attributes from encoder output.
         
         Feature role split routing:
             - geometry_latent → scale, rotation, opacity heads
             - appearance_latent → SH/color head (features_rest)
+        
+        Args:
+            force_update: If True, bypass cache and force recomputation
         """
-        contracted_xyz = self.get_contracted_xyz
-
-        # Chunked evaluation to reduce peak memory usage when many Gaussians are present
-        N = contracted_xyz.shape[0]
+        # Smart caching: Only recompute if xyz changed or during densification
+        # This saves ~28ms per iteration (profiler shows 569ms / 20 calls)
+        N = self._xyz.shape[0]
         if N == 0:
             return
+
+        # Training needs a fresh graph every iteration; disable caching when grads are enabled
+        caching_enabled = not torch.is_grad_enabled()
+        if not caching_enabled:
+            force_update = True  # always recompute under autograd to avoid stale graphs
+            self._cached_attributes_hash = None  # invalidate cache when switching back to training
+            
+        # Check if we can use cached attributes
+        if caching_enabled and not force_update and hasattr(self, '_cached_attributes_hash'):
+            # Use xyz tensor data pointer as a cheap hash (changes on densify/prune/optimizer step)
+            current_hash = (self._xyz.data_ptr(), N, self._xyz.requires_grad)
+            if current_hash == self._cached_attributes_hash:
+                # Cache hit - skip expensive recomputation
+                if not hasattr(self, '_cache_hit_count'):
+                    self._cache_hit_count = 0
+                self._cache_hit_count += 1
+                return
+        
+        # Cache miss - need to recompute
+        if not hasattr(self, '_cache_miss_count'):
+            self._cache_miss_count = 0
+        self._cache_miss_count += 1
+        
+        contracted_xyz = self.get_contracted_xyz
 
         # Optimize chunk size: use larger chunks or process all at once if memory allows
         # For better GPU utilization, try to process in fewer, larger chunks
         chunk_size = min(131072, N) if N > 65536 else N  # Process all at once if < 65k, else use 128k chunks
 
         if self._feature_role_split:
-            # Pre-allocate output tensors to avoid append + cat overhead
-            self._opacity = torch.empty((N, 1), device=self._xyz.device, dtype=torch.float32)
-            self._scaling = torch.empty((N, 3), device=self._xyz.device, dtype=torch.float32)
-            self._rotation = torch.empty((N, 4), device=self._xyz.device, dtype=torch.float32)
-            if self.max_sh_degree > 0:
-                self._features_rest = torch.empty((N, (self.max_sh_degree + 1) ** 2 - 1, 3), device=self._xyz.device, dtype=torch.float32)
+            # Collect outputs to avoid in-place writes that may invalidate autograd versions
+            opacity_chunks = []
+            scaling_chunks = []
+            rotation_chunks = []
+            features_rest_chunks = [] if self.max_sh_degree > 0 else None
 
             # For debug stats (mean norms) - compute only when needed (every 1000 iter)
             shared_norm_sum = 0.0
@@ -290,15 +315,17 @@ class GaussianModel:
                 # Project geometry_latent (C_shared + C_role) to head input dim (C_shared)
                 geometry_proj = self._geometry_input_proj(geometry_chunk)  # [N, C_shared]
                 
-                # Direct assignment to pre-allocated tensors (faster than append + cat)
-                self._scaling[i:end_idx] = self._scaling_head(geometry_proj)
-                self._rotation[i:end_idx] = self._rotation_head(geometry_proj) + self._rotation_init
-                self._opacity[i:end_idx] = self._opacity_head(geometry_proj) + self._opacity_init
+                # Append outputs; avoid in-place writes to keep autograd versions clean
+                scaling_chunks.append(self._scaling_head(geometry_proj))
+                rotation_chunks.append(self._rotation_head(geometry_proj) + self._rotation_init)
+                opacity_chunks.append(self._opacity_head(geometry_proj) + self._opacity_init)
 
                 # Appearance / SH head
                 if self.max_sh_degree > 0:
                     appearance_proj = self._appearance_input_proj(appearance_chunk)  # [N, C_shared]
-                    self._features_rest[i:end_idx] = self._features_rest_head(appearance_proj).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3)
+                    features_rest_chunks.append(
+                        self._features_rest_head(appearance_proj).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3)
+                    )
 
             # Store mean-norm scalars for light-weight debug logging (convert to float only when needed)
             if total_count > 0:
@@ -309,14 +336,23 @@ class GaussianModel:
                 self._last_shared_norm = 0.0
                 self._last_geometry_norm = 0.0
                 self._last_appearance_norm = 0.0
+
+            # Concatenate chunk outputs
+            self._opacity = torch.cat(opacity_chunks, dim=0)
+            self._scaling = torch.cat(scaling_chunks, dim=0)
+            self._rotation = torch.cat(rotation_chunks, dim=0)
+            if self.max_sh_degree > 0:
+                self._features_rest = torch.cat(features_rest_chunks, dim=0)
+            
+            # Update cache hash after successful computation
+            self._cached_attributes_hash = (self._xyz.data_ptr(), N, self._xyz.requires_grad)
         else:
             # Fallback: single fused latent for all heads
             # Pre-allocate output tensors for better performance
-            self._opacity = torch.empty((N, 1), device=self._xyz.device, dtype=torch.float32)
-            self._scaling = torch.empty((N, 3), device=self._xyz.device, dtype=torch.float32)
-            self._rotation = torch.empty((N, 4), device=self._xyz.device, dtype=torch.float32)
-            if self.max_sh_degree > 0:
-                self._features_rest = torch.empty((N, (self.max_sh_degree + 1) ** 2 - 1, 3), device=self._xyz.device, dtype=torch.float32)
+            opacity_chunks = []
+            scaling_chunks = []
+            rotation_chunks = []
+            features_rest_chunks = [] if self.max_sh_degree > 0 else None
             
             for i in range(0, N, chunk_size):
                 end_idx = min(i + chunk_size, N)
@@ -324,14 +360,41 @@ class GaussianModel:
                 encoder_out = self._grid(coords)
                 feats = encoder_out if not isinstance(encoder_out, tuple) else encoder_out[0]
                 # Encoder already clamps, skip redundant clamp
-                self._opacity[i:end_idx] = self._opacity_head(feats) + self._opacity_init
-                self._scaling[i:end_idx] = self._scaling_head(feats)
-                self._rotation[i:end_idx] = self._rotation_head(feats) + self._rotation_init
+                opacity_chunks.append(self._opacity_head(feats) + self._opacity_init)
+                scaling_chunks.append(self._scaling_head(feats))
+                rotation_chunks.append(self._rotation_head(feats) + self._rotation_init)
                 if self.max_sh_degree > 0:
-                    self._features_rest[i:end_idx] = self._features_rest_head(feats).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3)
+                    features_rest_chunks.append(self._features_rest_head(feats).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3))
+
+            self._opacity = torch.cat(opacity_chunks, dim=0)
+            self._scaling = torch.cat(scaling_chunks, dim=0)
+            self._rotation = torch.cat(rotation_chunks, dim=0)
+            if self.max_sh_degree > 0:
+                self._features_rest = torch.cat(features_rest_chunks, dim=0)
+            
+            # Update cache hash after successful computation
+            self._cached_attributes_hash = (self._xyz.data_ptr(), N, self._xyz.requires_grad)
         
         # NOTE: Removed torch.cuda.empty_cache() here for real-time performance
         # empty_cache() is expensive (~1-2ms) and should only be called when necessary
+    
+    def get_cache_stats(self):
+        """Return cache hit/miss statistics for update_attributes."""
+        hits = getattr(self, '_cache_hit_count', 0)
+        misses = getattr(self, '_cache_miss_count', 0)
+        total = hits + misses
+        hit_rate = (hits / total * 100) if total > 0 else 0.0
+        return {
+            'cache_hits': hits,
+            'cache_misses': misses,
+            'total_calls': total,
+            'hit_rate_percent': hit_rate
+        }
+    
+    def reset_cache_stats(self):
+        """Reset cache statistics counters."""
+        self._cache_hit_count = 0
+        self._cache_miss_count = 0
     
     def _stabilize_features(self, feats: torch.Tensor) -> torch.Tensor:
         """Numerical stability for feature tensors (legacy, use clamp directly in hot path)."""
@@ -369,12 +432,23 @@ class GaussianModel:
 
     @property
     def get_contracted_xyz(self):
-        # Cache contracted xyz to avoid recomputation in same iteration
-        # Note: This assumes xyz doesn't change between calls in same update_attributes
-        if not hasattr(self, '_cached_contracted_xyz') or self._cached_contracted_xyz.shape[0] != self._xyz.shape[0]:
-            contracted = contract_to_unisphere(self.get_xyz.detach(), self._aabb)
-            # Fast clamp to [-1, 1] (NaN/Inf checks are expensive sync operations, skip in hot path)
-            self._cached_contracted_xyz = torch.clamp(contracted, -1.0, 1.0)
+        # Smart cache: track xyz data pointer to detect changes (densify/prune/optimizer)
+        # This is much more efficient than shape check alone
+        N = self._xyz.shape[0]
+        if N == 0:
+            return torch.empty((0, 3), device=self._xyz.device)
+        
+        # Use data pointer + size as cache key (changes on any modification)
+        current_key = (self._xyz.data_ptr(), N)
+        
+        if not hasattr(self, '_cached_contracted_key') or self._cached_contracted_key != current_key:
+            # Cache miss - recompute
+            with torch.no_grad():  # No grad needed for coordinate transformation
+                contracted = contract_to_unisphere(self.get_xyz.detach(), self._aabb)
+                # Fast clamp to [-1, 1] (NaN/Inf checks are expensive sync operations, skip in hot path)
+                self._cached_contracted_xyz = torch.clamp(contracted, -1.0, 1.0)
+                self._cached_contracted_key = current_key
+        
         return self._cached_contracted_xyz
         
     @property
@@ -702,6 +776,10 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        # Invalidate attribute caches; shapes changed
+        self._cached_attributes_hash = None
+        if hasattr(self, '_cached_contracted_key'):
+            self._cached_contracted_key = None
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -740,30 +818,41 @@ class GaussianModel:
         new_sh_mask = self._sh_mask[selected_pts_mask]
 
         self.densification_postfix(new_xyz, new_features_dc, new_scaling_base, new_mask, new_sh_mask)
+        # Recompute implicit attributes to align shapes before further densification logic
+        self.update_attributes(force_update=True)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        self.update_attributes()
+        # Optimization: Only update once before densification
+        # Cache will be invalidated after densify_and_clone/split modify _xyz
+        self.update_attributes(force_update=True)
         self.densify_and_clone(grads, max_grad, extent)
-        self.update_attributes()
+        # Cache invalidated by densify_and_clone, will auto-update on next call
         self.densify_and_split(grads, max_grad, extent)
 
-        self.update_attributes()
-        prune_mask = torch.logical_or((self.get_mask <= 0.01).squeeze(), (self.get_opacity < min_opacity).squeeze())
+        # Final update before pruning (force to ensure we have latest attributes)
+        self.update_attributes(force_update=True)
+        # 更激进的pruning以减少显存占用
+        # 提高mask阈值，更早删除不必要的Gaussians
+        prune_mask = torch.logical_or((self.get_mask <= 0.005).squeeze(), (self.get_opacity < min_opacity).squeeze())
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
 
+        # 强制清理显存缓存
         torch.cuda.empty_cache()
+        torch.cuda.synchronize()  # 确保所有操作完成后再清理
 
     def mask_prune(self):
-        prune_mask = (self.get_mask <= 0.01).squeeze()
+        # 更激进的pruning阈值以减少显存占用
+        prune_mask = (self.get_mask <= 0.005).squeeze()
         self.prune_points(prune_mask)
         torch.cuda.empty_cache()
+        torch.cuda.synchronize()  # 确保清理完成
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)

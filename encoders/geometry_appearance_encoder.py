@@ -94,6 +94,30 @@ class GeometryAppearanceEncoder(nn.Module):
         """Output dimension for appearance_latent when feature_role_split=True."""
         return self._out_dim + self._role_dim if self.feature_role_split else self._out_dim
     
+    def _forward_split(self, hash_latent: torch.Tensor, geo_latent: torch.Tensor):
+        """
+        Internal forward logic for feature_role_split mode.
+        Separated for torch.compile optimization.
+        """
+        # Build shared latent from concatenated multi-resolution features
+        shared_input = torch.cat([hash_latent, geo_latent], dim=1)
+        shared_latent = self.shared_projector(shared_input)
+
+        # Small-dimension residual adapters: lightweight role-specific specialization
+        geometry_residual = self.geometry_adapter(shared_latent)   # [N, C_role]
+        appearance_residual = self.appearance_adapter(shared_latent)  # [N, C_role]
+
+        # Concatenate shared_latent with role-specific residual
+        geometry_latent = torch.cat([shared_latent, geometry_residual], dim=-1)   # [N, C_shared + C_role]
+        appearance_latent = torch.cat([shared_latent, appearance_residual], dim=-1)  # [N, C_shared + C_role]
+
+        # Single clamp at the end (avoid multiple clamp operations)
+        geometry_latent = torch.clamp(geometry_latent, -10.0, 10.0)
+        appearance_latent = torch.clamp(appearance_latent, -10.0, 10.0)
+        shared_latent = torch.clamp(shared_latent, -10.0, 10.0)
+
+        return shared_latent, geometry_latent, appearance_latent
+    
     def forward(
         self, 
         coordinates: torch.Tensor
@@ -121,26 +145,8 @@ class GeometryAppearanceEncoder(nn.Module):
         geo_latent = self.geo_encoder(coordinates)
 
         if self.feature_role_split:
-            # Build shared latent from concatenated multi-resolution features
-            shared_input = torch.cat([hash_latent, geo_latent], dim=1)
-            shared_latent = self.shared_projector(shared_input)
-
-            # Small-dimension residual adapters: lightweight role-specific specialization
-            geometry_residual = self.geometry_adapter(shared_latent)   # [N, C_role]
-            appearance_residual = self.appearance_adapter(shared_latent)  # [N, C_role]
-
-            # Concatenate shared_latent with role-specific residual
-            # Use torch.cat with out parameter for better memory efficiency (if supported)
-            geometry_latent = torch.cat([shared_latent, geometry_residual], dim=-1)   # [N, C_shared + C_role]
-            appearance_latent = torch.cat([shared_latent, appearance_residual], dim=-1)  # [N, C_shared + C_role]
-
-            # Single clamp at the end (avoid multiple clamp operations)
-            # Clamp all three tensors in one pass for better GPU utilization
-            geometry_latent = torch.clamp(geometry_latent, -10.0, 10.0)
-            appearance_latent = torch.clamp(appearance_latent, -10.0, 10.0)
-            shared_latent = torch.clamp(shared_latent, -10.0, 10.0)
-
-            return shared_latent, geometry_latent, appearance_latent
+            # Torch.compile introduces graph shape cache issues during densification; run eager instead.
+            return self._forward_split(hash_latent, geo_latent)
         else:
             # Fallback: fuse both branches into single latent (legacy behaviour)
             combined = torch.cat([hash_latent, geo_latent], dim=1)

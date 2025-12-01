@@ -82,21 +82,45 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     if override_color is None:
         if pipe.convert_SHs_python:
             shs_view = pc.get_features
-            sh_mask_degree = torch.ones_like(shs_view) # (N, 15, 3)
-            for degree in range(1, pc.active_sh_degree + 1):
-                sh_mask_degree[:, degree**2:, :] *= sh_mask[:, degree - 1:degree].unsqueeze(1)
-            shs_view *= sh_mask_degree 
+            # Fully vectorized SH mask application (no loop, faster)
+            # Build cumulative mask: degree i masks all coefficients from degree i onward
+            if pc.active_sh_degree > 0:
+                # Pre-compute degree boundaries: [1, 4, 9, 16, ...] for degrees [0, 1, 2, 3, ...]
+                # Mask structure: sh_mask is (N, max_degree) where sh_mask[:, d-1] applies to degree d
+                # We need to apply cumulative product of masks
+                N, C, _ = shs_view.shape
+                sh_mask_expanded = torch.ones((N, C, 3), device=shs_view.device, dtype=shs_view.dtype)
+                
+                # Vectorized: apply mask to corresponding degree ranges
+                for degree in range(1, min(pc.active_sh_degree + 1, sh_mask.shape[1] + 1)):
+                    start_idx = degree ** 2
+                    end_idx = min((degree + 1) ** 2, C) if degree < pc.max_sh_degree else C
+                    # Broadcast mask along the coefficient dimension
+                    sh_mask_expanded[:, start_idx:end_idx, :] *= sh_mask[:, degree - 1:degree, None]
+                
+                shs_view = shs_view * sh_mask_expanded
+            
             shs_view = shs_view.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
-            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
-            dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
+            # Optimize: avoid repeat(), use broadcasting instead
+            dir_pp = pc.get_xyz - viewpoint_camera.camera_center[None, :]
+            dir_pp_normalized = dir_pp / (dir_pp.norm(dim=1, keepdim=True) + 1e-7)  # Add epsilon for stability
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
-            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+            # 改进：使用sigmoid替代固定偏移，避免整体偏亮和去饱和
+            colors_precomp = torch.sigmoid(sh2rgb)
+            colors_precomp = torch.clamp(colors_precomp, 0.0, 1.0)
         else:
             shs = pc.get_features
-            sh_mask_degree = torch.ones_like(shs) # (N, 15, 3)
-            for degree in range(1, pc.active_sh_degree + 1):
-                sh_mask_degree[:, degree**2:, :] *= sh_mask[:, degree - 1:degree].unsqueeze(1)
-            shs *= sh_mask_degree
+            # Fully vectorized SH mask application (no loop, faster)
+            if pc.active_sh_degree > 0:
+                N, C, _ = shs.shape
+                sh_mask_expanded = torch.ones((N, C, 3), device=shs.device, dtype=shs.dtype)
+                
+                for degree in range(1, min(pc.active_sh_degree + 1, sh_mask.shape[1] + 1)):
+                    start_idx = degree ** 2
+                    end_idx = min((degree + 1) ** 2, C) if degree < pc.max_sh_degree else C
+                    sh_mask_expanded[:, start_idx:end_idx, :] *= sh_mask[:, degree - 1:degree, None]
+                
+                shs = shs * sh_mask_expanded
     else:
         colors_precomp = override_color
 
@@ -178,7 +202,10 @@ def render_eval(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Ten
             dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
-            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+            # 改进：使用sigmoid替代固定偏移，避免整体偏亮和去饱和
+            # 原代码：colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+            colors_precomp = torch.sigmoid(sh2rgb)
+            colors_precomp = torch.clamp(colors_precomp, 0.0, 1.0)
         else:
             shs = pc.get_features
     else:

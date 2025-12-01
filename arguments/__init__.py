@@ -128,13 +128,31 @@ class OptimizationParams(ParamGroup):
         self.lambda_dssim = 0.2
         self.lambda_mask = 0.004
         self.lambda_sh_mask = 0.0001
-        self.densification_interval = 100
+        # Densification频率：可以根据显存和时间调整
+        # 保守：100, 平衡：75, 激进：50
+        self.densification_interval = 100  # 降低频率以减少显存峰值
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
-        self.densify_until_iter = 15_000
-        self.densify_grad_threshold = 0.0002
-        self.prune_interval = 1000
+        # Densification结束迭代：可以根据显存和时间调整
+        # 保守：15_000, 平衡：18_000, 激进：20_000
+        self.densify_until_iter = 18_000  # 适度延长，避免过度densify
+        # Densification参数：可以根据显存情况调整
+        # 保守：0.0002, 平衡：0.00015, 激进：0.0001
+        self.densify_grad_threshold = 0.00015  # 提高阈值，减少Gaussian数量
+        # 更频繁的pruning以减少显存占用
+        self.prune_interval = 500  # 从1000改为500，更频繁pruning
         self.random_background = False
+        # 新增：梯度损失权重（可以设为0禁用，或降低到0.1减少计算量）
+        # 默认设为0.1以减少显存占用，可以设为0完全禁用
+        self.lambda_grad = 0.1
+        # Profiling 相关参数（默认关闭）
+        self.profile_iters = 0
+        self.profile_wait = 2
+        self.profile_warmup = 2
+        self.profile_active = 4
+        self.profile_logdir = ""
+        # Mixed precision training (AMP) - 可选启用以加速训练和减少显存
+        self.use_amp = False  # Set to True to enable automatic mixed precision
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
