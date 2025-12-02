@@ -105,9 +105,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             dir_pp = pc.get_xyz - viewpoint_camera.camera_center[None, :]
             dir_pp_normalized = dir_pp / (dir_pp.norm(dim=1, keepdim=True) + 1e-7)  # Add epsilon for stability
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
-            # 改进：使用sigmoid替代固定偏移，避免整体偏亮和去饱和
-            colors_precomp = torch.sigmoid(sh2rgb)
-            colors_precomp = torch.clamp(colors_precomp, 0.0, 1.0)
+            # 回退为线性偏移以避免sigmoid饱和造成梯度缩小
+            colors_precomp = torch.clamp(sh2rgb + 0.5, 0.0, 1.0)
         else:
             shs = pc.get_features
             # Fully vectorized SH mask application (no loop, faster)
@@ -202,10 +201,8 @@ def render_eval(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Ten
             dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
-            # 改进：使用sigmoid替代固定偏移，避免整体偏亮和去饱和
-            # 原代码：colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
-            colors_precomp = torch.sigmoid(sh2rgb)
-            colors_precomp = torch.clamp(colors_precomp, 0.0, 1.0)
+            # 回退为线性偏移以避免sigmoid饱和造成梯度缩小
+            colors_precomp = torch.clamp(sh2rgb + 0.5, 0.0, 1.0)
         else:
             shs = pc.get_features
     else:

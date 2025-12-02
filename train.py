@@ -13,7 +13,7 @@ import os
 import torch
 import torchvision
 from random import randint
-from utils.loss_utils import l1_loss, ssim, gradient_loss
+from utils.loss_utils import l1_loss, ssim, ssim_raw, gradient_loss
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -29,6 +29,38 @@ try:
     torch.set_float32_matmul_precision('high')
 except Exception:
     pass
+
+
+def build_background_weight_map(H: int, W: int, alpha: float = 0.6, device: str = "cuda") -> torch.Tensor:
+    """
+    Build a radial weight map that emphasizes image periphery (edges/corners).
+    Center weight ≈ 1.0, corner weight ≈ 1.0 + alpha.
+    This encourages densification in background/peripheral regions without
+    significantly increasing total Gaussian count.
+    
+    Args:
+        H: Image height
+        W: Image width
+        alpha: Weight boost at corners (default 0.6 → range [1.0, 1.6])
+        device: Target device
+    
+    Returns:
+        weight_map: [H, W] tensor with radial weights
+    """
+    # Normalized coordinates in [-1, 1]
+    y_coords = torch.linspace(-1.0, 1.0, H, device=device)
+    x_coords = torch.linspace(-1.0, 1.0, W, device=device)
+    yy, xx = torch.meshgrid(y_coords, x_coords, indexing='ij')
+    
+    # Radial distance from center, normalized so corners have distance ~1.414
+    radial_dist = torch.sqrt(xx ** 2 + yy ** 2)
+    # Normalize to [0, 1] range (center=0, corner=1)
+    radial_dist_normalized = radial_dist / (2 ** 0.5)
+    
+    # Linear ramp: center=1.0, corner=1.0+alpha
+    weight_map = 1.0 + alpha * radial_dist_normalized
+    
+    return weight_map
 
 try:
     from torch.profiler import (
@@ -143,15 +175,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Loss
             gt_image = viewpoint_cam.original_image.cuda()
-            Ll1 = l1_loss(image, gt_image)
-            pixel_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
             
-            # 新增：梯度损失，鼓励边缘和纹理更锐利
-            # 优化：降低计算频率以减少显存占用（每2次迭代计算一次）
-            if hasattr(opt, 'lambda_grad') and opt.lambda_grad > 0 and iteration % 2 == 0:
+            # ----------------------------------------------------------------
+            # Background-weighted loss: emphasize peripheral regions to give
+            # background/edge areas more gradient, encouraging densification
+            # there without drastically increasing total Gaussian count.
+            # ----------------------------------------------------------------
+            H, W = gt_image.shape[1], gt_image.shape[2]
+            background_weight_map = build_background_weight_map(H, W, alpha=0.6, device="cuda")
+            # Expand to [1, 1, H, W] for broadcasting with [B, C, H, W] images
+            weight_map_4d = background_weight_map[None, None, :, :]
+            
+            # Weighted L1 loss
+            rgb_residual = (image - gt_image).abs()
+            weighted_rgb_residual = weight_map_4d * rgb_residual
+            Ll1 = weighted_rgb_residual.mean()
+            
+            # Weighted SSIM loss: use per-pixel dissimilarity map
+            dssim_map = ssim_raw(image, gt_image)  # [1, 1, H, W]
+            ssim_loss_weighted = (weight_map_4d * dssim_map).mean()
+            
+            pixel_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss_weighted
+            
+            # Edge loss: controlled by enable_edge_loss flag and start iteration
+            edge_loss_enabled = getattr(opt, 'enable_edge_loss', False)
+            edge_loss_start_iter = getattr(opt, 'edge_loss_start_iter', 0)
+            lambda_grad = getattr(opt, 'lambda_grad', 0.0)
+            
+            if edge_loss_enabled and iteration >= edge_loss_start_iter and lambda_grad > 0:
                 Lgrad = gradient_loss(image, gt_image)
             else:
-                Lgrad = 0.0
+                Lgrad = torch.tensor(0.0, device=image.device)
             
             mask_loss = torch.mean(gaussians.get_mask)
             sh_mask_loss = 0.0
@@ -163,9 +217,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     sh_mask_loss += weight * lambda_degree * torch.mean(gaussians.get_sh_mask[..., degree - 1])
 
             loss = pixel_loss + opt.lambda_mask * mask_loss + opt.lambda_sh_mask * sh_mask_loss
-            if hasattr(opt, 'lambda_grad') and opt.lambda_grad > 0:
-                loss = loss + opt.lambda_grad * Lgrad
+            # Add edge loss only when enabled
+            if edge_loss_enabled and iteration >= edge_loss_start_iter and lambda_grad > 0:
+                loss = loss + lambda_grad * Lgrad
+
+            # (周期性日志已精简，详细逐项 grad 计算移除以减少频繁的图计算)
         
+        # (已移除重复的逐项 debug 打印，保留更简洁的周期性报告)
+
         # Backward pass with gradient scaling
         scaler.scale(loss).backward()
 
@@ -175,62 +234,38 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             
-            # Store loss components for detailed logging
+            # Store loss components for detailed logging (every 1000 iters)
             if iteration % 1000 == 0:
-                loss_pixel_val = pixel_loss.item()
+                pixel_loss_value = pixel_loss.item()
                 loss_mask_val = mask_loss.item()
                 loss_sh_mask_val = sh_mask_loss.item() if isinstance(sh_mask_loss, torch.Tensor) else sh_mask_loss
                 loss_total_val = loss.item()
+                gaussian_count = gaussians.get_xyz.shape[0]
+                edge_loss_value = Lgrad.item() if isinstance(Lgrad, torch.Tensor) else 0.0
                 
-                # Enhanced debug logging with all key metrics
-                mem_allocated_gb = torch.cuda.memory_allocated() / 1e9
-                mem_reserved_gb = torch.cuda.memory_reserved() / 1e9
-                n_gaussians = gaussians.get_xyz.shape[0]
+                # Edge loss contribution for monitoring
+                edge_loss_weight = lambda_grad if edge_loss_enabled else 0.0
+                edge_contrib = edge_loss_weight * edge_loss_value
                 
-                # Get learning rates from optimizer
-                grid_lr = gaussians.optimizer.param_groups[0]['lr']
-                other_lr = gaussians.optimizer_i.param_groups[0]['lr'] if hasattr(gaussians, 'optimizer_i') else 0.0
+                # Gaussian statistics: opacity percentiles
+                with torch.no_grad():
+                    opacity_vals = gaussians.get_opacity.detach().squeeze()
+                    if opacity_vals.numel() > 0:
+                        opacity_p5 = torch.quantile(opacity_vals, 0.05).item()
+                        opacity_p50 = torch.quantile(opacity_vals, 0.50).item()
+                        opacity_p95 = torch.quantile(opacity_vals, 0.95).item()
+                    else:
+                        opacity_p5 = opacity_p50 = opacity_p95 = 0.0
+                    current_sh_degree = gaussians.active_sh_degree
                 
-                # Compute average iteration time
-                avg_iter_time = iter_start.elapsed_time(iter_end) / 1000.0  # Convert to seconds
-                
-                print(f"\n{'='*80}")
-                print(f"[Iter {iteration:05d}] Training Progress Report")
-                print(f"{'-'*80}")
-                print(f"  Loss Breakdown:")
-                print(f"    Total       : {loss_total_val:.6f}")
-                print(f"    Pixel (RGB) : {loss_pixel_val:.6f} (L1={Ll1.item():.6f})")
-                if hasattr(opt, 'lambda_grad') and opt.lambda_grad > 0:
-                    loss_grad_val = Lgrad.item() if isinstance(Lgrad, torch.Tensor) else 0.0
-                    print(f"    Gradient    : {loss_grad_val:.6f} (weight={opt.lambda_grad:.4f})")
-                print(f"    Mask        : {loss_mask_val:.6f} (weight={opt.lambda_mask:.4f})")
-                print(f"    SH Mask     : {loss_sh_mask_val:.6f} (weight={opt.lambda_sh_mask:.4f})")
-                print(f"  Gaussians:")
-                print(f"    Count       : {n_gaussians:,} ({n_gaussians//1000}k points)")
-                print(f"    SH Degree   : {gaussians.active_sh_degree}/{gaussians.max_sh_degree}")
-                
-                # Feature role split debug: concise latent norm logging
-                if dataset.feature_role_split and hasattr(gaussians, '_last_geometry_norm'):
-                    shared_norm = getattr(gaussians, '_last_shared_norm', 0.0)
-                    geom_norm = getattr(gaussians, '_last_geometry_norm', 0.0)
-                    app_norm = getattr(gaussians, '_last_appearance_norm', 0.0)
-                    print(f"  [FeatureRoleSplit] iter={iteration} ||shared||={shared_norm:.4f} ||geometry||={geom_norm:.4f} ||appearance||={app_norm:.4f}")
-                print(f"  Learning Rates:")
-                print(f"    Grid        : {grid_lr:.6f}")
-                print(f"    Implicit    : {other_lr:.6f}")
-                print(f"  Resources:")
-                print(f"    GPU Memory  : {mem_allocated_gb:.2f}GB allocated, {mem_reserved_gb:.2f}GB reserved")
-                print(f"    Time/Iter   : {avg_iter_time:.3f}s")
-                
-                # Cache performance statistics
-                cache_stats = gaussians.get_cache_stats()
-                if cache_stats['total_calls'] > 0:
-                    print(f"  Cache Performance (update_attributes):")
-                    print(f"    Hit Rate    : {cache_stats['hit_rate_percent']:.1f}% ({cache_stats['cache_hits']}/{cache_stats['total_calls']} calls)")
-                    print(f"    Time Saved  : ~{cache_stats['cache_hits'] * 28:.0f}ms (est. 28ms per cache hit)")
-                    gaussians.reset_cache_stats()  # Reset for next interval
-                
-                print(f"{'='*80}\n")
+                # Compact log format with Gaussian stats
+                print(("[iter {:>5}] Gaussians: N={:>7} | opacity(p5,p50,p95)=[{:.3f},{:.3f},{:.3f}] | sh_degree={}").format(
+                    iteration, gaussian_count, opacity_p5, opacity_p50, opacity_p95, current_sh_degree
+                ))
+                print(("           L_total={:.5f} L_rgb={:.5f} L_ssim={:.5f} L_edge={:.5f} | lambda_grad={:.3f} edge_enabled={}").format(
+                    loss_total_val, Ll1.item(), (1.0 - ssim(image, gt_image)).item(), edge_loss_value, 
+                    edge_loss_weight, edge_loss_enabled
+                ))
             
             if iteration % 10 == 0:
                 progress_bar.set_postfix({
@@ -244,22 +279,48 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
 
-            # Densification
-            if iteration < opt.densify_until_iter:
-                # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
-
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    # 在densification前清理显存
-                    torch.cuda.empty_cache()
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
-                    # densification后再次清理
-                    torch.cuda.empty_cache()
-            else:
-                if iteration % opt.prune_interval == 0:
-                    gaussians.mask_prune()
+            # -----------------------------------------------------------------
+            # Densification with capacity control (6M hard cap).
+            # Delegates to maybe_densify_and_prune which wraps the original
+            # densify_and_prune logic without modifying its internals.
+            # -----------------------------------------------------------------
+            # Keep track of max radii in image-space for pruning (always needed)
+            gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+            gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+            
+            if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                torch.cuda.empty_cache()
+                n_before = gaussians.get_xyz.shape[0]
+                
+                # Use configured min_opacity (LocoGS default: 0.005)
+                min_opacity = getattr(opt, 'min_opacity', 0.005)
+                mask_prune_threshold = getattr(opt, 'mask_prune_threshold', 0.005)
+                
+                # Call capacity-controlled wrapper instead of direct densify_and_prune
+                gaussians.maybe_densify_and_prune(
+                    iteration=iteration,
+                    max_grad=opt.densify_grad_threshold,
+                    min_opacity=min_opacity,
+                    extent=scene.cameras_extent,
+                    max_screen_size=size_threshold,
+                    mask_prune_threshold=mask_prune_threshold,
+                )
+                
+                n_after = gaussians.get_xyz.shape[0]
+                # Compact log with capacity status
+                with torch.no_grad():
+                    opacity_vals = gaussians.get_opacity.detach().squeeze()
+                    low_op_ratio = (opacity_vals < 0.1).float().mean().item()
+                    max_cap = gaussians.gaussian_capacity_config["max_point_count"]
+                    cap_pct = n_after / max_cap * 100
+                    print(("[DENSIFY] iter={} N: {}→{} Δ={:+d} | cap={:.1f}% | opacity q5/50/95=[{:.3f},{:.3f},{:.3f}]").format(
+                        iteration, n_before, n_after, n_after - n_before, cap_pct,
+                        torch.quantile(opacity_vals, 0.05).item(),
+                        torch.quantile(opacity_vals, 0.5).item(),
+                        torch.quantile(opacity_vals, 0.95).item(),
+                    ))
+                torch.cuda.empty_cache()
             
             if (iteration in saving_iterations):
                 print(f"\n[ITER {iteration}] Saving Gaussians")

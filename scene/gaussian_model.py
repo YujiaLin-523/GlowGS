@@ -70,6 +70,16 @@ class GaussianModel:
         }
     
     def setup_params(self):
+        # -----------------------------------------------------------------
+        # Capacity control: hard cap on total Gaussian count to prevent
+        # densification from exploding memory. Densify stops once N >= max.
+        # -----------------------------------------------------------------
+        self.gaussian_capacity_config = {
+            "max_point_count": 6_000_000,      # Hard cap: 6M Gaussians
+            "densify_until_iter": 15000,       # Match baseline schedule
+            "prune_interval": 400,             # Periodic pruning interval
+        }
+        
         # Create base hash encoder
         hash_encoder = tcnn.Encoding(n_input_dims=3, encoding_config=self.encoding_config)
         
@@ -834,25 +844,67 @@ class GaussianModel:
 
         # Final update before pruning (force to ensure we have latest attributes)
         self.update_attributes(force_update=True)
-        # 更激进的pruning以减少显存占用
-        # 提高mask阈值，更早删除不必要的Gaussians
-        prune_mask = torch.logical_or((self.get_mask <= 0.005).squeeze(), (self.get_opacity < min_opacity).squeeze())
+        # Pruning: LocoGS uses fixed mask_threshold=0.01, min_opacity from train.py (0.005)
+        prune_mask = torch.logical_or((self.get_mask <= 0.01).squeeze(), (self.get_opacity < min_opacity).squeeze())
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
 
-        # 强制清理显存缓存
         torch.cuda.empty_cache()
-        torch.cuda.synchronize()  # 确保所有操作完成后再清理
 
-    def mask_prune(self):
-        # 更激进的pruning阈值以减少显存占用
-        prune_mask = (self.get_mask <= 0.005).squeeze()
+    def maybe_densify_and_prune(
+        self,
+        iteration: int,
+        max_grad: float,
+        min_opacity: float,
+        extent: float,
+        max_screen_size,
+        mask_prune_threshold: float = 0.005,
+    ):
+        """
+        Lightweight wrapper around densify_and_prune with capacity control.
+        Enforces a hard cap on Gaussian count (default 6M) and respects the
+        densification schedule. Does NOT modify internal densify/prune logic.
+        
+        Args:
+            iteration: Current training iteration
+            max_grad: Gradient threshold for densification
+            min_opacity: Minimum opacity for pruning
+            extent: Scene extent for scale threshold
+            max_screen_size: Max screen-space size for pruning
+            mask_prune_threshold: Mask threshold for post-densification pruning
+        """
+        config = self.gaussian_capacity_config
+        max_points = config["max_point_count"]
+        densify_until = config["densify_until_iter"]
+        prune_interval = config["prune_interval"]
+        
+        num_points = self.get_xyz.shape[0]
+        
+        # Densify only if under capacity and within schedule
+        if iteration < densify_until and num_points < max_points:
+            self.densify_and_prune(max_grad, min_opacity, extent, max_screen_size)
+            new_count = self.get_xyz.shape[0]
+            # Log capacity warning if approaching limit
+            if new_count >= max_points * 0.9:
+                print(f"[CAPACITY] Approaching limit: {new_count}/{max_points} ({new_count/max_points*100:.1f}%)")
+        elif iteration >= densify_until:
+            # Post-densification phase: periodic mask pruning only
+            if iteration % prune_interval == 0:
+                self.mask_prune(mask_threshold=mask_prune_threshold)
+        else:
+            # At or over capacity: skip densification, still allow pruning
+            if iteration % prune_interval == 0:
+                self.mask_prune(mask_threshold=mask_prune_threshold)
+                print(f"[CAPACITY] At limit ({num_points}>={max_points}), densify skipped, prune only")
+
+    def mask_prune(self, mask_threshold=0.01):
+        # Pruning: points with mask <= threshold are removed (LocoGS: 0.01)
+        prune_mask = (self.get_mask <= mask_threshold).squeeze()
         self.prune_points(prune_mask)
         torch.cuda.empty_cache()
-        torch.cuda.synchronize()  # 确保清理完成
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
