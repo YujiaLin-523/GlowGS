@@ -198,14 +198,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             pixel_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss_weighted
             
             # Edge loss: controlled by enable_edge_loss flag and start iteration
+            # Uses unified edge-aware gradient loss: aligns edges while suppressing flat-region noise
             edge_loss_enabled = getattr(opt, 'enable_edge_loss', False)
             edge_loss_start_iter = getattr(opt, 'edge_loss_start_iter', 0)
             lambda_grad = getattr(opt, 'lambda_grad', 0.0)
+            flat_weight = getattr(opt, 'edge_flat_weight', 0.5)  # Weight for flat region suppression
             
             if edge_loss_enabled and iteration >= edge_loss_start_iter and lambda_grad > 0:
-                Lgrad = gradient_loss(image, gt_image)
+                Lgrad, Lgrad_edge, Lgrad_flat = gradient_loss(image, gt_image, flat_weight=flat_weight, return_components=True)
             else:
                 Lgrad = torch.tensor(0.0, device=image.device)
+                Lgrad_edge = torch.tensor(0.0, device=image.device)
+                Lgrad_flat = torch.tensor(0.0, device=image.device)
             
             mask_loss = torch.mean(gaussians.get_mask)
             sh_mask_loss = 0.0
@@ -234,7 +238,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             
-            # Store loss components for detailed logging (every 1000 iters)
+            # Unified detailed logging every 1000 iterations
             if iteration % 1000 == 0:
                 pixel_loss_value = pixel_loss.item()
                 loss_mask_val = mask_loss.item()
@@ -242,30 +246,38 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 loss_total_val = loss.item()
                 gaussian_count = gaussians.get_xyz.shape[0]
                 edge_loss_value = Lgrad.item() if isinstance(Lgrad, torch.Tensor) else 0.0
+                edge_term_value = Lgrad_edge.item() if isinstance(Lgrad_edge, torch.Tensor) else 0.0
+                flat_term_value = Lgrad_flat.item() if isinstance(Lgrad_flat, torch.Tensor) else 0.0
                 
-                # Edge loss contribution for monitoring
+                # Edge loss weight
                 edge_loss_weight = lambda_grad if edge_loss_enabled else 0.0
-                edge_contrib = edge_loss_weight * edge_loss_value
                 
-                # Gaussian statistics: opacity percentiles
-                with torch.no_grad():
-                    opacity_vals = gaussians.get_opacity.detach().squeeze()
-                    if opacity_vals.numel() > 0:
-                        opacity_p5 = torch.quantile(opacity_vals, 0.05).item()
-                        opacity_p50 = torch.quantile(opacity_vals, 0.50).item()
-                        opacity_p95 = torch.quantile(opacity_vals, 0.95).item()
-                    else:
-                        opacity_p5 = opacity_p50 = opacity_p95 = 0.0
-                    current_sh_degree = gaussians.active_sh_degree
+                # Gaussian statistics
+                opacity_vals = gaussians.get_opacity.detach().squeeze()
+                if opacity_vals.numel() > 0:
+                    opacity_p5 = torch.quantile(opacity_vals, 0.05).item()
+                    opacity_p50 = torch.quantile(opacity_vals, 0.50).item()
+                    opacity_p95 = torch.quantile(opacity_vals, 0.95).item()
+                else:
+                    opacity_p5 = opacity_p50 = opacity_p95 = 0.0
+                current_sh_degree = gaussians.active_sh_degree
                 
-                # Compact log format with Gaussian stats
-                print(("[iter {:>5}] Gaussians: N={:>7} | opacity(p5,p50,p95)=[{:.3f},{:.3f},{:.3f}] | sh_degree={}").format(
-                    iteration, gaussian_count, opacity_p5, opacity_p50, opacity_p95, current_sh_degree
-                ))
-                print(("           L_total={:.5f} L_rgb={:.5f} L_ssim={:.5f} L_edge={:.5f} | lambda_grad={:.3f} edge_enabled={}").format(
-                    loss_total_val, Ll1.item(), (1.0 - ssim(image, gt_image)).item(), edge_loss_value, 
-                    edge_loss_weight, edge_loss_enabled
-                ))
+                # Capacity info
+                max_cap = gaussians.gaussian_capacity_config["max_point_count"]
+                cap_pct = gaussian_count / max_cap * 100
+                
+                # Formatted output
+                print("\n" + "=" * 90)
+                print(f"  [Iteration {iteration:>5}]  Training Summary")
+                print("-" * 90)
+                print(f"  Gaussians   │  N = {gaussian_count:,}  │  Capacity = {cap_pct:.1f}%  │  SH Degree = {current_sh_degree}")
+                print(f"  Opacity     │  p5 = {opacity_p5:.3f}  │  p50 = {opacity_p50:.3f}  │  p95 = {opacity_p95:.3f}")
+                print("-" * 90)
+                print(f"  Loss Total  │  {loss_total_val:.6f}")
+                print(f"  Loss RGB    │  L1 = {Ll1.item():.6f}  │  SSIM = {(1.0 - ssim(image, gt_image)).item():.6f}")
+                if edge_loss_enabled:
+                    print(f"  Loss Edge   │  {edge_loss_value:.6f}  (align = {edge_term_value:.6f}, flat = {flat_term_value:.6f})  │  λ = {edge_loss_weight:.3f}")
+                print("=" * 90 + "\n")
             
             if iteration % 10 == 0:
                 progress_bar.set_postfix({
@@ -308,18 +320,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 )
                 
                 n_after = gaussians.get_xyz.shape[0]
-                # Compact log with capacity status
-                with torch.no_grad():
-                    opacity_vals = gaussians.get_opacity.detach().squeeze()
-                    low_op_ratio = (opacity_vals < 0.1).float().mean().item()
-                    max_cap = gaussians.gaussian_capacity_config["max_point_count"]
-                    cap_pct = n_after / max_cap * 100
-                    print(("[DENSIFY] iter={} N: {}→{} Δ={:+d} | cap={:.1f}% | opacity q5/50/95=[{:.3f},{:.3f},{:.3f}]").format(
-                        iteration, n_before, n_after, n_after - n_before, cap_pct,
-                        torch.quantile(opacity_vals, 0.05).item(),
-                        torch.quantile(opacity_vals, 0.5).item(),
-                        torch.quantile(opacity_vals, 0.95).item(),
-                    ))
                 torch.cuda.empty_cache()
             
             if (iteration in saving_iterations):

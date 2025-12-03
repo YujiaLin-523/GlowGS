@@ -40,56 +40,130 @@ def ssim(img1, img2, window_size=11, size_average=True):
 
     return _ssim(img1, img2, window, window_size, channel, size_average)
 
-# 预定义Sobel算子（全局缓存，避免重复创建）
+# -----------------------------------------------------------------------------
+# Sobel Kernels (cached globally to avoid repeated allocation)
+# -----------------------------------------------------------------------------
 _sobel_x = None
 _sobel_y = None
 
-def gradient_loss(img1, img2, normalize=True):
+
+def _get_sobel_kernels(device, dtype):
     """
-    计算图像梯度损失，鼓励边缘和纹理更锐利
-    使用Sobel算子检测边缘，对梯度图计算L1损失
-    
-    Args:
-        img1, img2: 输入图像对
-        normalize: 是否对梯度图进行归一化，使其与像素值量级一致
-    
-    性能优化：使用缓存的Sobel算子，减少重复创建开销
+    Return cached 3x3 Sobel kernels for gradient computation.
+    Creates kernels on first call or when device/dtype changes.
     """
     global _sobel_x, _sobel_y
+    if _sobel_x is None or _sobel_x.device != device or _sobel_x.dtype != dtype:
+        _sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
+                                dtype=dtype, device=device).view(1, 1, 3, 3)
+        _sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
+                                dtype=dtype, device=device).view(1, 1, 3, 3)
+    return _sobel_x, _sobel_y
+
+
+def _rgb_to_grayscale(img):
+    """
+    Convert RGB image to grayscale using BT.601 luminance weights.
+    Input: [B, 3, H, W] or [3, H, W]
+    Output: [B, 1, H, W]
+    """
+    if img.dim() == 3:
+        img = img.unsqueeze(0)
+    # BT.601: Y = 0.299*R + 0.587*G + 0.114*B
+    weights = torch.tensor([0.299, 0.587, 0.114], device=img.device, dtype=img.dtype)
+    gray = (img * weights.view(1, 3, 1, 1)).sum(dim=1, keepdim=True)
+    return gray
+
+
+def _compute_gradient_magnitude(gray_img, sobel_x, sobel_y):
+    """
+    Compute gradient magnitude from grayscale image using Sobel operators.
+    Input: [B, 1, H, W] grayscale image
+    Output: [B, 1, H, W] gradient magnitude
+    """
+    gx = F.conv2d(gray_img, sobel_x, padding=1)
+    gy = F.conv2d(gray_img, sobel_y, padding=1)
+    grad_mag = torch.sqrt(gx ** 2 + gy ** 2 + 1e-6)
+    return grad_mag
+
+
+def gradient_loss(pred_rgb, gt_rgb, valid_mask=None, flat_weight=0.5, return_components=False):
+    """
+    Edge-aware gradient loss with unified edge alignment and flat regularization.
     
-    def get_gradient(img):
-        # 确保输入是4D (B, C, H, W) 或 3D (C, H, W)
-        if img.dim() == 3:
-            img = img.unsqueeze(0)
-        
-        # 使用缓存的Sobel算子
-        global _sobel_x, _sobel_y
-        if _sobel_x is None or _sobel_x.device != img.device or _sobel_x.dtype != img.dtype:
-            # 只在第一次或设备/类型变化时创建
-            _sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
-                                  dtype=img.dtype, device=img.device).view(1, 1, 3, 3)
-            _sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
-                                  dtype=img.dtype, device=img.device).view(1, 1, 3, 3)
-        
-        # 对每个通道计算梯度
-        channels = img.shape[-3]
-        grad_x = F.conv2d(img, _sobel_x.repeat(channels, 1, 1, 1), 
-                         padding=1, groups=channels)
-        grad_y = F.conv2d(img, _sobel_y.repeat(channels, 1, 1, 1), 
-                         padding=1, groups=channels)
-        grad_mag = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
-        
-        # 归一化：将梯度图缩放到与像素值相同的量级 [0, 1]
-        # Sobel算子在纯黑白边界上的最大响应约为4.0（对于[0,1]范围的图像）
-        if normalize:
-            grad_mag = grad_mag / 4.0
-            grad_mag = torch.clamp(grad_mag, 0, 1)
-        
-        return grad_mag
+    Design:
+    - Edge regions (high GT gradient): align pred gradient to GT gradient.
+    - Flat regions (low GT gradient): suppress spurious texture in predictions.
     
-    grad1 = get_gradient(img1)
-    grad2 = get_gradient(img2)
-    return l1_loss(grad1, grad2)
+    Args:
+        pred_rgb: Predicted image [C, H, W] or [B, C, H, W]
+        gt_rgb: Ground truth image [C, H, W] or [B, C, H, W]
+        valid_mask: Optional binary mask [H, W] or [B, 1, H, W] for valid regions
+        flat_weight: Weight for flat region regularization term (alpha in paper)
+        return_components: If True, also return (edge_term, flat_term) for logging
+    
+    Returns:
+        loss: Scalar edge-aware gradient loss
+        (optional) edge_term_mean, flat_term_mean: Component values for debugging
+    """
+    # Ensure 4D input: [B, C, H, W]
+    if pred_rgb.dim() == 3:
+        pred_rgb = pred_rgb.unsqueeze(0)
+    if gt_rgb.dim() == 3:
+        gt_rgb = gt_rgb.unsqueeze(0)
+    
+    # Get cached Sobel kernels
+    sobel_x, sobel_y = _get_sobel_kernels(pred_rgb.device, pred_rgb.dtype)
+    
+    # Convert to grayscale for gradient computation
+    pred_gray = _rgb_to_grayscale(pred_rgb)
+    gt_gray = _rgb_to_grayscale(gt_rgb)
+    
+    # Compute gradient magnitudes
+    G_pred = _compute_gradient_magnitude(pred_gray, sobel_x, sobel_y)
+    G_gt = _compute_gradient_magnitude(gt_gray, sobel_x, sobel_y)
+    
+    # Normalize gradients to [0, 1] range for stable loss magnitude
+    # Sobel max response on [0,1] image is ~4.0; use 4.0 as normalizer
+    grad_normalizer = 4.0
+    G_pred_norm = G_pred / grad_normalizer
+    G_gt_norm = G_gt / grad_normalizer
+    
+    # Build edge confidence mask from GT gradient (detached to avoid gradient path issues)
+    # Higher values at edges, lower at flat regions
+    # Use adaptive scaling: mean * edge_sharpness determines the transition point
+    edge_sharpness = 1.5  # Controls how sharply edges are distinguished from flat
+    eps = 1e-6
+    grad_scale = G_gt_norm.detach().mean(dim=[2, 3], keepdim=True) * edge_sharpness + eps
+    edge_confidence = torch.clamp(G_gt_norm.detach() / grad_scale, 0.0, 1.0)
+    
+    # Edge alignment term: match pred gradient to GT gradient at edge locations
+    edge_term = torch.abs(G_pred_norm - G_gt_norm) * edge_confidence
+    
+    # Flat regularization term: suppress pred gradient where GT is flat
+    flat_confidence = 1.0 - edge_confidence
+    flat_term = G_pred_norm * flat_confidence
+    
+    # Apply valid mask if provided
+    if valid_mask is not None:
+        if valid_mask.dim() == 2:
+            valid_mask = valid_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+        edge_term = edge_term * valid_mask
+        flat_term = flat_term * valid_mask
+        # Compute mean only over valid pixels
+        num_valid = valid_mask.sum().clamp(min=1.0)
+        edge_term_mean = edge_term.sum() / num_valid
+        flat_term_mean = flat_term.sum() / num_valid
+    else:
+        edge_term_mean = edge_term.mean()
+        flat_term_mean = flat_term.mean()
+    
+    # Combined loss: edge alignment + weighted flat regularization
+    loss = edge_term_mean + flat_weight * flat_term_mean
+    
+    if return_components:
+        return loss, edge_term_mean.detach(), flat_term_mean.detach()
+    return loss
 
 def _ssim(img1, img2, window, window_size, channel, size_average=True):
     mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=channel)

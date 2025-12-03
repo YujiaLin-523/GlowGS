@@ -3,7 +3,7 @@
 NUM_PTS=1_000_000
 
 
-SCENE_LIST="bonsai counter kitchen room bicycle garden stump flowers treehill"
+SCENE_LIST="bonsai counter kitchen room bicycle garden stump"
 
 for SCENE in $SCENE_LIST;
 do
