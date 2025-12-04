@@ -8,8 +8,6 @@ python train.py \
     -m output/drjohnson \
     --eval \
     --pcd_path output/drjohnson/nerfacto/run/point_cloud.ply \
-    --lambda_mask 0.004 \
-    --feature_role_split
 
 # playroom
 python train.py \
@@ -17,5 +15,3 @@ python train.py \
     -m output/playroom \
     --eval \
     --pcd_path output/playroom/nerfacto/run/point_cloud.ply \
-    --lambda_mask 0.004 \
-    --feature_role_split

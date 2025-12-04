@@ -8,8 +8,6 @@ python train.py \
     -m output/train \
     --eval \
     --pcd_path output/train/nerfacto/run/point_cloud.ply \
-    --lambda_mask 0.004 \
-    --feature_role_split
 
 # truck
 python train.py \
@@ -17,5 +15,3 @@ python train.py \
     -m output/truck \
     --eval \
     --pcd_path output/truck/nerfacto/run/point_cloud.ply \
-    --lambda_mask 0.004 \
-    --feature_role_split
