@@ -149,9 +149,9 @@ class OptimizationParams(ParamGroup):
         
         self.random_background = False
 
-        self.enable_edge_loss = False       # master switch for Sobel gradient loss
+        self.enable_edge_loss = True       # master switch for Sobel gradient loss
         self.edge_loss_start_iter = 5000    # delay edge loss to avoid early instability
-        self.lambda_grad = 0.0              # edge loss weight (suggested: 0.02~0.1 when enabled)
+        self.lambda_grad = 0.05             # edge loss weight (0.02~0.1 recommended)
         # Profiling 相关参数（默认关闭）
         self.profile_iters = 0
         self.profile_wait = 2
@@ -160,6 +160,15 @@ class OptimizationParams(ParamGroup):
         self.profile_logdir = ""
         # Mixed precision training (AMP) - 可选启用以加速训练和减少显存
         self.use_amp = False  # Set to True to enable automatic mixed precision
+        
+        # Detail-aware densification/pruning (enabled by default)
+        # Reallocates Gaussian budget toward high-frequency detail regions
+        self.enable_detail_aware = True          # Master switch for detail-aware densify/prune
+        self.detail_ema_decay = 0.9              # EMA decay for per-Gaussian detail_importance
+        self.detail_importance_power_edge = 1.2  # Exponent for edge_strength in pixel_importance
+        self.detail_importance_power_error = 1.0 # Exponent for error_strength in pixel_importance
+        self.detail_densify_scale = 0.5          # k: effective_threshold = base / (1 + k * detail_importance)
+        self.detail_prune_weight = 0.2           # Weight for detail term in prune score
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

@@ -13,7 +13,7 @@ import os
 import torch
 import torchvision
 from random import randint
-from utils.loss_utils import l1_loss, ssim, ssim_raw, gradient_loss
+from utils.loss_utils import l1_loss, ssim, ssim_raw, gradient_loss, compute_pixel_importance
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -272,6 +272,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("-" * 90)
                 print(f"  Gaussians   │  N = {gaussian_count:,}  │  Capacity = {cap_pct:.1f}%  │  SH Degree = {current_sh_degree}")
                 print(f"  Opacity     │  p5 = {opacity_p5:.3f}  │  p50 = {opacity_p50:.3f}  │  p95 = {opacity_p95:.3f}")
+                
+                # Detail importance statistics (if enabled)
+                detail_aware_enabled = getattr(opt, 'enable_detail_aware', True)
+                if detail_aware_enabled and hasattr(gaussians, 'detail_importance') and gaussians.detail_importance.numel() > 0:
+                    di_stats = gaussians.get_detail_importance_stats()
+                    print(f"  Detail Imp  │  p5 = {di_stats['p5']:.3f}  │  p50 = {di_stats['p50']:.3f}  │  p95 = {di_stats['p95']:.3f}")
+                
                 print("-" * 90)
                 print(f"  Loss Total  │  {loss_total_val:.6f}")
                 print(f"  Loss RGB    │  L1 = {Ll1.item():.6f}  │  SSIM = {(1.0 - ssim(image, gt_image)).item():.6f}")
@@ -299,6 +306,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Keep track of max radii in image-space for pruning (always needed)
             gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
             gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+            
+            # -----------------------------------------------------------------
+            # Detail-aware densification: update per-Gaussian importance scores
+            # based on pixel-level edge+error importance from current frame.
+            # -----------------------------------------------------------------
+            detail_aware_enabled = getattr(opt, 'enable_detail_aware', True)
+            if detail_aware_enabled and iteration >= opt.densify_from_iter:
+                # Compute pixel importance from GT edge strength and current residual
+                power_edge = getattr(opt, 'detail_importance_power_edge', 1.2)
+                power_error = getattr(opt, 'detail_importance_power_error', 1.0)
+                pixel_importance = compute_pixel_importance(
+                    gt_image, image.detach(), 
+                    power_edge=power_edge, 
+                    power_error=power_error
+                )
+                # Update per-Gaussian detail_importance via EMA
+                gaussians.update_detail_importance(pixel_importance, visibility_filter, radii)
             
             if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                 size_threshold = 20 if iteration > opt.opacity_reset_interval else None

@@ -87,6 +87,61 @@ def _compute_gradient_magnitude(gray_img, sobel_x, sobel_y):
     return grad_mag
 
 
+def compute_pixel_importance(gt_rgb, pred_rgb, power_edge=1.2, power_error=1.0):
+    """
+    Compute per-pixel importance combining edge strength (from GT) and error strength.
+    
+    High importance indicates regions that are:
+      1. High-frequency in GT (edges, textures, fine details)
+      2. Still poorly fitted by current prediction (large residual)
+    
+    Uses a weighted combination instead of pure multiplication to ensure
+    better numerical differentiation between detail and flat regions.
+    
+    Args:
+        gt_rgb: Ground truth image [C, H, W] or [B, C, H, W]
+        pred_rgb: Predicted image [C, H, W] or [B, C, H, W]
+        power_edge: Exponent for edge_strength (default 1.2)
+        power_error: Exponent for error_strength (default 1.0)
+    
+    Returns:
+        pixel_importance: [H, W] tensor with values in [0, 1]
+    """
+    # Ensure 4D: [B, C, H, W]
+    if gt_rgb.dim() == 3:
+        gt_rgb = gt_rgb.unsqueeze(0)
+    if pred_rgb.dim() == 3:
+        pred_rgb = pred_rgb.unsqueeze(0)
+    
+    # ---- Edge strength from GT gradient ----
+    sobel_x, sobel_y = _get_sobel_kernels(gt_rgb.device, gt_rgb.dtype)
+    gt_gray = _rgb_to_grayscale(gt_rgb)
+    G_gt = _compute_gradient_magnitude(gt_gray, sobel_x, sobel_y)  # [B, 1, H, W]
+    
+    # Normalize using mean + std for better spread (avoid percentile collapsing)
+    G_mean = G_gt.mean()
+    G_std = G_gt.std().clamp(min=1e-6)
+    edge_strength = ((G_gt - G_mean) / (3.0 * G_std) + 0.5).clamp(0.0, 1.0)  # ~N(0.5, 0.17)
+    edge_strength = edge_strength.squeeze(0).squeeze(0)  # [H, W]
+    
+    # ---- Error strength from residual ----
+    residual = (pred_rgb - gt_rgb).abs().mean(dim=1, keepdim=True)  # [B, 1, H, W]
+    res_mean = residual.mean()
+    res_std = residual.std().clamp(min=1e-6)
+    error_strength = ((residual - res_mean) / (3.0 * res_std) + 0.5).clamp(0.0, 1.0)
+    error_strength = error_strength.squeeze(0).squeeze(0)  # [H, W]
+    
+    # ---- Combine: weighted sum with edge as primary signal ----
+    # Edge regions are inherently important; error provides secondary boost
+    # Formula: importance = 0.7 * edge^p + 0.3 * error^q
+    # This ensures even low-error edge regions get high importance
+    edge_term = edge_strength ** power_edge
+    error_term = error_strength ** power_error
+    pixel_importance = 0.7 * edge_term + 0.3 * error_term
+    
+    return pixel_importance.detach()  # Detach to avoid graph retention
+
+
 def gradient_loss(pred_rgb, gt_rgb, valid_mask=None, flat_weight=0.5, return_components=False):
     """
     Edge-aware gradient loss with unified edge alignment and flat regularization.
