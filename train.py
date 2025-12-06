@@ -12,8 +12,9 @@
 import os
 import torch
 import torchvision
+import yaml
 from random import randint
-from utils.loss_utils import l1_loss, ssim, ssim_raw, gradient_loss, compute_pixel_importance
+from utils.loss_utils import l1_loss, ssim, ssim_raw, compute_edge_loss, compute_pixel_importance
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -78,12 +79,60 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
+def save_ablation_config(output_dir, dataset, opt, pipe):
+    """Save ablation study configuration to YAML file for experiment tracking."""
+    config = {
+        'ablation_settings': {
+            'encoder_variant': getattr(opt, 'encoder_variant', 'hybrid'),
+            'edge_loss_mode': getattr(opt, 'edge_loss_mode', 'sobel_weighted'),
+            'densify_strategy': getattr(opt, 'densify_strategy', 'feature_weighted'),
+        },
+        'training_hyperparameters': {
+            'iterations': opt.iterations,
+            'position_lr_init': opt.position_lr_init,
+            'position_lr_final': opt.position_lr_final,
+            'lambda_grad': getattr(opt, 'lambda_grad', 0.05),
+            'lambda_mask': getattr(opt, 'lambda_mask', 0.01),
+            'max_gaussians': getattr(opt, 'max_gaussians', 6_000_000),
+            'densify_until_iter': getattr(opt, 'densify_until_iter', 15000),
+            'densify_grad_threshold': opt.densify_grad_threshold,
+        },
+        'dataset_settings': {
+            'source_path': dataset.source_path,
+            'model_path': dataset.model_path,
+            'sh_degree': dataset.sh_degree,
+            'hash_size': dataset.hash_size,
+            'width': dataset.width,
+            'depth': dataset.depth,
+            'feature_role_split': dataset.feature_role_split,
+            'geo_resolution': dataset.geo_resolution,
+            'geo_rank': dataset.geo_rank,
+            'geo_channels': dataset.geo_channels,
+        },
+        'rendering_settings': {
+            'white_background': dataset.white_background,
+            'convert_SHs_python': pipe.convert_SHs_python,
+            'compute_cov3D_python': pipe.compute_cov3D_python,
+        }
+    }
+    
+    config_path = os.path.join(output_dir, 'ablation_config.yaml')
+    with open(config_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    print(f"[Config] Saved ablation configuration to: {config_path}\n")
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
+    
+    # Save ablation study configuration for experiment tracking
+    save_ablation_config(dataset.model_path, dataset, opt, pipe)
+    
     gaussians = GaussianModel(
         dataset.sh_degree, dataset.hash_size, dataset.width, dataset.depth, 
-        dataset.feature_role_split, dataset.geo_resolution, dataset.geo_rank, dataset.geo_channels
+        dataset.feature_role_split, dataset.geo_resolution, dataset.geo_rank, dataset.geo_channels,
+        encoder_variant=getattr(opt, 'encoder_variant', 'hybrid'),
+        densify_strategy=getattr(opt, 'densify_strategy', 'feature_weighted')
     )
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
@@ -102,6 +151,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
+
+    # Print ablation study configuration summary
+    print("\n" + "=" * 90)
+    print("  ABLATION STUDY CONFIGURATION")
+    print("-" * 90)
+    encoder_variant = getattr(opt, 'encoder_variant', 'hybrid')
+    edge_loss_mode = getattr(opt, 'edge_loss_mode', 'sobel_weighted')
+    densify_strategy = getattr(opt, 'densify_strategy', 'feature_weighted')
+    lambda_grad = getattr(opt, 'lambda_grad', 0.05)
+    max_gaussians = getattr(opt, 'max_gaussians', 6_000_000)
+    
+    print(f"  Encoder Variant      │  {encoder_variant}")
+    print(f"  Edge Loss Mode       │  {edge_loss_mode} (λ={lambda_grad:.3f})")
+    print(f"  Densification Mode   │  {densify_strategy}")
+    print(f"  Max Gaussians        │  {max_gaussians:,}")
+    print(f"  Iterations           │  {opt.iterations:,}")
+    print("=" * 90 + "\n")
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
@@ -197,16 +263,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             
             pixel_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss_weighted
             
-            # Edge loss: controlled by enable_edge_loss flag and start iteration
-            # Uses unified edge-aware gradient loss: aligns edges while suppressing flat-region noise
-            edge_loss_enabled = getattr(opt, 'enable_edge_loss', False)
+            # Edge loss: unified interface for ablation studies
+            # Mode can be "none" | "sobel_basic" | "sobel_weighted" (paper default)
+            edge_loss_mode = getattr(opt, 'edge_loss_mode', 'sobel_weighted')
             edge_loss_start_iter = getattr(opt, 'edge_loss_start_iter', 0)
-            lambda_grad = getattr(opt, 'lambda_grad', 0.0)
-            flat_weight = getattr(opt, 'edge_flat_weight', 0.5)  # Weight for flat region suppression
+            lambda_grad = getattr(opt, 'lambda_grad', 0.05)
+            flat_weight = getattr(opt, 'edge_flat_weight', 0.5)
             
-            if edge_loss_enabled and iteration >= edge_loss_start_iter and lambda_grad > 0:
-                Lgrad, Lgrad_edge, Lgrad_flat = gradient_loss(image, gt_image, flat_weight=flat_weight, return_components=True)
+            if iteration >= edge_loss_start_iter:
+                Lgrad, Lgrad_edge, Lgrad_flat = compute_edge_loss(
+                    image, gt_image, 
+                    mode=edge_loss_mode,
+                    lambda_edge=lambda_grad,
+                    flat_weight=flat_weight,
+                    return_components=True
+                )
             else:
+                # Before start_iter: no edge loss
                 Lgrad = torch.tensor(0.0, device=image.device)
                 Lgrad_edge = torch.tensor(0.0, device=image.device)
                 Lgrad_flat = torch.tensor(0.0, device=image.device)
@@ -221,9 +294,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     sh_mask_loss += weight * lambda_degree * torch.mean(gaussians.get_sh_mask[..., degree - 1])
 
             loss = pixel_loss + opt.lambda_mask * mask_loss + opt.lambda_sh_mask * sh_mask_loss
-            # Add edge loss only when enabled
-            if edge_loss_enabled and iteration >= edge_loss_start_iter and lambda_grad > 0:
-                loss = loss + lambda_grad * Lgrad
+            # Add edge loss (already weighted by lambda_grad in compute_edge_loss)
+            loss = loss + Lgrad
 
             # (周期性日志已精简，详细逐项 grad 计算移除以减少频繁的图计算)
         
@@ -250,7 +322,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 flat_term_value = Lgrad_flat.item() if isinstance(Lgrad_flat, torch.Tensor) else 0.0
                 
                 # Edge loss weight
-                edge_loss_weight = lambda_grad if edge_loss_enabled else 0.0
+                edge_loss_mode = getattr(opt, 'edge_loss_mode', 'sobel_weighted')
+                edge_loss_weight = lambda_grad if edge_loss_mode != "none" else 0.0
                 
                 # Gaussian statistics
                 opacity_vals = gaussians.get_opacity.detach().squeeze()
@@ -282,8 +355,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("-" * 90)
                 print(f"  Loss Total  │  {loss_total_val:.6f}")
                 print(f"  Loss RGB    │  L1 = {Ll1.item():.6f}  │  SSIM = {(1.0 - ssim(image, gt_image)).item():.6f}")
-                if edge_loss_enabled:
-                    print(f"  Loss Edge   │  {edge_loss_value:.6f}  (align = {edge_term_value:.6f}, flat = {flat_term_value:.6f})  │  λ = {edge_loss_weight:.3f}")
+                if edge_loss_mode != "none":
+                    print(f"  Loss Edge   │  {edge_loss_value:.6f}  (align = {edge_term_value:.6f}, flat = {flat_term_value:.6f})  │  λ = {edge_loss_weight:.3f}  │  mode = {edge_loss_mode}")
                 print("=" * 90 + "\n")
             
             if iteration % 10 == 0:

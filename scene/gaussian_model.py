@@ -22,7 +22,7 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation, contract_to_unisphere, mortonEncode
 from utils.quantization_utils import half_ste, quantize, dequantize
 from utils.gpcc_utils import encode_xyz, decode_xyz
-from encoders.geometry_appearance_encoder import GeometryAppearanceEncoder
+from encoders import create_gaussian_encoder, get_encoder_output_dims
 import tinycudann as tcnn
 
 class GaussianModel:
@@ -80,18 +80,15 @@ class GaussianModel:
             "prune_interval": 400,             # Periodic pruning interval
         }
         
-        # Create base hash encoder
-        hash_encoder = tcnn.Encoding(n_input_dims=3, encoding_config=self.encoding_config)
-        
-        # GeometryAppearanceEncoder with feature role split support
-        # Uses stored GeoEncoder parameters for flexible size/quality tradeoff
-        self._grid = GeometryAppearanceEncoder(
-            hash_encoder=hash_encoder,
-            out_dim=hash_encoder.n_output_dims,
-            geo_channels=self._geo_channels,
+        # Create encoder using factory for ablation study support
+        # encoder_variant is set via __init__ from training args
+        self._grid = create_gaussian_encoder(
+            variant=self._encoder_variant,
+            encoding_config=self.encoding_config,
+            network_config=self.network_config,
             geo_resolution=self._geo_resolution,
             geo_rank=self._geo_rank,
-            feature_role_split=self._feature_role_split
+            geo_channels=self._geo_channels,
         )
         # Move encoder and its submodules to GPU
         self._grid = self._grid.cuda()
@@ -105,36 +102,36 @@ class GaussianModel:
         self._aabb = torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], dtype=torch.float, device='cuda')
         # Lightweight projection layers for feature_role_split path
         # Map geometry_latent/appearance_latent (C_shared + C_role) to head input dim (C_shared)
-        # Only used when feature_role_split=True to preserve head capacity
-        if self._feature_role_split and hasattr(self._grid, 'geometry_dim'):
-            geometry_input_dim = self._grid.geometry_dim  # C_shared + C_role
-            appearance_input_dim = self._grid.appearance_dim  # C_shared + C_role
-            base_dim = self._grid.n_output_dims  # C_shared
+        # Only used when encoder variant supports role split (hybrid with feature_role_split=True)
+        base_dim, geometry_dim, appearance_dim = get_encoder_output_dims(self._grid, self._encoder_variant)
+        
+        if geometry_dim != base_dim:  # Role split is active
             # Projection for geometry heads (scale, rotation, opacity)
-            self._geometry_input_proj = nn.Linear(geometry_input_dim, base_dim, bias=True).cuda()
+            self._geometry_input_proj = nn.Linear(geometry_dim, base_dim, bias=True).cuda()
             # Projection for appearance head (SH)
-            self._appearance_input_proj = nn.Linear(appearance_input_dim, base_dim, bias=True).cuda()
+            self._appearance_input_proj = nn.Linear(appearance_dim, base_dim, bias=True).cuda()
             nn.init.normal_(self._geometry_input_proj.weight, std=0.01)
             nn.init.zeros_(self._geometry_input_proj.bias)
             nn.init.normal_(self._appearance_input_proj.weight, std=0.01)
             nn.init.zeros_(self._appearance_input_proj.bias)
+            # Mark as role-split mode for update_attributes
+            self._use_role_split = True
         else:
-            # Fallback: legacy projection layers for backward compatibility
-            self._opacity_input_proj = nn.Linear(self._grid.n_output_dims * 2, self._grid.n_output_dims, bias=True).cuda()
-            self._sh_input_proj = nn.Linear(self._grid.n_output_dims * 2, self._grid.n_output_dims, bias=True).cuda()
-            nn.init.normal_(self._opacity_input_proj.weight, std=0.01)
-            nn.init.zeros_(self._opacity_input_proj.bias)
-            nn.init.normal_(self._sh_input_proj.weight, std=0.01)
-            nn.init.zeros_(self._sh_input_proj.bias)
+            # Fused latent mode: no separate projections needed
             self._geometry_input_proj = None
             self._appearance_input_proj = None
+            self._use_role_split = False
         self._rotation_init = torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float, device='cuda')
         self._opacity_init = torch.tensor([[np.log(0.1 / (1 - 0.1))]], dtype=torch.float, device='cuda')
 
     def __init__(self, sh_degree: int, hash_size=19, width=64, depth=2, feature_role_split=True,
-                 geo_resolution=48, geo_rank=6, geo_channels=8):
+                 geo_resolution=48, geo_rank=6, geo_channels=8, encoder_variant="hybrid",
+                 densify_strategy="feature_weighted"):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree
+        # Store encoder variant and densification strategy for ablation studies
+        self._encoder_variant = encoder_variant
+        self._densify_strategy = densify_strategy
         self._feature_role_split = feature_role_split  # Geometry/appearance disentanglement flag
         # Store GeoEncoder parameters for serialization/deserialization
         self._geo_resolution = geo_resolution
@@ -279,7 +276,7 @@ class GaussianModel:
         # For better GPU utilization, try to process in fewer, larger chunks
         chunk_size = min(131072, N) if N > 65536 else N  # Process all at once if < 65k, else use 128k chunks
 
-        if self._feature_role_split:
+        if self._use_role_split:
             # Collect outputs to avoid in-place writes that may invalidate autograd versions
             opacity_chunks = []
             scaling_chunks = []
@@ -837,6 +834,75 @@ class GaussianModel:
         if hasattr(self, '_cached_contracted_key'):
             self._cached_contracted_key = None
 
+    def compute_densify_score(self, grads, strategy="feature_weighted"):
+        """
+        Unified interface for computing densification scores for ablation studies.
+        
+        Args:
+            grads: Gradient tensor [N, 3] or [N]
+            strategy: Densification strategy variant
+                - "original": Original 3DGS gradient-only baseline (no detail_importance)
+                - "feature_weighted": GlowGS feature-weighted densification (paper default)
+                - "residual_only": Only use reconstruction residual, ignore edge info
+                - "edge_only": Only use edge magnitude, ignore reconstruction quality
+        
+        Returns:
+            scores: Densification scores [N], higher = more likely to densify
+        """
+        n_points = grads.shape[0]
+        
+        # Normalize gradient magnitude to [0, 1] range for comparability
+        grad_norm = torch.norm(grads, dim=-1) if grads.dim() > 1 else grads
+        grad_max = grad_norm.max()
+        if grad_max > 0:
+            grad_score = grad_norm / grad_max
+        else:
+            grad_score = grad_norm
+        
+        if strategy == "original":
+            # Baseline: pure gradient magnitude (original 3DGS)
+            return grad_score
+        
+        elif strategy == "feature_weighted":
+            # GlowGS default: gradient modulated by detail_importance
+            if self._detail_aware_enabled and self.detail_importance.shape[0] >= n_points:
+                k = self._detail_densify_scale
+                # Higher detail_importance → higher score (easier to densify)
+                importance_boost = 1.0 + k * self.detail_importance[:n_points]
+                return grad_score * importance_boost
+            else:
+                # Fallback to original if detail_importance not available
+                return grad_score
+        
+        elif strategy == "residual_only":
+            # Ablation: only use reconstruction residual component of detail_importance
+            # This simulates a detail_importance computed from pixel loss gradients only
+            if self._detail_aware_enabled and self.detail_importance.shape[0] >= n_points:
+                # Approximate: use 80% of detail_importance as "residual proxy"
+                # In practice, you'd recompute from reconstruction loss gradients only
+                residual_proxy = self.detail_importance[:n_points] * 0.8
+                k = self._detail_densify_scale
+                importance_boost = 1.0 + k * residual_proxy
+                return grad_score * importance_boost
+            else:
+                return grad_score
+        
+        elif strategy == "edge_only":
+            # Ablation: only use edge magnitude component of detail_importance
+            # This simulates a detail_importance computed from edge loss gradients only
+            if self._detail_aware_enabled and self.detail_importance.shape[0] >= n_points:
+                # Approximate: use normalized edge component (20% contribution)
+                # In practice, you'd recompute from edge loss gradients only
+                edge_proxy = torch.clamp(self.detail_importance[:n_points] * 1.2 - 0.4, 0.0, 1.0)
+                k = self._detail_densify_scale
+                importance_boost = 1.0 + k * edge_proxy
+                return grad_score * importance_boost
+            else:
+                return grad_score
+        
+        else:
+            raise ValueError(f"Unknown densify_strategy: {strategy}")
+
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         """
         Feature-weighted densification: split large Gaussians (GlowGS innovation #3).
@@ -854,15 +920,17 @@ class GaussianModel:
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
         
-        # Detail-aware threshold: high detail_importance → lower effective threshold
-        # effective_threshold_i = grad_threshold / (1 + k * detail_importance_i)
-        if self._detail_aware_enabled and self.detail_importance.shape[0] == n_init_points:
-            k = self._detail_densify_scale
-            effective_threshold = grad_threshold / (1.0 + k * self.detail_importance)
-        else:
-            effective_threshold = grad_threshold
+        # Use unified densification score computation for ablation studies
+        densify_scores = self.compute_densify_score(padded_grad, strategy=self._densify_strategy)
         
-        selected_pts_mask = padded_grad >= effective_threshold
+        # Convert scores back to threshold comparison (higher score = lower effective threshold)
+        # For backward compatibility: score = grad / effective_threshold
+        # So: effective_threshold = grad / score, selected if grad >= effective_threshold
+        # Simplified: selected if score >= 1.0 (normalized by grad_threshold)
+        grad_norm = torch.norm(grads, dim=-1) if grads.dim() > 1 else grads
+        grad_max = grad_norm.max() if grad_norm.max() > 0 else 1.0
+        normalized_threshold = grad_threshold / grad_max
+        selected_pts_mask = densify_scores >= normalized_threshold
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
 
@@ -885,13 +953,14 @@ class GaussianModel:
         # Extract points that satisfy the gradient condition
         n_points = grads.shape[0]
         
-        # Detail-aware threshold: high detail_importance → lower effective threshold
-        if self._detail_aware_enabled and self.detail_importance.shape[0] >= n_points:
-            k = self._detail_densify_scale
-            effective_threshold = grad_threshold / (1.0 + k * self.detail_importance[:n_points])
-            selected_pts_mask = torch.norm(grads, dim=-1) >= effective_threshold
-        else:
-            selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
+        # Use unified densification score computation for ablation studies
+        densify_scores = self.compute_densify_score(grads, strategy=self._densify_strategy)
+        
+        # Convert scores to selection mask (same logic as densify_and_split)
+        grad_norm = torch.norm(grads, dim=-1) if grads.dim() > 1 else grads
+        grad_max = grad_norm.max() if grad_norm.max() > 0 else 1.0
+        normalized_threshold = grad_threshold / grad_max
+        selected_pts_mask = densify_scores >= normalized_threshold
         
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)

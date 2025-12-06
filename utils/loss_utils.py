@@ -149,6 +149,82 @@ def compute_pixel_importance(gt_rgb, pred_rgb, power_edge=1.2, power_error=1.0):
     return pixel_importance.detach()  # Detach to avoid graph retention
 
 
+def compute_edge_loss(pred_rgb, gt_rgb, mode: str = "sobel_weighted", lambda_edge: float = 0.05, 
+                      flat_weight: float = 0.5, return_components: bool = False):
+    """
+    Unified edge loss interface for ablation studies.
+    
+    Supports systematic comparison of:
+    - "none": No edge supervision (returns zero, no computation)
+    - "sobel_basic": Simple Sobel gradient L1 matching
+    - "sobel_weighted": Adaptive edge-aware loss with flat regularization (paper default)
+    
+    Args:
+        pred_rgb: Predicted image
+        gt_rgb: Ground truth image
+        mode: Edge loss variant
+        lambda_edge: Loss weight (applied internally)
+        flat_weight: Weight for flat region term (used in sobel_weighted)
+        return_components: Whether to return (loss, edge_term, flat_term)
+    
+    Returns:
+        Weighted loss (lambda_edge * base_loss) or tuple if return_components=True
+    """
+    if mode == "none":
+        # No edge loss: return zero tensor with no grad
+        zero_loss = torch.tensor(0.0, device=pred_rgb.device, requires_grad=False)
+        if return_components:
+            return zero_loss, zero_loss, zero_loss
+        return zero_loss
+    
+    elif mode == "sobel_basic":
+        # Basic Sobel gradient L1: no adaptive weighting, simple matching
+        return _sobel_basic_loss(pred_rgb, gt_rgb, lambda_edge, return_components)
+    
+    elif mode == "sobel_weighted":
+        # Paper's unified edge-aware loss (default)
+        loss = gradient_loss(pred_rgb, gt_rgb, valid_mask=None, flat_weight=flat_weight, 
+                            return_components=return_components)
+        if return_components:
+            base_loss, edge_term, flat_term = loss
+            return lambda_edge * base_loss, edge_term, flat_term
+        return lambda_edge * loss
+    
+    else:
+        raise ValueError(
+            f"Unknown edge_loss_mode: {mode}. "
+            f"Expected one of ['none', 'sobel_basic', 'sobel_weighted']"
+        )
+
+
+def _sobel_basic_loss(pred_rgb, gt_rgb, lambda_edge, return_components=False):
+    """
+    Basic Sobel gradient matching (ablation baseline).
+    Simply computes L1 between pred and GT gradient magnitudes without adaptive weighting.
+    """
+    # Ensure 4D input
+    if pred_rgb.dim() == 3:
+        pred_rgb = pred_rgb.unsqueeze(0)
+    if gt_rgb.dim() == 3:
+        gt_rgb = gt_rgb.unsqueeze(0)
+    
+    sobel_x, sobel_y = _get_sobel_kernels(pred_rgb.device, pred_rgb.dtype)
+    pred_gray = _rgb_to_grayscale(pred_rgb)
+    gt_gray = _rgb_to_grayscale(gt_rgb)
+    
+    G_pred = _compute_gradient_magnitude(pred_gray, sobel_x, sobel_y)
+    G_gt = _compute_gradient_magnitude(gt_gray, sobel_x, sobel_y)
+    
+    # Simple L1 matching (no edge/flat distinction)
+    basic_loss = torch.abs(G_pred - G_gt).mean()
+    weighted_loss = lambda_edge * basic_loss
+    
+    if return_components:
+        # Return same value for all components (no decomposition in basic mode)
+        return weighted_loss, basic_loss.detach(), torch.tensor(0.0, device=pred_rgb.device)
+    return weighted_loss
+
+
 def gradient_loss(pred_rgb, gt_rgb, valid_mask=None, flat_weight=0.5, return_components=False):
     """
     Unified edge-aware gradient loss (GlowGS innovation #2).

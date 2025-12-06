@@ -1,25 +1,18 @@
 <div align="center">
 
-# Locality-aware 3D Gaussian Compression <br> for Fast and High-quality Rendering
+# GlowGS: Efficient 3D Gaussian Splatting with <br> Hybrid Encoding and Adaptive Densification
 
-<div style="font-size:120%">
-  <a href="https://seungjooshin.github.io">Seungjoo Shin<a><sup>1</sup> &nbsp;&nbsp;</a>
-  <a href="https://jaesik.info">Jaesik Park<a><sup>2</sup> &nbsp;&nbsp;</a>
-  <a href="https://www.scho.pe.kr">Sunghyun Cho<a><sup>1</sup> &nbsp;&nbsp;</a>
 </div>
 
-<p>
-    <sup>1</sup>POSTECH &nbsp;&nbsp;
-    <sup>2</sup>Seoul National University &nbsp;&nbsp;
-</p>
+## Overview
 
-### <p style="font-size:120%"> ICLR 2025</p>
-<a href='https://arxiv.org/abs/2501.05757'><img src='https://img.shields.io/badge/arXiv-2501.05757-b31b1b.svg'></a> &nbsp;&nbsp;
-<a href='https://seungjooshin.github.io/LocoGS'><img src='https://img.shields.io/badge/Project-Page-Green'></a> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+GlowGS introduces three key innovations for efficient and high-quality 3D Gaussian Splatting:
 
-<img src="./assets/qualitative.png"/>
-<br>
-</div>
+1. **🔀 Hybrid Hash-VM Encoder**: Combines discrete hash grids with continuous tri-plane VM decomposition for efficient geometry/appearance encoding
+2. **🎯 Unified Edge-Aware Loss**: Adaptive gradient-based loss that preserves high-frequency details while regularizing flat regions
+3. **⚡ Feature-Weighted Densification**: Detail-aware Gaussian allocation that prioritizes high-importance regions
+
+This codebase provides a clean, unified interface for systematic ablation studies of these innovations.
 
 ## Installation
 
@@ -32,12 +25,12 @@ This project is built upon the following environment:
 Run the following command to build the environment.
 ```bash
 # clone this repo
-git clone --recursive https://github.com/seungjooshin/LocoGS.git
-cd LocoGS
+git clone --recursive https://github.com/YujiaLin-523/GlowGS.git
+cd GlowGS
 
 # create a conda environment
-conda create -n locogs python=3.10
-conda activate locogs
+conda create -n glowgs python=3.10
+conda activate glowgs
 
 # install pytorch
 conda install pytorch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 pytorch-cuda=11.7 -c pytorch -c nvidia
@@ -50,10 +43,17 @@ cd ../../
 
 # install packages
 pip install -r requirements.txt
+
+# install pyyaml for ablation config saving
+pip install pyyaml
 ```
 
-### G-PCC
-Run the following command to build [TMC13](https://github.com/MPEGGroup/mpeg-pcc-tmc13).
+**Note**: If you encounter issues with `tiny-cuda-nn`, please refer to their [official installation guide](https://github.com/NVlabs/tiny-cuda-nn).
+
+### G-PCC (Geometry-based Point Cloud Compression)
+
+GlowGS uses [TMC13](https://github.com/MPEGGroup/mpeg-pcc-tmc13) for efficient model storage and compression. Build it with:
+
 ```bash
 # build mpeg-pcc-tmc13
 cd submodules/mpeg-pcc-tmc13
@@ -63,6 +63,8 @@ cmake ..
 make
 cd ../../../
 ```
+
+This step is **required** for model saving/loading functionality.
 
 ## Data
 
@@ -83,25 +85,130 @@ We support three datasets for evaluation. Please follow [3DGS](https://github.co
       ├── ...
 ```
 
-## Running
+## Quick Start
 
-Please refer to the [scripts](scripts) for evaluation.
-- Dense initialization: [scripts/run_nerfacto.sh](scripts/run_nerfacto.sh) 
-- LocoGS: [scripts/run.sh](scripts/run.sh) 
-- LocoGS-Small: [scripts/run_small.sh](scripts/run_small.sh) 
-- LocoGS w/o dense initialization: [scripts/run_colmap_pcd.sh](scripts/run_colmap_pcd.sh) 
+### Basic Training
+
+Train GlowGS with default settings (full method):
+```bash
+python train.py -s data/360_v2/bicycle -m output/bicycle --eval
+```
+
+### Training with Custom Point Cloud
+
+If you have a dense point cloud (e.g., from NeRF):
+```bash
+python train.py -s data/360_v2/bicycle -m output/bicycle --eval \
+                --pcd_path path/to/point_cloud.ply
+``` 
 
 
-### Preprocessing
+## Ablation Studies
 
-Run the following command to acquire a dense point cloud. 
+GlowGS provides a unified interface for systematic ablation studies. See [ABLATION_STUDY_GUIDE.md](ABLATION_STUDY_GUIDE.md) for detailed documentation.
+
+### Ablation Parameters
+
+Control three key innovations via CLI parameters:
+
+| Parameter | Options | Default | Description |
+|-----------|---------|---------|-------------|
+| `--encoder_variant` | `hybrid`, `hash_only`, `vm_only`, `no_role_split` | `hybrid` | Encoder architecture variant |
+| `--edge_loss_mode` | `sobel_weighted`, `sobel_basic`, `none` | `sobel_weighted` | Edge-aware loss mode |
+| `--densify_strategy` | `feature_weighted`, `original`, `residual_only`, `edge_only` | `feature_weighted` | Densification strategy |
+
+### Examples
+
+**Test encoder variants:**
+```bash
+# Hash-only baseline (no VM)
+python train.py -s data/360_v2/bicycle -m output/bicycle_hash \
+                --encoder_variant hash_only
+
+# VM-only baseline (no hash grid)
+python train.py -s data/360_v2/bicycle -m output/bicycle_vm \
+                --encoder_variant vm_only
+
+# Hybrid without role split (fused latent)
+python train.py -s data/360_v2/bicycle -m output/bicycle_norole \
+                --encoder_variant no_role_split
+```
+
+**Test edge loss modes:**
+```bash
+# Disable edge loss
+python train.py -s data/360_v2/bicycle -m output/bicycle_noedge \
+                --edge_loss_mode none
+
+# Basic edge loss (simple gradient matching)
+python train.py -s data/360_v2/bicycle -m output/bicycle_basiced \
+                --edge_loss_mode sobel_basic
+```
+
+**Test densification strategies:**
+```bash
+# Original 3DGS densification
+python train.py -s data/360_v2/bicycle -m output/bicycle_origdens \
+                --densify_strategy original
+
+# Edge-only importance
+python train.py -s data/360_v2/bicycle -m output/bicycle_edgedens \
+                --densify_strategy edge_only
+```
+
+**Full ablation (all innovations disabled):**
+```bash
+python train.py -s data/360_v2/bicycle -m output/bicycle_baseline \
+                --encoder_variant hash_only \
+                --edge_loss_mode none \
+                --densify_strategy original
+```
+
+### Configuration Auto-Save
+
+Every training run automatically saves `ablation_config.yaml` in the output directory for full reproducibility:
+
+```yaml
+ablation_settings:
+  encoder_variant: hybrid
+  edge_loss_mode: sobel_weighted
+  densify_strategy: feature_weighted
+
+training_hyperparameters:
+  iterations: 30000
+  lambda_grad: 0.05
+  max_gaussians: 6000000
+  ...
+```
+
+### Training Summary
+
+At training start, you'll see:
+```
+======================================================================================
+  ABLATION STUDY CONFIGURATION
+--------------------------------------------------------------------------------------
+  Encoder Variant      │  hybrid
+  Edge Loss Mode       │  sobel_weighted (λ=0.050)
+  Densification Mode   │  feature_weighted
+  Max Gaussians        │  6,000,000
+  Iterations           │  30,000
+======================================================================================
+```
+
+## Advanced Usage
+
+### Preprocessing (Optional Dense Initialization)
+
+If you want to use a dense point cloud from NeRF instead of COLMAP:
+
 ``` shell
-# processing data
+# Process data
 ns-process-data images --data data/${DATASET}/${SCENE} \
                        --output-dir data/${DATASET}/${SCENE} \
                        --skip-colmap --skip-image-processing
 
-# train nerfacto
+# Train nerfacto
 ns-train nerfacto --data data/${DATASET}/${SCENE} \
                   --output-dir output \
                   --timestamp run \
@@ -109,7 +216,7 @@ ns-train nerfacto --data data/${DATASET}/${SCENE} \
                   --machine.seed 0  \
                   --pipeline.model.camera-optimizer.mode off
 
-# export pointcloud
+# Export pointcloud
 ns-export pointcloud --load-config output/${SCENE}/nerfacto/run/config.yml \
                      --output-dir output/${SCENE}/nerfacto/run \
                      --remove-outliers True \
@@ -117,65 +224,122 @@ ns-export pointcloud --load-config output/${SCENE}/nerfacto/run/config.yml \
                      --normal-method open3d \
                      --save-world-frame True
 ```
+
 The point cloud will be saved as `output/${SCENE}/nerfacto/run/point_cloud.ply`.
-- If you get inaccruate results, please re-run COLMAP.
 
-### Training
+### Training Parameters
 
-Run the following command to optimize LocoGS.
-``` shell
-# LocoGS
-python train.py -s data/${DATASET}/${SCENE} -m output/${SCENE} --eval \
-                --pcd_path ${PATH_TO_PCD} \
-                --lambda_mask 0.004 \
-                --hash_size 19
+Key hyperparameters for GlowGS:
 
-# LocoGS-Small
-python train.py -s data/${DATASET}/${SCENE} -m output/${SCENE} --eval \
-                --pcd_path ${PATH_TO_PCD} \
-                --lambda_mask 0.005 \
-                --hash_size 17
-
-# LocoGS w/ COLMAP point cloud
-python train.py -s data/${DATASET}/${SCENE} -m output/${SCENE} --eval \
-                --lambda_mask 0.001 \
-                --hash_size 19
+```bash
+python train.py -s <scene_path> -m <output_path> \
+                --eval \                           # Enable test set evaluation
+                --pcd_path <path_to_pcd> \        # Optional: custom point cloud
+                --lambda_grad 0.05 \               # Edge loss weight
+                --lambda_mask 0.01 \               # Mask regularization weight
+                --hash_size 19 \                   # Hash grid size
+                --max_gaussians 6000000 \          # Maximum Gaussian count
+                --iterations 30000                 # Training iterations
 ```
-- `pcd_path`: path to initial point cloud (COLMAP point cloud by default)
-- `lambda_mask`: weight of masking loss (`0.004` by default)
-- `hash_size`: size of hash grid, (`19` by default)
+
+**Parameter Details:**
+- `pcd_path`: Path to initial point cloud (uses COLMAP point cloud by default)
+- `lambda_grad`: Weight for edge-aware loss (default: `0.05`)
+- `lambda_mask`: Weight for mask regularization (default: `0.01`)
+- `hash_size`: Hash grid resolution, controls memory usage (default: `19`)
+- `max_gaussians`: Hard capacity limit for Gaussians (default: `6,000,000`)
+- `geo_resolution`: VM tri-plane resolution (default: `48`)
+- `geo_rank`: VM rank for tensor decomposition (default: `6`)
 
 ### Evaluation
-Run the following command to evaluate LocoGS.
+
+Render and evaluate a trained model:
 ```bash
-# render LocoGS
-python render.py -s data/${DATASET}/${SCENE} -m output/${SCENE}
+# Render test views
+python render.py -m output/bicycle
 
-# compute error metrics on renderings
-python metrics.py -m output/${SCENE}
+# Compute metrics (PSNR, SSIM, LPIPS)
+python metrics.py -m output/bicycle
 ```
 
-### Convert to PLY format
-Run the following command to convert LocoGS to PLY format.
+Results will be saved in `output/bicycle/test/ours_30000/`.
+
+
+## Batch Processing Scripts
+
+For convenience, we provide scripts for batch evaluation:
+
 ```bash
-# convert LocoGS to PLY
-python convert2ply.py -m output/${SCENE}
+# Train all scenes in Mip-NeRF 360
+bash scripts/train_360_v2.sh
+
+# Train Tanks & Temples scenes
+bash scripts/train_tandt.sh
+
+# Train Deep Blending scenes
+bash scripts/train_db.sh
+
+# Evaluate all trained models
+bash scripts/evaluate_360_v2.sh
+bash scripts/evaluate_tandt.sh
+bash scripts/evaluate_db.sh
 ```
 
+## Project Structure
 
-## Citation
-
-If our work is useful, please consider citing our paper:
-```bib
-@inproceedings{shin2025localityaware,
-  title={Locality-aware Gaussian Compression for Fast and High-quality Rendering},
-  author={Seungjoo Shin and Jaesik Park and Sunghyun Cho},
-  booktitle={The Thirteenth International Conference on Learning Representations},
-  year={2025},
-  url={https://openreview.net/forum?id=dHYwfV2KeP}
-}
 ```
+GlowGS/
+├── encoders/
+│   ├── encoder_factory.py      # Unified encoder creation (ablation support)
+│   ├── geo_encoder.py          # VM tri-plane encoder
+│   └── geometry_appearance_encoder.py  # Hybrid hash-VM encoder
+├── scene/
+│   └── gaussian_model.py       # Core Gaussian model with densification
+├── utils/
+│   ├── loss_utils.py           # Loss functions (edge-aware loss)
+│   └── ...
+├── train.py                    # Main training script
+├── render.py                   # Rendering script
+├── metrics.py                  # Evaluation metrics
+└── ABLATION_STUDY_GUIDE.md    # Detailed ablation guide
+```
+
+## Key Features
+
+✅ **Unified Ablation Interface**: Clean CLI parameters for systematic experiments  
+✅ **Auto-Config Saving**: Every run saves `ablation_config.yaml` for reproducibility  
+✅ **Modular Design**: Factory pattern for easy variant switching  
+✅ **Backward Compatible**: Default parameters match paper baseline  
+✅ **GPU Memory Efficient**: Supports both 48GB and 24GB GPUs  
+✅ **Training Monitoring**: TensorBoard integration + detailed console logs  
+
+## Tips
+
+- **Memory**: If OOM on 24GB GPU, reduce `--max_gaussians` to `3000000` or `--hash_size` to `18`
+- **Speed**: Enable AMP with `--use_amp` for faster training (experimental)
+- **Quality**: For better quality, increase `--geo_resolution` to `64` (more memory)
+- **Debugging**: Use `--debug_from 0` to enable detailed logging from iteration 0
+
+## Troubleshooting
+
+**Issue**: "CUDA out of memory"  
+**Solution**: Reduce `--max_gaussians` or `--hash_size`, or enable `--use_amp`
+
+**Issue**: "Module 'yaml' not found"  
+**Solution**: `pip install pyyaml`
+
+**Issue**: "tiny-cuda-nn installation failed"  
+**Solution**: Follow [tiny-cuda-nn installation guide](https://github.com/NVlabs/tiny-cuda-nn#pytorch-extension)
+
+**Issue**: Different results with same config  
+**Solution**: Set random seed with environment variable: `PYTHONHASHSEED=0 python train.py ...`
 
 ## Acknowledgement
 
-Our code is based on [3DGS](https://github.com/graphdeco-inria/gaussian-splatting) and [Compact-3DGS](https://github.com/maincold2/Compact-3DGS). Thanks for their awesome work.
+This codebase is built upon:
+- [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting) - Original 3DGS implementation
+- [LocoGS](https://github.com/seungjooshin/LocoGS) - Locality-aware compression baseline
+- [tiny-cuda-nn](https://github.com/NVlabs/tiny-cuda-nn) - Efficient hash grid encoding
+- [TensoRF](https://github.com/apchenstu/TensoRF) - VM decomposition inspiration
+
+Thanks to the authors for their excellent work!

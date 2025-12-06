@@ -175,6 +175,23 @@ class OptimizationParams(ParamGroup):
         # Capacity control: hard cap on total Gaussian count
         # Prevents densification from exploding memory on large scenes
         self.max_gaussians = 6_000_000           # N_max: maximum number of Gaussians (6M for 48GB GPU)
+        
+        # ========================================================================
+        # Ablation Study Configuration
+        # ========================================================================
+        
+        # Encoder ablation: switch between different encoder architectures
+        # Options: "hybrid" (hash+VM, paper default) | "hash_only" | "vm_only" | "no_role_split"
+        self.encoder_variant = "hybrid"
+        
+        # Edge loss ablation: different edge supervision strategies
+        # Options: "none" | "sobel_basic" | "sobel_weighted" (paper default)
+        self.edge_loss_mode = "sobel_weighted"
+        
+        # Densification strategy ablation: compare different importance scoring
+        # Options: "original" (3DGS baseline) | "feature_weighted" (paper default) | "residual_only" | "edge_only"
+        self.densify_strategy = "feature_weighted"
+        
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
