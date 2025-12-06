@@ -149,9 +149,11 @@ class OptimizationParams(ParamGroup):
         
         self.random_background = False
 
-        self.enable_edge_loss = True       # master switch for Sobel gradient loss
-        self.edge_loss_start_iter = 5000    # delay edge loss to avoid early instability
-        self.lambda_grad = 0.05             # edge loss weight (0.02~0.1 recommended)
+        # Edge-aware loss configuration (GlowGS innovation #2)
+        self.enable_edge_loss = True       # master switch for unified edge-aware gradient loss
+        self.edge_loss_start_iter = 5000    # delay edge loss until geometry stabilizes (warmup)
+        self.lambda_grad = 0.05             # edge loss weight (0.02~0.1 typical; 0.05 balanced)
+        self.edge_flat_weight = 0.5         # flat region penalty weight (alpha in paper; 0.5 = equal)
         # Profiling 相关参数（默认关闭）
         self.profile_iters = 0
         self.profile_wait = 2
@@ -169,6 +171,10 @@ class OptimizationParams(ParamGroup):
         self.detail_importance_power_error = 1.0 # Exponent for error_strength in pixel_importance
         self.detail_densify_scale = 0.5          # k: effective_threshold = base / (1 + k * detail_importance)
         self.detail_prune_weight = 0.2           # Weight for detail term in prune score
+        
+        # Capacity control: hard cap on total Gaussian count
+        # Prevents densification from exploding memory on large scenes
+        self.max_gaussians = 6_000_000           # N_max: maximum number of Gaussians (6M for 48GB GPU)
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

@@ -14,14 +14,25 @@ from .geo_encoder import GeoEncoder
 
 class GeometryAppearanceEncoder(nn.Module):
     """
-    Dual-branch encoder with explicit geometry/appearance feature role split.
+    Hybrid Encoder for Gaussians (GlowGS innovation #1).
     
-    Hash branch captures high-frequency details optimal for appearance (SH/color).
-    GeoEncoder branch provides smooth low-frequency priors optimal for geometry (scale/rot).
+    Design Philosophy:
+    - Combines hash grid (local, high-frequency, view-dependent details) with
+      tri-plane GeoEncoder (global, low-frequency, smooth structure).
+    - Explicit feature role split: geometry_latent for scale/rotation/opacity,
+      appearance_latent for SH/color, enabling disentangled learning.
+    - Shared latent provides unified local context, then specialized adapters
+      add small-dimension residuals for role-specific refinement.
+    
+    Architecture:
+      Input 3D coords → Hash grid + Tri-plane GeoEncoder
+                     → Shared projector (C_shared)
+                     → Geometry adapter (C_role) / Appearance adapter (C_role)
+                     → geometry_latent / appearance_latent
     
     Args:
         hash_encoder: Pre-initialized hash grid encoder with forward() and n_output_dims.
-        out_dim (int): Output feature dimension per branch.
+        out_dim (int): Output feature dimension per branch (C_shared).
         geo_channels (int): GeoEncoder output channels.
         geo_resolution (int): Tri-plane spatial resolution.
         geo_rank (int): Low-rank factorization rank.

@@ -227,6 +227,12 @@ class GaussianModel:
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
         self.optimizer_i.load_state_dict(opt_i_dict)
+        
+        # Ensure detail_importance is correctly sized after restore
+        # (Old checkpoints may not have this buffer, initialize to neutral)
+        if self.detail_importance.shape[0] != self._xyz.shape[0]:
+            self.detail_importance = torch.full((self._xyz.shape[0],), 0.5, device="cuda")
+            print(f"[INFO] Initialized detail_importance to neutral (0.5) for {self._xyz.shape[0]} Gaussians")
 
     def update_attributes(self, force_update=False):
         """
@@ -532,6 +538,16 @@ class GaussianModel:
         # Ensure detail_importance is initialized if not already
         if self.detail_importance.shape[0] != self.get_xyz.shape[0]:
             self.detail_importance = torch.full((self.get_xyz.shape[0],), 0.5, device="cuda")
+        
+        # Update capacity config from training_args (allow CLI override)
+        max_gaussians = getattr(training_args, 'max_gaussians', 6_000_000)
+        densify_until = getattr(training_args, 'densify_until_iter', 15000)
+        prune_interval = getattr(training_args, 'prune_interval', 1000)
+        self.gaussian_capacity_config.update({
+            "max_point_count": max_gaussians,
+            "densify_until_iter": densify_until,
+            "prune_interval": prune_interval,
+        })
 
         param_groups = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -822,6 +838,17 @@ class GaussianModel:
             self._cached_contracted_key = None
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+        """
+        Feature-weighted densification: split large Gaussians (GlowGS innovation #3).
+        
+        Key Modification:
+        - Applies per-Gaussian detail_importance scores to modulate split threshold.
+        - High-importance Gaussians (edges, textures) get lower effective threshold,
+          making them easier to split even with moderate gradients.
+        - Reallocates limited Gaussian budget toward high-frequency regions.
+        
+        Formula: effective_threshold_i = base_threshold / (1 + k * detail_importance_i)
+        """
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -946,9 +973,16 @@ class GaussianModel:
         mask_prune_threshold: float = 0.005,
     ):
         """
-        Lightweight wrapper around densify_and_prune with capacity control.
-        Enforces a hard cap on Gaussian count (default 6M) and respects the
-        densification schedule. Does NOT modify internal densify/prune logic.
+        Capacity-controlled densification wrapper (GlowGS innovation #3: N_max enforcement).
+        
+        Design:
+        - Enforces hard point budget (N_max, default 6M) to prevent memory explosion.
+        - Densification only proceeds if: (1) within schedule, (2) under capacity.
+        - Works synergistically with feature-weighted densification: limited budget
+          is allocated to high-importance regions via detail_importance modulation.
+        - Post-densification: periodic mask pruning to remove low-contribution Gaussians.
+        
+        Does NOT modify core densify/prune algorithms, only adds capacity gating.
         
         Args:
             iteration: Current training iteration
