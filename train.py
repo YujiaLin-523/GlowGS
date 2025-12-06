@@ -435,7 +435,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                # Use lightweight save for final checkpoint to reduce file size (~3-5MB savings)
+                # Optimizer states not needed for inference/evaluation
+                if iteration == opt.iterations:
+                    torch.save((gaussians.capture_for_eval(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                    print(f"  ├─ Saved lightweight checkpoint (evaluation-only, no optimizer states)")
+                else:
+                    torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
         if profiler:
             profiler.step()

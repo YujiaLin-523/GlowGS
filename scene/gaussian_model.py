@@ -197,7 +197,112 @@ class GaussianModel:
             self.spatial_lr_scale,
         )
     
+    def capture_for_eval(self):
+        """
+        Lightweight capture for evaluation/inference only.
+        Excludes training-specific data (optimizer states, gradients) to reduce model size.
+        Saves ~3-5MB compared to full capture().
+        """
+        return (
+            self.active_sh_degree,
+            self._xyz,
+            self._features_dc,
+            self._features_rest,
+            self._scaling_base,
+            self._mask,
+            self._sh_mask,
+            self._grid,
+            self._features_rest_head,
+            self._scaling_head,
+            self._rotation_head,
+            self._opacity_head,
+            self._aabb,
+            self._rotation_init,
+            self._opacity_init,
+            self.spatial_lr_scale,
+        )
+    
     def restore(self, model_args, training_args):
+        """
+        Restore model from checkpoint. 
+        Automatically detects lightweight (eval-only) vs full (training) checkpoints.
+        """
+        # Check if this is a lightweight checkpoint (16 items) or full checkpoint (21 items)
+        if len(model_args) == 16:
+            # Lightweight checkpoint from capture_for_eval()
+            print("[INFO] Loading lightweight checkpoint (evaluation-only)")
+            (self.active_sh_degree, 
+            self._xyz, 
+            self._features_dc,
+            self._features_rest,
+            self._scaling_base,
+            self._mask,
+            self._sh_mask,
+            self._grid,
+            self._features_rest_head,
+            self._scaling_head,
+            self._rotation_head,
+            self._opacity_head,
+            self._aabb,
+            self._rotation_init,
+            self._opacity_init,
+            self.spatial_lr_scale) = model_args
+            
+            # Initialize training-specific buffers
+            N = self._xyz.shape[0]
+            self.max_radii2D = torch.zeros((N,), device="cuda")
+            xyz_gradient_accum = torch.zeros((N, 1), device="cuda")
+            denom = torch.zeros((N, 1), device="cuda")
+            
+            # Setup training (creates optimizers)
+            self.training_setup(training_args)
+            self.xyz_gradient_accum = xyz_gradient_accum
+            self.denom = denom
+            # Optimizer states will be fresh (not loaded)
+            print(f"[INFO] Initialized {N} Gaussians with fresh optimizer states")
+            
+        else:
+            # Full checkpoint from capture()
+            (self.active_sh_degree, 
+            self._xyz, 
+            self._features_dc,
+            self._features_rest,
+            self._scaling_base,
+            self._mask,
+            self._sh_mask,
+            self._grid,
+            self._features_rest_head,
+            self._scaling_head,
+            self._rotation_head,
+            self._opacity_head,
+            self._aabb,
+            self._rotation_init,
+            self._opacity_init,
+            self.max_radii2D, 
+            xyz_gradient_accum, 
+            denom,
+            opt_dict, 
+            opt_i_dict,
+            self.spatial_lr_scale) = model_args
+            
+            self.training_setup(training_args)
+            self.xyz_gradient_accum = xyz_gradient_accum
+            self.denom = denom
+            self.optimizer.load_state_dict(opt_dict)
+            self.optimizer_i.load_state_dict(opt_i_dict)
+        
+        # Ensure detail_importance is correctly sized after restore
+        # (Old checkpoints may not have this buffer, initialize to neutral)
+        if self.detail_importance.shape[0] != self._xyz.shape[0]:
+            self.detail_importance = torch.full((self._xyz.shape[0],), 0.5, device="cuda")
+            print(f"[INFO] Initialized detail_importance to neutral (0.5) for {self._xyz.shape[0]} Gaussians")
+    
+    def restore_for_eval(self, model_args):
+        """
+        Lightweight restore for evaluation/inference only.
+        Compatible with capture_for_eval() output.
+        Initializes training buffers to empty tensors (not used in eval mode).
+        """
         (self.active_sh_degree, 
         self._xyz, 
         self._features_dc,
@@ -213,23 +318,16 @@ class GaussianModel:
         self._aabb,
         self._rotation_init,
         self._opacity_init,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
-        denom,
-        opt_dict, 
-        opt_i_dict,
         self.spatial_lr_scale) = model_args
-        self.training_setup(training_args)
-        self.xyz_gradient_accum = xyz_gradient_accum
-        self.denom = denom
-        self.optimizer.load_state_dict(opt_dict)
-        self.optimizer_i.load_state_dict(opt_i_dict)
         
-        # Ensure detail_importance is correctly sized after restore
-        # (Old checkpoints may not have this buffer, initialize to neutral)
-        if self.detail_importance.shape[0] != self._xyz.shape[0]:
-            self.detail_importance = torch.full((self._xyz.shape[0],), 0.5, device="cuda")
-            print(f"[INFO] Initialized detail_importance to neutral (0.5) for {self._xyz.shape[0]} Gaussians")
+        # Initialize training buffers to empty (not needed for eval)
+        N = self._xyz.shape[0]
+        self.max_radii2D = torch.zeros((N,), device="cuda")
+        self.xyz_gradient_accum = torch.zeros((N, 1), device="cuda")
+        self.denom = torch.zeros((N, 1), device="cuda")
+        self.detail_importance = torch.full((N,), 0.5, device="cuda")
+        
+        print(f"[INFO] Restored {N} Gaussians for evaluation (lightweight mode)")
 
     def update_attributes(self, force_update=False):
         """
