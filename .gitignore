@@ -81,8 +81,9 @@ cfg_args
 events.out.tfevents*
 
 # -------------------- Submodules --------------------
-/submodules/
-submodules/**
+# /submodules/
+# submodules/**
+# Note: submodules are now managed via git submodules
 
 # -------------------- Node / web --------------------
 node_modules/
