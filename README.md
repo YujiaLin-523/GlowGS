@@ -33,7 +33,7 @@ conda create -n glowgs python=3.10
 conda activate glowgs
 
 # install pytorch
-conda install pytorch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 pytorch-cuda=11.7 -c pytorch -c nvidia
+conda install pytorch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 pytorch-cuda=12.1 -c pytorch -c nvidia
 
 # install nerfstudio
 cd submodules/nerfstudio
@@ -41,11 +41,14 @@ pip install --upgrade pip setuptools
 pip install -e .
 cd ../../
 
-# install packages
-pip install -r requirements.txt
+# install submodules
+pip install submodules/diff-gaussian-rasterization --no-build-isolation
+pip install submodules/diff-gaussian-rasterization-sh --no-build-isolation
+pip install submodules/simple-knn --no-build-isolation
+pip install git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch --no-build-isolation
 
-# install pyyaml for ablation config saving
-pip install pyyaml
+# install packages
+pip install -r requirements.txt --no-build-isolation
 ```
 
 **Note**: If you encounter issues with `tiny-cuda-nn`, please refer to their [official installation guide](https://github.com/NVlabs/tiny-cuda-nn).

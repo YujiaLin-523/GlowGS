@@ -1,15 +1,19 @@
 [submodule "submodules/diff-gaussian-rasterization"]
 	path = submodules/diff-gaussian-rasterization
 	url = https://github.com/graphdeco-inria/diff-gaussian-rasterization.git
+	ignore = dirty
 [submodule "submodules/diff-gaussian-rasterization-sh"]
 	path = submodules/diff-gaussian-rasterization-sh
 	url = https://github.com/seungjoo-shin/diff-gaussian-rasterization-sh.git
+	ignore = dirty
 [submodule "submodules/simple-knn"]
 	path = submodules/simple-knn
 	url = https://github.com/camenduru/simple-knn.git
+	ignore = dirty
 [submodule "submodules/mpeg-pcc-tmc13"]
 	path = submodules/mpeg-pcc-tmc13
 	url = https://github.com/MPEGGroup/mpeg-pcc-tmc13.git
 [submodule "submodules/nerfstudio"]
 	path = submodules/nerfstudio
 	url = https://github.com/nerfstudio-project/nerfstudio.git
+	ignore = dirty
