@@ -62,8 +62,8 @@ GlowGS uses [TMC13](https://github.com/MPEGGroup/mpeg-pcc-tmc13) for efficient m
 cd submodules/mpeg-pcc-tmc13
 mkdir build
 cd build
-cmake ..
-make
+cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 .. 
+make -j$(nproc)
 cd ../../../
 ```
 
