@@ -84,6 +84,13 @@ events.out.tfevents*
 # /submodules/
 # submodules/**
 # Note: submodules are now managed via git submodules
+# Ignore build artifacts in submodules
+submodules/*/build/
+submodules/*/dist/
+submodules/*/*.egg-info/
+submodules/*/__pycache__/
+submodules/*/*.so
+submodules/*/*.pyc
 
 # -------------------- Node / web --------------------
 node_modules/
