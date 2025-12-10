@@ -43,7 +43,7 @@ TANDT_SCENES=(train truck)
 DB_SCENES=(drjohnson playroom)
 
 # Training iterations (can be adjusted for faster testing)
-ITERATIONS=30000
+ITERATIONS=1000
 
 # Initialize results file with header if it doesn't exist
 if [ ! -f "$RESULTS_FILE" ]; then
@@ -82,15 +82,15 @@ run_experiment() {
         --use_hybrid_encoder="$use_hybrid" \
         --use_edge_loss="$use_edge" \
         --use_feature_densify="$use_densify" \
-        > "$log_file" 2>&1
+        > "$log_file"
     
     echo "[INFO] Training completed, running render and evaluation..."
     
     # Run render.py to generate test images
-    python render.py -m "$output_dir" >> "$log_file" 2>&1
+    python render.py -m "$output_dir" >> "$log_file"
     
     # Run metrics.py to get final evaluation
-    python metrics.py -m "$output_dir" >> "$log_file" 2>&1
+    python metrics.py -m "$output_dir" >> "$log_file"
     
     # Extract metrics from log file
     # Look for patterns from metrics.py output: "  PSNR : XX.XXXXXXX"
