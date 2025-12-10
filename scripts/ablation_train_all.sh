@@ -1,23 +1,28 @@
 #!/usr/bin/env bash
 
 # ==============================================================================
-# GlowGS Ablation Experiment Runner
+# GlowGS Ablation Experiments - All Datasets
 # ==============================================================================
+# Runs complete ablation study across MipNeRF360, Tanks&Temples, and Deep Blending
+#
 # Usage:
-#   bash scripts/run_ablation_mip360_tandt_db.sh
+#   bash scripts/ablation_all_datasets.sh
 #
-# This script runs GlowGS ablation experiments on:
-#   - mipnerf360: garden, stump, bicycle
+# Datasets & Scenes:
+#   - MipNeRF360: garden, stump, bicycle
 #   - Tanks&Temples: train, truck
-#   - DB: drjohnson, playroom
+#   - Deep Blending: drjohnson, playroom
 #
-# For each scene, it runs 4 variants:
-#   V0: baseline 3DGS-mode (all innovations OFF)
-#   V1: +Hybrid Encoder
-#   V2: +Hybrid Encoder + Edge Loss
-#   V3: full GlowGS (Hybrid + Edge Loss + Feature Densification)
+# Ablation Variants (4 configurations per scene):
+#   V0: 3DGS Baseline (all innovations OFF)
+#   V1: + Hybrid Encoder only
+#   V2: + Hybrid Encoder + Edge Loss
+#   V3: Full GlowGS (all innovations ON)
 #
-# Results are summarized in logs/ablation/ablation_results.tsv
+# Output:
+#   - Models: output/ablation/<scene>/<variant>/
+#   - Logs: logs/ablation/<scene>/<variant>.log
+#   - Summary: logs/ablation/ablation_results.tsv
 # ==============================================================================
 
 set -e  # Exit on error
@@ -79,7 +84,10 @@ run_experiment() {
         --use_feature_densify="$use_densify" \
         > "$log_file" 2>&1
     
-    echo "[INFO] Training completed, running evaluation..."
+    echo "[INFO] Training completed, running render and evaluation..."
+    
+    # Run render.py to generate test images
+    python render.py -m "$output_dir" >> "$log_file" 2>&1
     
     # Run metrics.py to get final evaluation
     python metrics.py -m "$output_dir" >> "$log_file" 2>&1
