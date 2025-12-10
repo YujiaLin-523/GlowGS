@@ -19,6 +19,9 @@ class GroupParams:
 class ParamGroup:
     def __init__(self, parser: ArgumentParser, name : str, fill_none = False):
         group = parser.add_argument_group(name)
+        # Ablation switches that need explicit True/False values
+        ablation_switches = {'use_hybrid_encoder', 'use_edge_loss', 'use_feature_densify'}
+        
         for key, value in vars(self).items():
             shorthand = False
             if key.startswith("_"):
@@ -28,12 +31,24 @@ class ParamGroup:
             value = value if not fill_none else None 
             if shorthand:
                 if t == bool:
-                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
+                    if key in ablation_switches:
+                        # Ablation switches: require explicit True/False value
+                        group.add_argument("--" + key, ("-" + key[0:1]), default=value, 
+                                         type=lambda x: (str(x).lower() == 'true'))
+                    else:
+                        # Regular bool flags: presence = True
+                        group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
                 else:
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, type=t)
             else:
                 if t == bool:
-                    group.add_argument("--" + key, default=value, action="store_true")
+                    if key in ablation_switches:
+                        # Ablation switches: require explicit True/False value
+                        group.add_argument("--" + key, default=value, 
+                                         type=lambda x: (str(x).lower() == 'true'))
+                    else:
+                        # Regular bool flags: presence = True
+                        group.add_argument("--" + key, default=value, action="store_true")
                 else:
                     group.add_argument("--" + key, default=value, type=t)
 
@@ -179,18 +194,22 @@ class OptimizationParams(ParamGroup):
         # ========================================================================
         # Ablation Study Configuration
         # ========================================================================
+        # GlowGS has three main innovations that can be toggled independently:
+        #
+        # 1. use_hybrid_encoder: Hybrid hash+VM encoder with geometry/appearance split
+        # 2. use_edge_loss: Unified edge-aware gradient loss (Sobel-weighted)
+        # 3. use_feature_densify: Feature-weighted densification (capacity allocation)
+        #
+        # When all three are False, the system approximates 3DGS baseline behavior:
+        # - SH-based color representation (no hybrid encoder)
+        # - RGB-only loss (no edge supervision)
+        # - Original 3DGS densification (coordinate gradient based)
+        #
+        # Default: all True (preserves existing GlowGS full behavior)
         
-        # Encoder ablation: switch between different encoder architectures
-        # Options: "hybrid" (hash+VM, paper default) | "hash_only" | "vm_only" | "no_role_split"
-        self.encoder_variant = "hybrid"
-        
-        # Edge loss ablation: different edge supervision strategies
-        # Options: "none" | "sobel_basic" | "sobel_weighted" (paper default)
-        self.edge_loss_mode = "sobel_weighted"
-        
-        # Densification strategy ablation: compare different importance scoring
-        # Options: "original" (3DGS baseline) | "feature_weighted" (paper default) | "residual_only" | "edge_only"
-        self.densify_strategy = "feature_weighted"
+        self.use_hybrid_encoder = True     # Enable hybrid hash+VM encoder with role split
+        self.use_edge_loss = True          # Enable unified edge-aware gradient loss
+        self.use_feature_densify = True    # Enable feature-weighted densification
         
         super().__init__(parser, "Optimization Parameters")
 

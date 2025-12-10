@@ -83,9 +83,9 @@ def save_ablation_config(output_dir, dataset, opt, pipe):
     """Save ablation study configuration to YAML file for experiment tracking."""
     config = {
         'ablation_settings': {
-            'encoder_variant': getattr(opt, 'encoder_variant', 'hybrid'),
-            'edge_loss_mode': getattr(opt, 'edge_loss_mode', 'sobel_weighted'),
-            'densify_strategy': getattr(opt, 'densify_strategy', 'feature_weighted'),
+            'use_hybrid_encoder': getattr(opt, 'use_hybrid_encoder', True),
+            'use_edge_loss': getattr(opt, 'use_edge_loss', True),
+            'use_feature_densify': getattr(opt, 'use_feature_densify', True),
         },
         'training_hyperparameters': {
             'iterations': opt.iterations,
@@ -125,14 +125,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     
+    # ========================================================================
+    # Map three binary ablation switches to internal implementation modes
+    # ========================================================================
+    use_hybrid_encoder = getattr(opt, 'use_hybrid_encoder', True)
+    use_edge_loss = getattr(opt, 'use_edge_loss', True)
+    use_feature_densify = getattr(opt, 'use_feature_densify', True)
+    
+    # Map encoder switch: hybrid (on) or 3dgs (off)
+    encoder_variant = 'hybrid' if use_hybrid_encoder else '3dgs'
+    
+    # Map edge loss switch: sobel_weighted (on) or none (off)
+    edge_loss_mode = 'sobel_weighted' if use_edge_loss else 'none'
+    
+    # Map densification switch: feature_weighted (on) or original_3dgs (off)
+    densify_strategy = 'feature_weighted' if use_feature_densify else 'original_3dgs'
+    
     # Save ablation study configuration for experiment tracking
     save_ablation_config(dataset.model_path, dataset, opt, pipe)
     
     gaussians = GaussianModel(
         dataset.sh_degree, dataset.hash_size, dataset.width, dataset.depth, 
         dataset.feature_role_split, dataset.geo_resolution, dataset.geo_rank, dataset.geo_channels,
-        encoder_variant=getattr(opt, 'encoder_variant', 'hybrid'),
-        densify_strategy=getattr(opt, 'densify_strategy', 'feature_weighted')
+        encoder_variant=encoder_variant,
+        densify_strategy=densify_strategy
     )
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
@@ -156,16 +172,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     print("\n" + "=" * 90)
     print("  ABLATION STUDY CONFIGURATION")
     print("-" * 90)
-    encoder_variant = getattr(opt, 'encoder_variant', 'hybrid')
-    edge_loss_mode = getattr(opt, 'edge_loss_mode', 'sobel_weighted')
-    densify_strategy = getattr(opt, 'densify_strategy', 'feature_weighted')
-    lambda_grad = getattr(opt, 'lambda_grad', 0.05)
-    max_gaussians = getattr(opt, 'max_gaussians', 6_000_000)
+    print(f"  [GlowGS] use_hybrid_encoder    : {use_hybrid_encoder}")
+    print(f"  [GlowGS] use_edge_loss         : {use_edge_loss}")
+    print(f"  [GlowGS] use_feature_densify   : {use_feature_densify}")
+    print("-" * 90)
     
-    print(f"  Encoder Variant      │  {encoder_variant}")
-    print(f"  Edge Loss Mode       │  {edge_loss_mode} (λ={lambda_grad:.3f})")
-    print(f"  Densification Mode   │  {densify_strategy}")
-    print(f"  Max Gaussians        │  {max_gaussians:,}")
+    # Derive variant label
+    if not use_hybrid_encoder and not use_edge_loss and not use_feature_densify:
+        variant_label = "V0: 3DGS Baseline"
+    elif use_hybrid_encoder and not use_edge_loss and not use_feature_densify:
+        variant_label = "V1: +Hybrid Encoder"
+    elif use_hybrid_encoder and use_edge_loss and not use_feature_densify:
+        variant_label = "V2: +Edge Loss"
+    elif use_hybrid_encoder and use_edge_loss and use_feature_densify:
+        variant_label = "V3: Full GlowGS"
+    else:
+        variant_label = "Custom"
+    
+    print(f"  Variant              │  {variant_label}")
+    print(f"  Max Gaussians        │  {getattr(opt, 'max_gaussians', 6_000_000):,}")
     print(f"  Iterations           │  {opt.iterations:,}")
     print("=" * 90 + "\n")
 
