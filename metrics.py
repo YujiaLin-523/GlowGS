@@ -25,7 +25,7 @@ def readImages(renders_dir, gt_dir):
     renders = []
     gts = []
     image_names = []
-    for fname in os.listdir(renders_dir):
+    for fname in tqdm(os.listdir(renders_dir), desc="Loading images"):
         render = Image.open(renders_dir / fname)
         gt = Image.open(gt_dir / fname)
         renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].cuda())
@@ -100,4 +100,6 @@ if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
     parser.add_argument('--model_paths', '-m', required=True, nargs="+", type=str, default=[])
     args = parser.parse_args()
+    import sys
+    sys.stderr.write(f"Computing metrics for: {args.model_paths}...\n")
     evaluate(args.model_paths)

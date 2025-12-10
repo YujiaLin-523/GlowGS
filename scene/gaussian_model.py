@@ -1511,6 +1511,37 @@ class GaussianModel:
 
         # mlps: prefer combined mlps.npz (quantized) else fallback to older float16 files
         mlps_path = os.path.join(path, 'mlps.npz')
+        def _coerce_and_assign(head, np_array, name):
+            """Coerce loaded numpy params to the target size expected by the head and assign safely."""
+            flat = np.asarray(np_array).ravel()
+            try:
+                expected = head.state_dict()['params'].numel()
+            except Exception:
+                # Fallback: try length of params attribute if present
+                try:
+                    expected = int(head.params.numel())
+                except Exception:
+                    expected = flat.size
+
+            if flat.size != expected:
+                print(f"[WARN] Loaded '{name}' params size ({flat.size}) != expected ({expected}), coercing")
+                if flat.size > expected:
+                    flat = flat[:expected]
+                else:
+                    # pad with zeros
+                    pad = np.zeros(expected - flat.size, dtype=flat.dtype)
+                    flat = np.concatenate([flat, pad])
+
+            tensor = torch.from_numpy(flat).half().cuda()
+            # Assign to head in a way compatible with tinycudann
+            try:
+                head.params = nn.Parameter(tensor)
+            except Exception:
+                # Last resort: try to set via state_dict
+                sd = head.state_dict()
+                sd['params'] = tensor
+                head.load_state_dict(sd)
+
         if os.path.exists(mlps_path):
             mlp_npz = np.load(mlps_path)
             o = dequantize(mlp_npz['opacity_data'], mlp_npz['opacity_scale'], mlp_npz['opacity_min'], log=True)
@@ -1518,10 +1549,10 @@ class GaussianModel:
             sc = dequantize(mlp_npz['scale_data'], mlp_npz['scale_scale'], mlp_npz['scale_min'], log=True)
             rt = dequantize(mlp_npz['rotation_data'], mlp_npz['rotation_scale'], mlp_npz['rotation_min'], log=True)
 
-            self._opacity_head.params = nn.Parameter(torch.from_numpy(np.asarray(o)).half().cuda())
-            self._features_rest_head.params = nn.Parameter(torch.from_numpy(np.asarray(fr)).half().cuda())
-            self._scaling_head.params = nn.Parameter(torch.from_numpy(np.asarray(sc)).half().cuda())
-            self._rotation_head.params = nn.Parameter(torch.from_numpy(np.asarray(rt)).half().cuda())
+            _coerce_and_assign(self._opacity_head, o, 'opacity')
+            _coerce_and_assign(self._features_rest_head, fr, 'features_rest')
+            _coerce_and_assign(self._scaling_head, sc, 'scaling')
+            _coerce_and_assign(self._rotation_head, rt, 'rotation')
         else:
             # backward compatible loading
             opacity_params = np.load(os.path.join(path, 'opacity.npz'))['data']
@@ -1529,10 +1560,10 @@ class GaussianModel:
             scale_params = np.load(os.path.join(path, 'scale.npz'))['data']
             rotation_params = np.load(os.path.join(path, 'rotation.npz'))['data']
 
-            self._opacity_head.params = nn.Parameter(torch.from_numpy(np.asarray(opacity_params)).half().cuda())
-            self._features_rest_head.params = nn.Parameter(torch.from_numpy(np.asarray(f_rest_params)).half().cuda())
-            self._scaling_head.params = nn.Parameter(torch.from_numpy(np.asarray(scale_params)).half().cuda())
-            self._rotation_head.params = nn.Parameter(torch.from_numpy(np.asarray(rotation_params)).half().cuda())
+            _coerce_and_assign(self._opacity_head, opacity_params, 'opacity')
+            _coerce_and_assign(self._features_rest_head, f_rest_params, 'features_rest')
+            _coerce_and_assign(self._scaling_head, scale_params, 'scaling')
+            _coerce_and_assign(self._rotation_head, rotation_params, 'rotation')
 
         self.active_sh_degree = self.max_sh_degree
 

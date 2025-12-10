@@ -79,6 +79,12 @@ class ModelParams(ParamGroup):
         self.geo_rank = 6            # Low-rank factorization rank (reduced from 8)
         self.geo_channels = 8        # Output feature channels
         self.feature_role_split = True  # Enable geometry/appearance feature disentanglement
+        
+        # Ablation switches - moved to ModelParams because they affect model structure
+        self.use_hybrid_encoder = True     # Enable hybrid hash+VM encoder with role split
+        self.use_edge_loss = True          # Enable unified edge-aware gradient loss
+        self.use_feature_densify = True    # Enable feature-weighted densification
+        
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -192,25 +198,6 @@ class OptimizationParams(ParamGroup):
         self.max_gaussians = 6_000_000           # N_max: maximum number of Gaussians (6M for 48GB GPU)
         
         # ========================================================================
-        # Ablation Study Configuration
-        # ========================================================================
-        # GlowGS has three main innovations that can be toggled independently:
-        #
-        # 1. use_hybrid_encoder: Hybrid hash+VM encoder with geometry/appearance split
-        # 2. use_edge_loss: Unified edge-aware gradient loss (Sobel-weighted)
-        # 3. use_feature_densify: Feature-weighted densification (capacity allocation)
-        #
-        # When all three are False, the system approximates 3DGS baseline behavior:
-        # - SH-based color representation (no hybrid encoder)
-        # - RGB-only loss (no edge supervision)
-        # - Original 3DGS densification (coordinate gradient based)
-        #
-        # Default: all True (preserves existing GlowGS full behavior)
-        
-        self.use_hybrid_encoder = True     # Enable hybrid hash+VM encoder with role split
-        self.use_edge_loss = True          # Enable unified edge-aware gradient loss
-        self.use_feature_densify = True    # Enable feature-weighted densification
-        
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

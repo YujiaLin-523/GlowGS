@@ -83,9 +83,9 @@ def save_ablation_config(output_dir, dataset, opt, pipe):
     """Save ablation study configuration to YAML file for experiment tracking."""
     config = {
         'ablation_settings': {
-            'use_hybrid_encoder': getattr(opt, 'use_hybrid_encoder', True),
-            'use_edge_loss': getattr(opt, 'use_edge_loss', True),
-            'use_feature_densify': getattr(opt, 'use_feature_densify', True),
+            'use_hybrid_encoder': getattr(dataset, 'use_hybrid_encoder', True),
+            'use_edge_loss': getattr(dataset, 'use_edge_loss', True),
+            'use_feature_densify': getattr(dataset, 'use_feature_densify', True),
         },
         'training_hyperparameters': {
             'iterations': opt.iterations,
@@ -128,9 +128,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # ========================================================================
     # Map three binary ablation switches to internal implementation modes
     # ========================================================================
-    use_hybrid_encoder = getattr(opt, 'use_hybrid_encoder', True)
-    use_edge_loss = getattr(opt, 'use_edge_loss', True)
-    use_feature_densify = getattr(opt, 'use_feature_densify', True)
+    use_hybrid_encoder = getattr(dataset, 'use_hybrid_encoder', True)
+    use_edge_loss = getattr(dataset, 'use_edge_loss', True)
+    use_feature_densify = getattr(dataset, 'use_feature_densify', True)
     
     # Map encoder switch: hybrid (on) or 3dgs (off)
     encoder_variant = 'hybrid' if use_hybrid_encoder else '3dgs'
@@ -558,6 +558,7 @@ if __name__ == "__main__":
     args.save_iterations.append(args.iterations)
     
     print("Optimizing " + args.model_path)
+    sys.stderr.write(f"Loading scene for training: {args.model_path}...\n")
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
