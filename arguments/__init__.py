@@ -97,6 +97,8 @@ class PipelineParams(ParamGroup):
         self.convert_SHs_python = False
         self.compute_cov3D_python = False
         self.debug = False
+        self.debug_equiv = False  # Equivalence debug mode: detailed config/optimizer/iteration logs
+        self.debug_full_gap = False  # Full ablation gap debug mode (read-only logs)
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):

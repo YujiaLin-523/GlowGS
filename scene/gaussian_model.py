@@ -455,6 +455,7 @@ class GaussianModel:
                 # Geometry heads: scale, rotation, opacity
                 # Project geometry_latent (C_shared + C_role) to head input dim (C_shared)
                 geometry_proj = self._geometry_input_proj(geometry_chunk)  # [N, C_shared]
+                geometry_proj = torch.clamp(geometry_proj, -10.0, 10.0)
                 
                 # Append outputs; avoid in-place writes to keep autograd versions clean
                 scaling_chunks.append(self._scaling_head(geometry_proj))
@@ -464,6 +465,7 @@ class GaussianModel:
                 # Appearance / SH head
                 if self.max_sh_degree > 0:
                     appearance_proj = self._appearance_input_proj(appearance_chunk)  # [N, C_shared]
+                    appearance_proj = torch.clamp(appearance_proj, -10.0, 10.0)
                     features_rest_chunks.append(
                         self._features_rest_head(appearance_proj).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3)
                     )

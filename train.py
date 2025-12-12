@@ -25,6 +25,31 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 
+
+def _is_true_env(var_name: str) -> bool:
+    return str(os.getenv(var_name, "")).lower() in {"1", "true", "yes", "on"}
+
+
+def _summarize_param_groups(optimizer) -> list:
+    rows = []
+    defaults = getattr(optimizer, "defaults", {})
+    for idx, pg in enumerate(optimizer.param_groups):
+        name = pg.get("name", f"group_{idx}")
+        lr = pg.get("lr", defaults.get("lr", 0.0))
+        betas = pg.get("betas", defaults.get("betas", (0.9, 0.999)))
+        eps = pg.get("eps", defaults.get("eps", 1e-8))
+        wd = pg.get("weight_decay", defaults.get("weight_decay", 0.0))
+        num_params = sum(p.numel() for p in pg.get("params", []))
+        rows.append({
+            "name": name,
+            "num_params": num_params,
+            "lr": lr,
+            "betas": betas,
+            "eps": eps,
+            "weight_decay": wd,
+        })
+    return rows
+
 # Enable TF32 tensor cores for faster matmul on Ampere+ GPUs
 try:
     torch.set_float32_matmul_precision('high')
@@ -124,6 +149,8 @@ def save_ablation_config(output_dir, dataset, opt, pipe):
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
+    # Debug flag for full ablation gap diagnostics (read-only logging)
+    debug_full_gap = pipe.debug_full_gap or os.getenv("DEBUG_FULL_GAP", "0") in {"1", "true", "True"}
     
     # ========================================================================
     # Map three binary ablation switches to internal implementation modes
@@ -140,6 +167,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     
     # Map densification switch: feature_weighted (on) or original_3dgs (off)
     densify_strategy = 'feature_weighted' if use_feature_densify else 'original_3dgs'
+    
+    # ========================================================================
+    # EQUIVALENCE FIX: Force edge_loss_mode into opt for consistent access
+    # Ensures edge loss is truly disabled in V0 config (all innovations off)
+    # ========================================================================
+    opt.edge_loss_mode = edge_loss_mode
+    
+    # EQUIVALENCE FIX: V0 baseline should disable all GlowGS-specific losses
+    if not use_hybrid_encoder and not use_edge_loss and not use_feature_densify:
+        # V0: 3DGS baseline - zero out all new loss terms
+        opt.lambda_mask = 0.0
+        opt.lambda_sh_mask = 0.0
+        opt.lambda_grad = 0.0
+        opt.enable_detail_aware = False
+        if pipe.debug_equiv:
+            print("[Equivalence] V0 detected: disabled lambda_mask/sh_mask/grad, detail_aware")
     
     # Save ablation study configuration for experiment tracking
     save_ablation_config(dataset.model_path, dataset, opt, pipe)
@@ -158,12 +201,100 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-    
+
     # Initialize AMP (Automatic Mixed Precision) if enabled
     use_amp = getattr(opt, 'use_amp', False)
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     if use_amp:
         print("[AMP] Automatic Mixed Precision enabled - faster training with lower memory usage")
+
+    # Debug counters for densify/prune (read-only)
+    densify_events = 0
+    prune_events = 0
+
+    # --------------------------------------------------------------------
+    # Debug Full Gap: one-shot configuration snapshots (read-only)
+    # --------------------------------------------------------------------
+    if debug_full_gap:
+        train_cams = scene.getTrainCameras()
+        test_cams = scene.getTestCameras()
+        sample_cam = train_cams[0] if len(train_cams) > 0 else None
+        res_info = f"{sample_cam.image_width}x{sample_cam.image_height}" if sample_cam else "N/A"
+        eval_res_strategy = "original" if getattr(dataset, "resolution", -1) == -1 else f"scaled /r={dataset.resolution}"
+        eval_split = "LLFF hold every 8" if getattr(dataset, "eval", False) else "train-only"
+        color_space = "linear RGB (no gamma)"  # metrics use tensors directly
+        clamp_mode = "render outputs clamped to [0,1] in eval"  # see training_report
+        bg_mode = "white" if dataset.white_background else ("random" if opt.random_background else "black")
+        # Training schedule snapshot
+        densify_start = getattr(opt, 'densify_from_iter', 500)
+        densify_end = getattr(opt, 'densify_until_iter', 15000)
+        densify_interval = getattr(opt, 'densification_interval', 100)
+        opacity_reset_iter = getattr(opt, 'opacity_reset_interval', 3000)
+        sh_sched = f"+1 degree every 1000 iters up to {dataset.sh_degree}"
+        # Loss weights (effective)
+        loss_weights = {
+            "lambda_dssim": opt.lambda_dssim,
+            "lambda_mask": getattr(opt, 'lambda_mask', 0.0),
+            "lambda_sh_mask": getattr(opt, 'lambda_sh_mask', 0.0),
+            "lambda_grad": getattr(opt, 'lambda_grad', 0.0),
+        }
+        # Point budget
+        cap_cfg = gaussians.gaussian_capacity_config
+        point_budget = {
+            "max_gaussians": cap_cfg.get("max_point_count", getattr(opt, 'max_gaussians', 0)),
+            "densify_until": cap_cfg.get("densify_until_iter", densify_end),
+            "prune_interval": cap_cfg.get("prune_interval", getattr(opt, 'prune_interval', 1000)),
+            "min_opacity": getattr(opt, 'min_opacity', 0.005),
+            "mask_prune_threshold": getattr(opt, 'mask_prune_threshold', 0.01),
+            "densify_grad_threshold": getattr(opt, 'densify_grad_threshold', 0.0002),
+            "init_gaussians": gaussians.get_xyz.shape[0],
+        }
+        # Optimizer groups snapshot
+        def _summarize_optimizer(opt_obj, title):
+            rows = []
+            for i, pg in enumerate(opt_obj.param_groups):
+                name = pg.get('name', f'group_{i}')
+                lr = pg.get('lr', 0.0)
+                betas = pg.get('betas', (0.9, 0.999))
+                eps = pg.get('eps', 1e-8)
+                wd = pg.get('weight_decay', 0.0)
+                n_params = sum(p.numel() for p in pg['params'])
+                rows.append((name, n_params, lr, betas, eps, wd))
+            print(f"[DEBUG_FULL_GAP] Optimizer Snapshot - {title}")
+            print("name | #params | lr | betas | eps | weight_decay")
+            for r in rows:
+                print(f"  {r[0]:12s} | {r[1]:8d} | {r[2]:.6g} | ({r[3][0]:.2f},{r[3][1]:.2f}) | {r[4]:.1e} | {r[5]:.2g}")
+
+        print("\n[DEBUG_FULL_GAP] Eval Snapshot")
+        print(f"  color_space       : {color_space}")
+        print(f"  clamp_mode        : {clamp_mode}")
+        print(f"  background        : {bg_mode}")
+        print(f"  eval_resolution   : {eval_res_strategy} (sample {res_info})")
+        print(f"  test_views        : {len(test_cams)} from {eval_split}")
+
+        print("[DEBUG_FULL_GAP] Train Snapshot")
+        print(f"  total_iters       : {opt.iterations}")
+        print(f"  test_every        : {testing_iterations}")
+        print(f"  densify start/end : {densify_start}/{densify_end} (interval {densify_interval})")
+        print(f"  opacity_reset     : {opacity_reset_iter}")
+        print(f"  sh_schedule       : {sh_sched}")
+        for k,v in loss_weights.items():
+            print(f"  {k:15s}: {v}")
+
+        print("[DEBUG_FULL_GAP] Point Budget Snapshot")
+        for k,v in point_budget.items():
+            print(f"  {k:20s}: {v}")
+
+        print("[DEBUG_FULL_GAP] Optimizer Param Groups (explicit)")
+        _summarize_optimizer(gaussians.optimizer, "explicit")
+        print("[DEBUG_FULL_GAP] Optimizer Param Groups (encoder/MLP)")
+        _summarize_optimizer(gaussians.optimizer_i, "implicit")
+
+        print("[DEBUG_FULL_GAP] RNG / Sampling Snapshot")
+        print(f"  torch.initial_seed : {torch.initial_seed()}")
+        print(f"  cudnn.deterministic: {torch.backends.cudnn.deterministic}")
+        print(f"  cudnn.benchmark    : {torch.backends.cudnn.benchmark}")
+        print(f"  AMP enabled        : {use_amp}")
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -193,10 +324,147 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     print(f"  Max Gaussians        │  {getattr(opt, 'max_gaussians', 6_000_000):,}")
     print(f"  Iterations           │  {opt.iterations:,}")
     print("=" * 90 + "\n")
+    
+    # ========================================================================
+    # EQUIVALENCE DEBUG MODE: detailed configuration snapshot for repro
+    # ========================================================================
+    if pipe.debug_equiv:
+        print("\n" + "#" * 90)
+        print("  🔍 EQUIVALENCE DEBUG MODE ENABLED")
+        print("#" * 90)
+        
+        # Dataset config
+        train_cams = scene.getTrainCameras()
+        test_cams = scene.getTestCameras()
+        if len(train_cams) > 0:
+            sample_cam = train_cams[0]
+            resolution_info = f"{sample_cam.image_width}x{sample_cam.image_height}"
+        else:
+            resolution_info = "N/A"
+        
+        print("\n[Dataset]")
+        print(f"  Train views      : {len(train_cams)}")
+        print(f"  Test views       : {len(test_cams)}")
+        print(f"  Resolution       : {resolution_info}")
+        print(f"  White background : {dataset.white_background}")
+        print(f"  Random bg        : {opt.random_background}")
+        print(f"  SH degree        : {dataset.sh_degree}")
+        
+        # Schedule config
+        print("\n[Training Schedule]")
+        print(f"  Total iters         : {opt.iterations}")
+        print(f"  Densify start       : {getattr(opt, 'densify_from_iter', 500)}")
+        print(f"  Densify until       : {getattr(opt, 'densify_until_iter', 15000)}")
+        print(f"  Densify interval    : {getattr(opt, 'densification_interval', 100)}")
+        print(f"  Densify threshold   : {opt.densify_grad_threshold}")
+        print(f"  Opacity reset       : {getattr(opt, 'opacity_reset_interval', 3000)}")
+        print(f"  SH degree schedule  : every 1000 iters (max={dataset.sh_degree})")
+        
+        # Randomness
+        print("\n[Randomness]")
+        print(f"  Torch seed       : {torch.initial_seed()}")
+        print(f"  CUDA deterministic : {torch.backends.cudnn.deterministic}")
+        
+        # Optimizer param groups
+        print("\n[Optimizer: Explicit Params]")
+        for i, pg in enumerate(gaussians.optimizer.param_groups):
+            pg_name = pg.get('name', f'group_{i}')
+            pg_lr = pg['lr']
+            pg_params = sum(p.numel() for p in pg['params'])
+            print(f"  {pg_name:15s} │ lr={pg_lr:.6f} │ params={pg_params:>8,d}")
+        
+        print("\n[Optimizer: Implicit Params (MLP/Grid)]")
+        for i, pg in enumerate(gaussians.optimizer_i.param_groups):
+            pg_name = pg.get('name', f'group_{i}')
+            pg_lr = pg['lr']
+            pg_params = sum(p.numel() for p in pg['params'])
+            print(f"  {pg_name:15s} │ lr={pg_lr:.6f} │ params={pg_params:>8,d}")
+        
+        # Loss config
+        print("\n[Loss Weights]")
+        print(f"  lambda_dssim     : {opt.lambda_dssim}")
+        print(f"  lambda_mask      : {getattr(opt, 'lambda_mask', 0.004)}")
+        print(f"  lambda_sh_mask   : {getattr(opt, 'lambda_sh_mask', 0.0001)}")
+        print(f"  lambda_grad      : {getattr(opt, 'lambda_grad', 0.05)} (edge loss, starts iter {getattr(opt, 'edge_loss_start_iter', 5000)})")
+        
+        # AMP
+        print("\n[Training Tech]")
+        print(f"  AMP (mixed precision) : {use_amp}")
+        print(f"  Detail-aware densify  : {getattr(opt, 'enable_detail_aware', True)}")
+        
+        print("\n" + "#" * 90 + "\n")
+
+    # ====================================================================
+    # DEBUG_FULL_GAP: one-shot snapshots (read-only, no behavior changes)
+    # ====================================================================
+    if debug_full_gap:
+        train_cams = scene.getTrainCameras()
+        test_cams = scene.getTestCameras()
+        eval_color_space = "linear tensor [0,1] (no sRGB gamma)"
+        clamp_eval = "clamp to [0,1] in eval (render/report)"
+        bg_mode = "white" if dataset.white_background else ("random-bg" if opt.random_background else "black")
+        eval_res_flag = getattr(dataset, "resolution", getattr(dataset, "_resolution", -1))
+        test_source = "llffhold=8 split" if dataset.eval else "train-only (no held-out)"
+        test_source = f"{test_source}, test_views={len(test_cams)}"
+
+        print("[DEBUG_FULL_GAP] Eval Snapshot")
+        print("setting | value")
+        print(f"color_space | {eval_color_space}")
+        print(f"render_clamp | {clamp_eval}")
+        print(f"background | {bg_mode}")
+        print(f"eval_resolution_flag | {eval_res_flag}")
+        print(f"test_views_source | {test_source}")
+
+        print("[DEBUG_FULL_GAP] Train Snapshot")
+        print("setting | value")
+        print(f"total_iters | {opt.iterations}")
+        print(f"test_iterations | {testing_iterations}")
+        print(f"densify_start/end/interval | {opt.densify_from_iter}/{opt.densify_until_iter}/{opt.densification_interval}")
+        print(f"opacity_reset_interval | {opt.opacity_reset_interval}")
+        print(f"sh_degree_schedule | +1 per 1000 iters up to {dataset.sh_degree}")
+        print(f"loss_weights | dssim={opt.lambda_dssim} mask={getattr(opt,'lambda_mask',0.0)} sh_mask={getattr(opt,'lambda_sh_mask',0.0)} grad={getattr(opt,'lambda_grad',0.0)} flat_w={getattr(opt,'edge_flat_weight',0.0)}")
+
+        print("[DEBUG_FULL_GAP] Point Budget Snapshot")
+        print("setting | value")
+        print(f"max_gaussians | {getattr(opt, 'max_gaussians', gaussians.gaussian_capacity_config['max_point_count'])}")
+        print(f"initial_gaussians | {gaussians.get_xyz.shape[0]:,}")
+        print(f"densify_threshold | {opt.densify_grad_threshold}")
+        print(f"min_opacity | {getattr(opt,'min_opacity',0.005)}")
+        print(f"mask_prune_threshold | {getattr(opt,'mask_prune_threshold',0.01)}")
+
+        print("[DEBUG_FULL_GAP] Optimizer Snapshot (explicit)")
+        print("name | num_params | lr | betas | eps | weight_decay")
+        for row in _summarize_param_groups(gaussians.optimizer):
+            print(f"{row['name']} | {row['num_params']:,} | {row['lr']:.6f} | {row['betas']} | {row['eps']:.1e} | {row['weight_decay']}")
+        print("[DEBUG_FULL_GAP] Optimizer Snapshot (implicit encoder/MLP)")
+        print("name | num_params | lr | betas | eps | weight_decay")
+        for row in _summarize_param_groups(gaussians.optimizer_i):
+            print(f"{row['name']} | {row['num_params']:,} | {row['lr']:.6f} | {row['betas']} | {row['eps']:.1e} | {row['weight_decay']}")
+
+        print("[DEBUG_FULL_GAP] RNG/Sampling Snapshot")
+        print("setting | value")
+        print(f"torch_seed | {torch.initial_seed()}")
+        print(f"numpy_seed | 0 (safe_state)")
+        print(f"python_seed | 0 (safe_state)")
+        print(f"cudnn_deterministic | {torch.backends.cudnn.deterministic}")
+        print(f"cudnn_benchmark | {torch.backends.cudnn.benchmark}")
+        print(f"amp_gradscaler | {use_amp}")
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+
+    # Counters for debug summaries
+    densify_events = 0
+    prune_events = 0
+    
+    # Equivalence debug: track first N iters for reproducibility check
+    debug_n_iters = 5 if pipe.debug_equiv else 0
+    if pipe.debug_equiv and first_iter == 1:
+        print("\n[Debug] Tracking first 5 iterations in detail...\n")
+        print(f"{'Iter':>5} | {'CamID':>6} | {'N_Gauss':>8} | {'Loss':>10} | {'RGB Mean':>10} | {'RGB Std':>10}")
+        print("-" * 75)
+    
     profiler = None
     profiler_logdir = None
     profile_iter_count = 0
@@ -263,6 +531,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         with torch.cuda.amp.autocast(enabled=use_amp):
             render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
             image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+            
+            # Debug equiv: log first N iters in detail
+            if iteration <= debug_n_iters:
+                cam_id = viewpoint_cam.uid
+                n_gauss = gaussians.get_xyz.shape[0]
+                rgb_mean = image.mean().item()
+                rgb_std = image.std().item()
 
             # Loss
             gt_image = viewpoint_cam.original_image.cuda()
@@ -324,6 +599,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # (周期性日志已精简，详细逐项 grad 计算移除以减少频繁的图计算)
         
+        # Debug equiv: print first N iters
+        if iteration <= debug_n_iters:
+            print(f"{iteration:>5} | {cam_id:>6} | {n_gauss:>8,} | {loss.item():>10.6f} | {rgb_mean:>10.6f} | {rgb_std:>10.6f}")
+        
         # (已移除重复的逐项 debug 打印，保留更简洁的周期性报告)
 
         # Backward pass with gradient scaling
@@ -356,9 +635,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     opacity_p5 = torch.quantile(opacity_vals, 0.05).item()
                     opacity_p50 = torch.quantile(opacity_vals, 0.50).item()
                     opacity_p95 = torch.quantile(opacity_vals, 0.95).item()
+                    opacity_mean = opacity_vals.mean().item()
                 else:
-                    opacity_p5 = opacity_p50 = opacity_p95 = 0.0
+                    opacity_p5 = opacity_p50 = opacity_p95 = opacity_mean = 0.0
                 current_sh_degree = gaussians.active_sh_degree
+                if debug_full_gap:
+                    scaling_vals = gaussians.get_scaling.detach()
+                    if scaling_vals.numel() > 0:
+                        scale_max = scaling_vals.max(dim=1).values
+                        scale_p90 = torch.quantile(scale_max, 0.90).item()
+                    else:
+                        scale_p90 = 0.0
+                    train_psnr_val = psnr(torch.clamp(image, 0.0, 1.0), torch.clamp(gt_image, 0.0, 1.0)).mean().item()
+                    print(f"[DFG] iter={iteration:05d} psnr={train_psnr_val:.3f} N={gaussian_count:,} sh={current_sh_degree} densify={densify_events} prune={prune_events} mean_opac={opacity_mean:.4f} scale_p90={scale_p90:.4f}")
                 
                 # Capacity info
                 max_cap = gaussians.gaussian_capacity_config["max_point_count"]
@@ -442,6 +731,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 )
                 
                 n_after = gaussians.get_xyz.shape[0]
+                if debug_full_gap:
+                    densify_events += int(n_after > n_before)
+                    prune_events += int(n_after < n_before)
                 torch.cuda.empty_cache()
             
             if (iteration in saving_iterations):

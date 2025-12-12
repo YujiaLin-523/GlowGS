@@ -43,7 +43,7 @@ TANDT_SCENES=(train truck)
 DB_SCENES=(drjohnson playroom)
 
 # Training iterations (can be adjusted for faster testing)
-ITERATIONS=1000
+ITERATIONS=30000
 
 # Initialize results file with header if it doesn't exist
 if [ ! -f "$RESULTS_FILE" ]; then
