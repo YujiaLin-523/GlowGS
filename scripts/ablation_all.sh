@@ -66,6 +66,9 @@ run_experiment() {
     local output_dir="output/${dataset}_${scene}_${variant}"
     local log_file="$LOG_DIR/${dataset}_${scene}_${variant}.log"
     
+    # Use pre-generated nerfacto point cloud for better initialization (critical for V3 performance)
+    local pcd_path="output/${scene}/nerfacto/run/point_cloud.ply"
+    
     echo ""
     echo "========================================================================"
     echo "  Running: ${dataset}/${scene} - ${variant}"
@@ -79,6 +82,7 @@ run_experiment() {
         -m "$output_dir" \
         --iterations "$ITERATIONS" \
         --eval \
+        --pcd_path "$pcd_path" \
         --use_hybrid_encoder="$use_hybrid" \
         --use_edge_loss="$use_edge" \
         --use_feature_densify="$use_densify" \
