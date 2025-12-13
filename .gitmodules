@@ -13,6 +13,7 @@
 [submodule "submodules/mpeg-pcc-tmc13"]
 	path = submodules/mpeg-pcc-tmc13
 	url = https://github.com/MPEGGroup/mpeg-pcc-tmc13.git
+	ignore = dirty
 [submodule "submodules/nerfstudio"]
 	path = submodules/nerfstudio
 	url = https://github.com/nerfstudio-project/nerfstudio.git
