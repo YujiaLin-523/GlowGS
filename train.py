@@ -57,7 +57,7 @@ except Exception:
     pass
 
 
-def build_background_weight_map(H: int, W: int, alpha: float = 0.6, device: str = "cuda") -> torch.Tensor:
+def build_background_weight_map(H: int, W: int, alpha: float = 0.8, device: str = "cuda") -> torch.Tensor:
     """
     Build a radial weight map that emphasizes image periphery (edges/corners).
     Center weight ≈ 1.0, corner weight ≈ 1.0 + alpha.

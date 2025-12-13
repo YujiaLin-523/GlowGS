@@ -173,9 +173,9 @@ class OptimizationParams(ParamGroup):
         self.random_background = False
 
         # Edge-aware loss configuration (GlowGS innovation #2)
-        self.enable_edge_loss = True       # master switch for unified edge-aware gradient loss
+        self.enable_edge_loss = True        # master switch for unified edge-aware gradient loss
         self.edge_loss_start_iter = 5000    # delay edge loss until geometry stabilizes (warmup)
-        self.lambda_grad = 0.05             # edge loss weight (0.02~0.1 typical; 0.05 balanced)
+        self.lambda_grad = 0.1              # edge loss weight (0.02~0.1 typical; 0.05 balanced)
         self.edge_flat_weight = 0.5         # flat region penalty weight (alpha in paper; 0.5 = equal)
         # Profiling 相关参数（默认关闭）
         self.profile_iters = 0
