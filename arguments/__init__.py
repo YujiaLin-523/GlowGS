@@ -205,6 +205,10 @@ class OptimizationParams(ParamGroup):
 def get_combined_args(parser : ArgumentParser):
     cmdlne_string = sys.argv[1:]
     cfgfile_string = "Namespace()"
+    # Parse defaults separately so we can detect which CLI flags were
+    # explicitly provided (vs. defaults). This prevents render/eval from
+    # overwriting the training config in cfg_args with parser defaults.
+    default_args = parser.parse_args([])
     args_cmdline = parser.parse_args(cmdlne_string)
 
     try:
@@ -219,8 +223,18 @@ def get_combined_args(parser : ArgumentParser):
     args_cfgfile = eval(cfgfile_string)
 
     merged_dict = vars(args_cfgfile).copy()
-    for k,v in vars(args_cmdline).items():
-        if v != None:
+
+    for k, v in vars(args_cmdline).items():
+        # Only override values that were explicitly set on the command line.
+        # This keeps cfg_args (saved during training) authoritative for
+        # ablation switches and architecture hyperparameters.
+        if v != getattr(default_args, k):
+            merged_dict[k] = v
+    
+    # Ensure all command line arguments are present in merged dict
+    # (for backward compatibility with old cfg_args that may be missing new parameters)
+    for k, v in vars(default_args).items():
+        if k not in merged_dict:
             merged_dict[k] = v
     
     # Ensure GeoEncoder parameters have defaults for backward compatibility
@@ -237,3 +251,4 @@ def get_combined_args(parser : ArgumentParser):
             print(f"[INFO] Using default {key}={default_val}")
     
     return Namespace(**merged_dict)
+

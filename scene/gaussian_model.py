@@ -1052,17 +1052,16 @@ class GaussianModel:
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
         
-        # Use unified densification score computation for ablation studies
-        densify_scores = self.compute_densify_score(padded_grad, strategy=self._densify_strategy)
+        # Detail-aware threshold: high detail_importance → lower effective threshold
+        # effective_threshold_i = grad_threshold / (1 + k * detail_importance_i)
+        if self._densify_strategy == "feature_weighted" and self._detail_aware_enabled and self.detail_importance.shape[0] == n_init_points:
+            k = self._detail_densify_scale
+            effective_threshold = grad_threshold / (1.0 + k * self.detail_importance)
+        else:
+            # original_3dgs or fallback: use fixed threshold
+            effective_threshold = grad_threshold
         
-        # Convert scores back to threshold comparison (higher score = lower effective threshold)
-        # For backward compatibility: score = grad / effective_threshold
-        # So: effective_threshold = grad / score, selected if grad >= effective_threshold
-        # Simplified: selected if score >= 1.0 (normalized by grad_threshold)
-        grad_norm = torch.norm(grads, dim=-1) if grads.dim() > 1 else grads
-        grad_max = grad_norm.max() if grad_norm.max() > 0 else 1.0
-        normalized_threshold = grad_threshold / grad_max
-        selected_pts_mask = densify_scores >= normalized_threshold
+        selected_pts_mask = padded_grad >= effective_threshold
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
 
@@ -1090,14 +1089,14 @@ class GaussianModel:
         # Extract points that satisfy the gradient condition
         n_points = grads.shape[0]
         
-        # Use unified densification score computation for ablation studies
-        densify_scores = self.compute_densify_score(grads, strategy=self._densify_strategy)
-        
-        # Convert scores to selection mask (same logic as densify_and_split)
-        grad_norm = torch.norm(grads, dim=-1) if grads.dim() > 1 else grads
-        grad_max = grad_norm.max() if grad_norm.max() > 0 else 1.0
-        normalized_threshold = grad_threshold / grad_max
-        selected_pts_mask = densify_scores >= normalized_threshold
+        # Detail-aware threshold: high detail_importance → lower effective threshold
+        if self._densify_strategy == "feature_weighted" and self._detail_aware_enabled and self.detail_importance.shape[0] >= n_points:
+            k = self._detail_densify_scale
+            effective_threshold = grad_threshold / (1.0 + k * self.detail_importance[:n_points])
+            selected_pts_mask = torch.norm(grads, dim=-1) >= effective_threshold
+        else:
+            # original_3dgs or fallback: use fixed threshold
+            selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
