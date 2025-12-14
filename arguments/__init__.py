@@ -197,7 +197,7 @@ class OptimizationParams(ParamGroup):
         
         # Capacity control: hard cap on total Gaussian count
         # Prevents densification from exploding memory on large scenes
-        self.max_gaussians = 6_000_000           # N_max: maximum number of Gaussians (6M for 48GB GPU)
+        self.max_gaussians = 4_000_000           # N_max: maximum number of Gaussians (4M for 48GB GPU)
         
         # ========================================================================
         super().__init__(parser, "Optimization Parameters")
