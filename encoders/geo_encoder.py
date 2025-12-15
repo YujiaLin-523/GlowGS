@@ -91,6 +91,13 @@ class GeoEncoder(nn.Module):
         # Initialize projection weights small to maintain gentle contribution
         nn.init.normal_(self.projection.weight, std=init_scale)
         nn.init.zeros_(self.projection.bias)
+        
+        # Compile the heavy sampling part if possible
+        # This fuses the 3 grid_samples + cat + linear into a single kernel via Triton
+        try:
+            self._sample_and_project = torch.compile(self._sample_and_project_impl)
+        except Exception:
+            self._sample_and_project = self._sample_and_project_impl
     
     def _sample_plane(
         self,
@@ -125,6 +132,28 @@ class GeoEncoder(nn.Module):
         # Efficient reshape: [1, rank, 1, N] -> [N, rank]
         return sampled.view(self.rank, -1).t()
     
+    def _sample_and_project_impl(self, coords, plane_xy, plane_xz, plane_yz):
+        """
+        Implementation of sampling and projection, separated for compilation.
+        """
+        # Precompute plane features in the shape expected by grid_sample: [1, rank, H, W]
+        plane_xy_feat = plane_xy.permute(2, 0, 1).unsqueeze(0)
+        plane_xz_feat = plane_xz.permute(2, 0, 1).unsqueeze(0)
+        plane_yz_feat = plane_yz.permute(2, 0, 1).unsqueeze(0)
+
+        # XY plane: sample with (x, y)
+        xy_features = self._sample_plane(plane_xy_feat, coords[:, :2])
+        # XZ plane: sample with (x, z)
+        xz_features = self._sample_plane(plane_xz_feat, coords[:, [0, 2]])
+        # YZ plane: sample with (y, z)
+        yz_features = self._sample_plane(plane_yz_feat, coords[:, 1:])
+
+        # Concatenate features from all three planes
+        triplane_features = torch.cat([xy_features, xz_features, yz_features], dim=1)
+        
+        # Project to output dimension
+        return self.projection(triplane_features)
+
     def forward(self, coordinates: torch.Tensor) -> torch.Tensor:
         """
         Forward pass to compute global low-frequency features.
@@ -141,24 +170,8 @@ class GeoEncoder(nn.Module):
         # Clamp coordinates to [-1, 1] to prevent illegal memory access
         coords = coordinates.clamp(-1.0, 1.0)
         
-        # Efficient tri-plane sampling using slicing instead of separate cat operations
-        # Precompute plane features in the shape expected by grid_sample: [1, rank, H, W]
-        plane_xy_feat = self.plane_xy.permute(2, 0, 1).unsqueeze(0)
-        plane_xz_feat = self.plane_xz.permute(2, 0, 1).unsqueeze(0)
-        plane_yz_feat = self.plane_yz.permute(2, 0, 1).unsqueeze(0)
-
-        # XY plane: sample with (x, y)
-        xy_features = self._sample_plane(plane_xy_feat, coords[:, :2])
-        # XZ plane: sample with (x, z)
-        xz_features = self._sample_plane(plane_xz_feat, coords[:, [0, 2]])
-        # YZ plane: sample with (y, z)
-        yz_features = self._sample_plane(plane_yz_feat, coords[:, 1:])
-
-        # Concatenate features from all three planes
-        triplane_features = torch.cat([xy_features, xz_features, yz_features], dim=1)
-        
-        # Project to output dimension with clamping for numerical stability
-        output = self.projection(triplane_features)
+        # Use compiled implementation for speed
+        output = self._sample_and_project(coords, self.plane_xy, self.plane_xz, self.plane_yz)
         
         # Fast clamp for stability
         return output.clamp(-10.0, 10.0)

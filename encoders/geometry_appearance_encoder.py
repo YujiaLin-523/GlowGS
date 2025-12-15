@@ -61,29 +61,34 @@ class GeometryAppearanceEncoder(nn.Module):
         )
         self.geo_dim = geo_channels
         
-        # Shared latent projector: unified local code from dual-branch features
-        # shared_latent dimension equals baseline out_dim to preserve downstream compatibility
-        self.shared_projector = nn.Sequential(
-            nn.Linear(self.hash_dim + self.geo_dim, out_dim, bias=True),
-            nn.SiLU()
-        )
-
-        # Small-dimension residual adapters: lightweight role-specific specialization
-        # C_role << C_shared (e.g., 16 vs 64) to reduce computation and memory
-        self._role_dim = 16  # Fixed small dimension for residual, not exposed as CLI param
-        self.geometry_adapter = nn.Linear(out_dim, self._role_dim, bias=True)
-        self.appearance_adapter = nn.Linear(out_dim, self._role_dim, bias=True)
+        # Feature Modulation (FiLM) Generators
+        # Instead of concatenating large features, we use lightweight VM features 
+        # to modulate the high-frequency Hash Grid features.
+        # Input: geo_dim (VM context) -> Output: hash_dim * 2 (Scale + Shift)
+        self.geometry_modulator = nn.Linear(self.geo_dim, self.hash_dim * 2, bias=True)
+        self.appearance_modulator = nn.Linear(self.geo_dim, self.hash_dim * 2, bias=True)
 
         # Fallback fusion layer for non-split mode (preserve original behavior)
         self.fusion_layer = nn.Linear(self.hash_dim + self.geo_dim, out_dim, bias=True)
 
-        # Initialize small weights for stability
-        for layer in [self.shared_projector[0], self.geometry_adapter, self.appearance_adapter, self.fusion_layer]:
-            nn.init.normal_(layer.weight, std=0.01)
+        # Initialize modulators for identity mapping (scale=0, shift=0)
+        # This ensures training starts with pure Hash Grid behavior, gradually introducing VM influence
+        for layer in [self.geometry_modulator, self.appearance_modulator]:
+            nn.init.zeros_(layer.weight)
             nn.init.zeros_(layer.bias)
+        
+        nn.init.normal_(self.fusion_layer.weight, std=0.01)
+        nn.init.zeros_(self.fusion_layer.bias)
         
         self._out_dim = out_dim
         self.feature_role_split = feature_role_split
+        
+        # Try to enable torch.compile for the heavy modulation part
+        # This uses Triton backend on supported platforms for fusion
+        try:
+            self._forward_split_compiled = torch.compile(self._forward_split_impl)
+        except Exception:
+            self._forward_split_compiled = self._forward_split_impl
     
     @property
     def n_output_dims(self) -> int:
@@ -93,41 +98,52 @@ class GeometryAppearanceEncoder(nn.Module):
     @property
     def role_dim(self) -> int:
         """Dimension of role-specific residual (C_role)."""
-        return self._role_dim if self.feature_role_split else 0
+        return 0  # No extra dimensions added in FiLM mode
     
     @property
     def geometry_dim(self) -> int:
         """Output dimension for geometry_latent when feature_role_split=True."""
-        return self._out_dim + self._role_dim if self.feature_role_split else self._out_dim
+        return self._out_dim
     
     @property
     def appearance_dim(self) -> int:
         """Output dimension for appearance_latent when feature_role_split=True."""
-        return self._out_dim + self._role_dim if self.feature_role_split else self._out_dim
+        return self._out_dim
     
-    def _forward_split(self, hash_latent: torch.Tensor, geo_latent: torch.Tensor):
+    def _forward_split_impl(self, hash_latent: torch.Tensor, geo_latent: torch.Tensor):
         """
-        Internal forward logic for feature_role_split mode.
-        Separated for torch.compile optimization.
+        Implementation of FiLM logic, separated for compilation.
         """
-        # Build shared latent from concatenated multi-resolution features
-        shared_input = torch.cat([hash_latent, geo_latent], dim=1)
-        shared_latent = self.shared_projector(shared_input)
+        # FiLM (Feature-wise Linear Modulation)
+        # VM features (low-freq) modulate Hash features (high-freq)
+        
+        # 1. Generate modulation parameters from VM features
+        g_params = self.geometry_modulator(geo_latent)  # [N, hash_dim * 2]
+        a_params = self.appearance_modulator(geo_latent) # [N, hash_dim * 2]
+        
+        g_scale, g_shift = g_params.chunk(2, dim=-1)
+        a_scale, a_shift = a_params.chunk(2, dim=-1)
+        
+        # 2. Apply modulation: feat = hash * (1 + scale) + shift
+        # Using (1 + scale) allows scale to be initialized to 0 for identity
+        geometry_latent = hash_latent * (1.0 + g_scale) + g_shift
+        appearance_latent = hash_latent * (1.0 + a_scale) + a_shift
+        
+        # Shared latent is just the raw hash features (or could be averaged)
+        shared_latent = hash_latent
 
-        # Small-dimension residual adapters: lightweight role-specific specialization
-        geometry_residual = self.geometry_adapter(shared_latent)   # [N, C_role]
-        appearance_residual = self.appearance_adapter(shared_latent)  # [N, C_role]
-
-        # Concatenate shared_latent with role-specific residual
-        geometry_latent = torch.cat([shared_latent, geometry_residual], dim=-1)   # [N, C_shared + C_role]
-        appearance_latent = torch.cat([shared_latent, appearance_residual], dim=-1)  # [N, C_shared + C_role]
-
-        # Single clamp at the end (avoid multiple clamp operations)
+        # Clamp for stability
         geometry_latent = torch.clamp(geometry_latent, -10.0, 10.0)
         appearance_latent = torch.clamp(appearance_latent, -10.0, 10.0)
         shared_latent = torch.clamp(shared_latent, -10.0, 10.0)
 
         return shared_latent, geometry_latent, appearance_latent
+
+    def _forward_split(self, hash_latent: torch.Tensor, geo_latent: torch.Tensor):
+        """
+        Internal forward logic for feature_role_split mode.
+        """
+        return self._forward_split_compiled(hash_latent, geo_latent)
     
     def forward(
         self, 
