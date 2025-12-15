@@ -571,8 +571,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             pixel_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss_weighted
             
             # Edge loss: unified interface for ablation studies
-            # Mode can be "none" | "sobel_basic" | "sobel_weighted" (paper default)
-            edge_loss_mode = getattr(opt, 'edge_loss_mode', 'sobel_weighted')
+            # Mode can be "none" | "sobel_basic" | "laplacian_weighted" (paper default)
+            edge_loss_mode = getattr(opt, 'edge_loss_mode', 'laplacian_weighted')
             edge_loss_start_iter = getattr(opt, 'edge_loss_start_iter', 0)
             lambda_grad = getattr(opt, 'lambda_grad', 0.05)
             flat_weight = getattr(opt, 'edge_flat_weight', 0.5)
@@ -633,7 +633,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 flat_term_value = Lgrad_flat.item() if isinstance(Lgrad_flat, torch.Tensor) else 0.0
                 
                 # Edge loss weight
-                edge_loss_mode = getattr(opt, 'edge_loss_mode', 'sobel_weighted')
+                edge_loss_mode = getattr(opt, 'edge_loss_mode', 'laplacian_weighted')
                 edge_loss_weight = lambda_grad if edge_loss_mode != "none" else 0.0
                 
                 # Gaussian statistics

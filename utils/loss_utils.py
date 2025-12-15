@@ -41,25 +41,42 @@ def ssim(img1, img2, window_size=11, size_average=True):
     return _ssim(img1, img2, window, window_size, channel, size_average)
 
 # -----------------------------------------------------------------------------
-# Sobel Kernels (cached globally to avoid repeated allocation)
+# Sobel Kernels (cached globally)
 # -----------------------------------------------------------------------------
-_sobel_x = None
-_sobel_y = None
-
+_sobel_kernel_x = None
+_sobel_kernel_y = None
+_gaussian_kernel = None
 
 def _get_sobel_kernels(device, dtype):
     """
-    Return cached 3x3 Sobel kernels for gradient computation.
-    Creates kernels on first call or when device/dtype changes.
+    Return cached 3x3 Sobel kernels (X and Y).
     """
-    global _sobel_x, _sobel_y
-    if _sobel_x is None or _sobel_x.device != device or _sobel_x.dtype != dtype:
-        _sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
-                                dtype=dtype, device=device).view(1, 1, 3, 3)
-        _sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
-                                dtype=dtype, device=device).view(1, 1, 3, 3)
-    return _sobel_x, _sobel_y
+    global _sobel_kernel_x, _sobel_kernel_y
+    if _sobel_kernel_x is None or _sobel_kernel_x.device != device or _sobel_kernel_x.dtype != dtype:
+        # Sobel X: [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]
+        kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
+                          dtype=dtype, device=device).view(1, 1, 3, 3)
+        # Sobel Y: [[-1, -2, -1], [0, 0, 0], [1, 2, 1]]
+        ky = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
+                          dtype=dtype, device=device).view(1, 1, 3, 3)
+        _sobel_kernel_x = kx
+        _sobel_kernel_y = ky
+    return _sobel_kernel_x, _sobel_kernel_y
 
+def _get_gaussian_kernel(device, dtype, kernel_size=3, sigma=0.5):
+    """
+    Return cached Gaussian kernel for smoothing.
+    """
+    global _gaussian_kernel
+    if _gaussian_kernel is None or _gaussian_kernel.device != device or _gaussian_kernel.dtype != dtype:
+        # Create 1D Gaussian
+        x = torch.arange(kernel_size, device=device, dtype=dtype) - kernel_size // 2
+        gauss_1d = torch.exp(-x.pow(2) / (2 * sigma ** 2))
+        gauss_1d = gauss_1d / gauss_1d.sum()
+        # Create 2D Gaussian
+        gauss_2d = gauss_1d.unsqueeze(1) @ gauss_1d.unsqueeze(0)
+        _gaussian_kernel = gauss_2d.view(1, 1, kernel_size, kernel_size)
+    return _gaussian_kernel
 
 def _rgb_to_grayscale(img):
     """
@@ -75,16 +92,20 @@ def _rgb_to_grayscale(img):
     return gray
 
 
-def _compute_gradient_magnitude(gray_img, sobel_x, sobel_y):
+def _compute_sobel_magnitude(gray_img, kx, ky, smooth_kernel=None):
     """
-    Compute gradient magnitude from grayscale image using Sobel operators.
+    Compute Sobel magnitude from grayscale image.
+    Optionally applies Gaussian smoothing first.
     Input: [B, 1, H, W] grayscale image
-    Output: [B, 1, H, W] gradient magnitude
+    Output: [B, 1, H, W] Sobel magnitude
     """
-    gx = F.conv2d(gray_img, sobel_x, padding=1)
-    gy = F.conv2d(gray_img, sobel_y, padding=1)
-    grad_mag = torch.sqrt(gx ** 2 + gy ** 2 + 1e-6)
-    return grad_mag
+    if smooth_kernel is not None:
+        gray_img = F.conv2d(gray_img, smooth_kernel, padding=smooth_kernel.shape[-1]//2)
+        
+    gx = F.conv2d(gray_img, kx, padding=1)
+    gy = F.conv2d(gray_img, ky, padding=1)
+    magnitude = torch.sqrt(gx**2 + gy**2 + 1e-6)
+    return magnitude
 
 
 def compute_pixel_importance(gt_rgb, pred_rgb, power_edge=1.2, power_error=1.0):
@@ -94,7 +115,7 @@ def compute_pixel_importance(gt_rgb, pred_rgb, power_edge=1.2, power_error=1.0):
     Design Philosophy:
     - Identifies regions requiring more Gaussian capacity: high-frequency details + hard-to-fit areas.
     - Combines two complementary signals:
-      1. Edge strength (from GT Sobel): captures intrinsic scene complexity (textures, edges).
+      1. Edge strength (from GT Laplacian): captures intrinsic scene complexity (textures, edges).
       2. Error strength (from residual): captures current reconstruction difficulty.
     - Weighted sum (0.7 edge + 0.3 error) ensures edges are always prioritized, even when
       temporarily well-fitted, preventing premature under-representation.
@@ -117,10 +138,11 @@ def compute_pixel_importance(gt_rgb, pred_rgb, power_edge=1.2, power_error=1.0):
     if pred_rgb.dim() == 3:
         pred_rgb = pred_rgb.unsqueeze(0)
     
-    # ---- Edge strength from GT gradient ----
-    sobel_x, sobel_y = _get_sobel_kernels(gt_rgb.device, gt_rgb.dtype)
+    # ---- Edge strength from GT Sobel ----
+    kx, ky = _get_sobel_kernels(gt_rgb.device, gt_rgb.dtype)
+    smooth_kernel = _get_gaussian_kernel(gt_rgb.device, gt_rgb.dtype)
     gt_gray = _rgb_to_grayscale(gt_rgb)
-    G_gt = _compute_gradient_magnitude(gt_gray, sobel_x, sobel_y)  # [B, 1, H, W]
+    G_gt = _compute_sobel_magnitude(gt_gray, kx, ky, smooth_kernel)  # [B, 1, H, W]
     
     # Robust percentile-based normalization (more stable than mean+std for skewed distributions)
     g_p10 = torch.quantile(G_gt, 0.10).clamp(min=1e-6)
@@ -176,8 +198,8 @@ def compute_edge_loss(pred_rgb, gt_rgb, mode: str = "sobel_weighted", lambda_edg
             return zero_loss, zero_loss, zero_loss
         return zero_loss
     
-    elif mode == "sobel_weighted":
-        # GlowGS unified edge-aware loss
+    elif mode == "sobel_weighted" or mode == "laplacian_weighted":
+        # GlowGS unified edge-aware loss (Now using Sobel internally)
         loss = gradient_loss(pred_rgb, gt_rgb, valid_mask=None, flat_weight=flat_weight, 
                             return_components=return_components)
         if return_components:
@@ -224,16 +246,17 @@ def gradient_loss(pred_rgb, gt_rgb, valid_mask=None, flat_weight=0.5, return_com
     if gt_rgb.dim() == 3:
         gt_rgb = gt_rgb.unsqueeze(0)
     
-    # Get cached Sobel kernels
-    sobel_x, sobel_y = _get_sobel_kernels(pred_rgb.device, pred_rgb.dtype)
+    # Get cached Sobel kernels and Gaussian smoother
+    kx, ky = _get_sobel_kernels(pred_rgb.device, pred_rgb.dtype)
+    smooth_kernel = _get_gaussian_kernel(pred_rgb.device, pred_rgb.dtype)
     
     # Convert to grayscale for gradient computation
     pred_gray = _rgb_to_grayscale(pred_rgb)
     gt_gray = _rgb_to_grayscale(gt_rgb)
     
-    # Compute gradient magnitudes
-    G_pred = _compute_gradient_magnitude(pred_gray, sobel_x, sobel_y)
-    G_gt = _compute_gradient_magnitude(gt_gray, sobel_x, sobel_y)
+    # Compute Sobel magnitudes with smoothing
+    G_pred = _compute_sobel_magnitude(pred_gray, kx, ky, smooth_kernel)
+    G_gt = _compute_sobel_magnitude(gt_gray, kx, ky, smooth_kernel)
     
     # Normalize gradients to [0, 1] range for stable loss magnitude
     # Sobel max response on [0,1] image is ~4.0; use 4.0 as normalizer
