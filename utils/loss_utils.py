@@ -24,10 +24,23 @@ def gaussian(window_size, sigma):
     gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
     return gauss / gauss.sum()
 
+# -----------------------------------------------------------------------------
+# SSIM Window Cache (avoid repeated allocation per iteration)
+# -----------------------------------------------------------------------------
+_ssim_window_cache = {}
+
 def create_window(window_size, channel):
+    """Create Gaussian window for SSIM computation with caching."""
+    global _ssim_window_cache
+    cache_key = (window_size, channel)
+    if cache_key in _ssim_window_cache:
+        return _ssim_window_cache[cache_key]
+    
     _1D_window = gaussian(window_size, 1.5).unsqueeze(1)
     _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
     window = Variable(_2D_window.expand(channel, 1, window_size, window_size).contiguous())
+    
+    _ssim_window_cache[cache_key] = window
     return window
 
 def ssim(img1, img2, window_size=11, size_average=True):
@@ -136,17 +149,24 @@ def compute_pixel_importance(gt_rgb, pred_rgb, power_edge=1.2, power_error=1.0):
     residual = (pred_rgb - gt_rgb).abs().mean(dim=1, keepdim=True)  # [B, 1, H, W]
     r_p10 = torch.quantile(residual, 0.10).clamp(min=1e-6)
     r_p90 = torch.quantile(residual, 0.90).clamp(min=1e-6)
-    r_range = (r_p90 - r_p10).clamp(min=1e-6)
+    
+    # Prevents noise amplification in converged scenes:
+    # If error spread is small (e.g. <0.05), we shouldn't map small errors to 1.0 importance.
+    r_range = (r_p90 - r_p10).clamp(min=0.05)
+    
     error_strength = ((residual - r_p10) / r_range * 0.8 + 0.1).clamp(0.0, 1.0)
     error_strength = error_strength.squeeze(0).squeeze(0)  # [H, W]
     
-    # ---- Combine: weighted sum with edge as primary signal ----
-    # Edge regions are inherently important; error provides secondary boost
-    # Formula: importance = 0.7 * edge^p + 0.3 * error^q
-    # This ensures even low-error edge regions get high importance
+    # ---- Combine: multiplicative gating (error-driven) ----
+    # Key insight: importance should decay when error is low, even at edges.
+    # Old (additive): importance = 0.7*edge + 0.3*error  → edges always high
+    # New (gated): importance = error * (1 + edge)  → converges to 0 when error→0
     edge_term = edge_strength ** power_edge
     error_term = error_strength ** power_error
-    pixel_importance = 0.7 * edge_term + 0.3 * error_term
+    pixel_importance = error_term * (1.0 + edge_term)
+    
+    # Normalize to [0, 1] range (max possible is 2.0 when both terms are 1.0)
+    pixel_importance = (pixel_importance / 2.0).clamp(0.0, 1.0)
     
     return pixel_importance.detach()  # Detach to avoid graph retention
 
@@ -249,7 +269,8 @@ def gradient_loss(pred_rgb, gt_rgb, valid_mask=None, flat_weight=0.5, return_com
     eps = 1e-6
     G_gt_detached = G_gt_norm.detach()
     # Use 95th percentile as reference scale (more robust than mean for bimodal distributions)
-    g_p95 = torch.quantile(G_gt_detached, 0.95).clamp(min=eps)
+    # Subsample by stride=4 to reduce quantile sorting cost (~16x speedup, negligible accuracy loss)
+    g_p95 = torch.quantile(G_gt_detached[..., ::4, ::4], 0.95).clamp(min=eps)
     # Scale so that p95 maps to ~0.7, allowing headroom for stronger edges
     grad_scale = g_p95 / 0.7 + eps
     edge_confidence = torch.clamp(G_gt_detached / grad_scale, 0.0, 1.0)

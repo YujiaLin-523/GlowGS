@@ -10,6 +10,7 @@
 #
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
@@ -157,12 +158,6 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
-        # Detail-aware densification: per-Gaussian importance score (EMA-smoothed)
-        self.detail_importance = torch.empty(0)
-        self._detail_aware_enabled = True  # Will be set by training_setup
-        self._detail_ema_decay = 0.9
-        self._detail_densify_scale = 0.5
-        self._detail_prune_weight = 0.2
         self.optimizer = None
         self.optimizer_i = None
         self.percent_dense = 0
@@ -290,12 +285,6 @@ class GaussianModel:
             self.denom = denom
             self.optimizer.load_state_dict(opt_dict)
             self.optimizer_i.load_state_dict(opt_i_dict)
-        
-        # Ensure detail_importance is correctly sized after restore
-        # (Old checkpoints may not have this buffer, initialize to neutral)
-        if self.detail_importance.shape[0] != self._xyz.shape[0]:
-            self.detail_importance = torch.full((self._xyz.shape[0],), 0.5, device="cuda")
-            print(f"[INFO] Initialized detail_importance to neutral (0.5) for {self._xyz.shape[0]} Gaussians")
     
     def restore_for_eval(self, model_args):
         """
@@ -325,7 +314,6 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((N,), device="cuda")
         self.xyz_gradient_accum = torch.zeros((N, 1), device="cuda")
         self.denom = torch.zeros((N, 1), device="cuda")
-        self.detail_importance = torch.full((N,), 0.5, device="cuda")
         
         print(f"[INFO] Restored {N} Gaussians for evaluation (lightweight mode)")
 
@@ -405,12 +393,6 @@ class GaussianModel:
             rotation_chunks = []
             features_rest_chunks = [] if self.max_sh_degree > 0 else None
 
-            # For debug stats (mean norms) - compute only when needed (every 1000 iter)
-            shared_norm_sum = 0.0
-            geometry_norm_sum = 0.0
-            appearance_norm_sum = 0.0
-            total_count = 0
-
             for i in range(0, N, chunk_size):
                 end_idx = min(i + chunk_size, N)
                 coords = contracted_xyz[i: end_idx]
@@ -438,19 +420,7 @@ class GaussianModel:
                         self._opacity[i:end_idx] = self._opacity_init.expand(end_idx - i, -1)
                         self._scaling[i:end_idx] = 0.0
                         self._rotation[i:end_idx] = self._rotation_init.expand(end_idx - i, -1)
-                    total_count += fused.shape[0]
                     continue
-
-                # Encoder already clamps, skip redundant clamp here (encoder does it)
-                # Only clamp if values are out of expected range (rare case)
-                
-                # Accumulate norms for debug logging (defer .item() to reduce sync)
-                chunk_size_actual = shared_chunk.shape[0]
-                with torch.no_grad():
-                    shared_norm_sum += shared_chunk.norm(dim=-1).sum()
-                    geometry_norm_sum += geometry_chunk.norm(dim=-1).sum()
-                    appearance_norm_sum += appearance_chunk.norm(dim=-1).sum()
-                total_count += chunk_size_actual
 
                 # Geometry heads: scale, rotation, opacity
                 # Project geometry_latent (C_shared + C_role) to head input dim (C_shared)
@@ -469,16 +439,6 @@ class GaussianModel:
                     features_rest_chunks.append(
                         self._features_rest_head(appearance_proj).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3)
                     )
-
-            # Store mean-norm scalars for light-weight debug logging (convert to float only when needed)
-            if total_count > 0:
-                self._last_shared_norm = (shared_norm_sum / total_count).item()
-                self._last_geometry_norm = (geometry_norm_sum / total_count).item()
-                self._last_appearance_norm = (appearance_norm_sum / total_count).item()
-            else:
-                self._last_shared_norm = 0.0
-                self._last_geometry_norm = 0.0
-                self._last_appearance_norm = 0.0
 
             # Concatenate chunk outputs
             self._opacity = torch.cat(opacity_chunks, dim=0)
@@ -654,22 +614,11 @@ class GaussianModel:
             self._features_rest = torch.empty(0)
 
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        # Initialize detail_importance to neutral value (0.5) - will be updated via EMA
-        self.detail_importance = torch.full((self.get_xyz.shape[0],), 0.5, device="cuda")
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        
-        # Detail-aware densification config (from training_args if present)
-        self._detail_aware_enabled = getattr(training_args, 'enable_detail_aware', True)
-        self._detail_ema_decay = getattr(training_args, 'detail_ema_decay', 0.9)
-        self._detail_densify_scale = getattr(training_args, 'detail_densify_scale', 0.5)
-        self._detail_prune_weight = getattr(training_args, 'detail_prune_weight', 0.2)
-        # Ensure detail_importance is initialized if not already
-        if self.detail_importance.shape[0] != self.get_xyz.shape[0]:
-            self.detail_importance = torch.full((self.get_xyz.shape[0],), 0.5, device="cuda")
         
         # Update capacity config from training_args (allow CLI override)
         max_gaussians = getattr(training_args, 'max_gaussians', 6_000_000)
@@ -923,10 +872,6 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         
-        # Prune detail_importance buffer
-        if self.detail_importance.shape[0] > 0:
-            self.detail_importance = self.detail_importance[valid_points_mask]
-        
         # Clear cached contracted_xyz since xyz changed
         if hasattr(self, '_cached_contracted_xyz'):
             delattr(self, '_cached_contracted_xyz')
@@ -981,92 +926,32 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         
-        # Extend detail_importance for new Gaussians: inherit from mean (neutral bias)
-        num_new = new_xyz.shape[0]
-        if num_new > 0:
-            # New Gaussians start with mean importance (will converge via EMA)
-            mean_importance = self.detail_importance.mean().item() if self.detail_importance.numel() > 0 else 0.5
-            new_importance = torch.full((num_new,), mean_importance, device="cuda")
-            self.detail_importance = torch.cat([self.detail_importance, new_importance], dim=0)
-        
         # Invalidate attribute caches; shapes changed
         self._cached_attributes_hash = None
         if hasattr(self, '_cached_contracted_key'):
             self._cached_contracted_key = None
 
-    def compute_densify_score(self, grads, strategy="feature_weighted"):
-        """
-        Compute densification scores for ablation studies.
-        
-        Args:
-            grads: Gradient tensor [N, 3] or [N]
-            strategy: Densification strategy variant
-                - "original_3dgs": Original 3DGS gradient-only baseline
-                - "feature_weighted": GlowGS feature-weighted densification
-        
-        Returns:
-            scores: Densification scores [N], higher = more likely to densify
-        """
-        n_points = grads.shape[0]
-        
-        # Normalize gradient magnitude to [0, 1] range for comparability
-        grad_norm = torch.norm(grads, dim=-1) if grads.dim() > 1 else grads
-        grad_max = grad_norm.max()
-        if grad_max > 0:
-            grad_score = grad_norm / grad_max
-        else:
-            grad_score = grad_norm
-        
-        if strategy == "original_3dgs":
-            # 3DGS baseline: pure gradient magnitude (no detail_importance)
-            return grad_score
-        
-        elif strategy == "feature_weighted":
-            # GlowGS: gradient modulated by detail_importance
-            if self._detail_aware_enabled and self.detail_importance.shape[0] >= n_points:
-                k = self._detail_densify_scale
-                # Higher detail_importance → higher score (easier to densify)
-                importance_boost = 1.0 + k * self.detail_importance[:n_points]
-                return grad_score * importance_boost
-            else:
-                # Fallback to original if detail_importance not available
-                return grad_score
-        
-        else:
-            raise ValueError(f"Unknown densify_strategy: {strategy}. Expected 'original_3dgs' or 'feature_weighted'")
-
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         """
-        Feature-weighted densification: split large Gaussians (GlowGS innovation #3).
-        
-        Key Modification:
-        - Applies per-Gaussian detail_importance scores to modulate split threshold.
-        - High-importance Gaussians (edges, textures) get lower effective threshold,
-          making them easier to split even with moderate gradients.
-        - Reallocates limited Gaussian budget toward high-frequency regions.
-        
-        Formula: effective_threshold_i = base_threshold / (1 + k * detail_importance_i)
+        Split large Gaussians with high gradient.
+        Uses original 3DGS logic with FPS guard for screen-space size.
         """
         n_init_points = self.get_xyz.shape[0]
-        # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
         
-        # Detail-aware threshold: high detail_importance → lower effective threshold
-        # effective_threshold_i = grad_threshold / (1 + k * detail_importance_i)
-        if self._densify_strategy == "feature_weighted" and self._detail_aware_enabled and self.detail_importance.shape[0] == n_init_points:
-            k = self._detail_densify_scale
-            effective_threshold = grad_threshold / (1.0 + k * self.detail_importance)
-        else:
-            # original_3dgs or fallback: use fixed threshold
-            effective_threshold = grad_threshold
+        selected_pts_mask = padded_grad >= grad_threshold
         
-        selected_pts_mask = padded_grad >= effective_threshold
-        selected_pts_mask = torch.logical_and(selected_pts_mask,
-                                              torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        # World-space size constraint (original 3DGS)
+        is_large_ws = torch.max(self.get_scaling, dim=1).values > self.percent_dense * scene_extent
+        # Screen-space size constraint (FPS optimization)
+        is_large_ss = self.max_radii2D > 3.0
+        
+        selected_pts_mask = torch.logical_and(selected_pts_mask, is_large_ws)
+        selected_pts_mask = torch.logical_and(selected_pts_mask, is_large_ss)
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
-        means =torch.zeros((stds.size(0), 3),device="cuda")
+        means = torch.zeros((stds.size(0), 3), device="cuda")
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
@@ -1075,7 +960,6 @@ class GaussianModel:
         new_mask = self._mask[selected_pts_mask].repeat(N,1)
         new_sh_mask = self._sh_mask[selected_pts_mask].repeat(N,1)
         
-        # In 3DGS mode, also clone/split f_rest
         new_features_rest = None
         if self._encoder_variant == '3dgs' and isinstance(self._features_rest, nn.Parameter):
             new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
@@ -1086,20 +970,20 @@ class GaussianModel:
         self.prune_points(prune_filter)
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
-        # Extract points that satisfy the gradient condition
-        n_points = grads.shape[0]
+        """
+        Clone small Gaussians with high gradient.
+        Uses original 3DGS logic with FPS guard for screen-space size.
+        """
+        selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         
-        # Detail-aware threshold: high detail_importance → lower effective threshold
-        if self._densify_strategy == "feature_weighted" and self._detail_aware_enabled and self.detail_importance.shape[0] >= n_points:
-            k = self._detail_densify_scale
-            effective_threshold = grad_threshold / (1.0 + k * self.detail_importance[:n_points])
-            selected_pts_mask = torch.norm(grads, dim=-1) >= effective_threshold
-        else:
-            # original_3dgs or fallback: use fixed threshold
-            selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
+        # World-space size constraint (original 3DGS)
+        is_small_ws = torch.max(self.get_scaling, dim=1).values <= self.percent_dense * scene_extent
+        # Screen-space size constraint (FPS optimization)
+        is_visible_ss = self.max_radii2D > 2.0
         
-        selected_pts_mask = torch.logical_and(selected_pts_mask,
-                                              torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
+        selected_pts_mask = torch.logical_and(selected_pts_mask, is_small_ws)
+        selected_pts_mask = torch.logical_and(selected_pts_mask, is_visible_ss)
+        selected_pts_mask = torch.logical_and(selected_pts_mask, is_visible_ss)
         
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
@@ -1107,70 +991,37 @@ class GaussianModel:
         new_mask = self._mask[selected_pts_mask]
         new_sh_mask = self._sh_mask[selected_pts_mask]
         
-        # In 3DGS mode, also clone f_rest
         new_features_rest = None
         if self._encoder_variant == '3dgs' and isinstance(self._features_rest, nn.Parameter):
             new_features_rest = self._features_rest[selected_pts_mask]
 
         self.densification_postfix(new_xyz, new_features_dc, new_scaling_base, new_mask, new_sh_mask, new_features_rest)
-        # Recompute implicit attributes to align shapes before further densification logic
         self.update_attributes(force_update=True)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
+        """
+        Core densification and pruning logic.
+        Simplified to use original 3DGS approach with opacity-based pruning.
+        """
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        # Optimization: Only update once before densification
-        # Cache will be invalidated after densify_and_clone/split modify _xyz
         self.update_attributes(force_update=True)
         self.densify_and_clone(grads, max_grad, extent)
-        # Cache invalidated by densify_and_clone, will auto-update on next call
         self.densify_and_split(grads, max_grad, extent)
-
-        # Final update before pruning (force to ensure we have latest attributes)
         self.update_attributes(force_update=True)
         
-        # Base prune conditions: LocoGS uses fixed mask_threshold=0.01, min_opacity from train.py (0.005)
-        mask_condition = (self.get_mask <= 0.01).squeeze()
-        opacity_condition = (self.get_opacity < min_opacity).squeeze()
-        prune_mask = torch.logical_or(mask_condition, opacity_condition)
+        # === Pruning: Low opacity points are removed ===
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
         
+        # Artifact cleanup (fog/floaters): large screen-space but transparent
         if max_screen_size:
-            big_points_vs = self.max_radii2D > max_screen_size
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
-            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
-        
-        # Detail-aware pruning: among candidates, prefer pruning low detail_importance ones
-        # This is a soft bias: we don't override the base conditions, but when capacity
-        # is tight, low-detail Gaussians are more likely to be pruned
-        if self._detail_aware_enabled and self.detail_importance.shape[0] == self.get_xyz.shape[0]:
-            # Compute prune score: higher score → more likely to prune
-            # Base score from opacity (lower opacity → higher prune score)
-            opacity_score = 1.0 - self.get_opacity.squeeze()
-            # Detail score: low detail_importance → higher prune score
-            detail_score = 1.0 - self.detail_importance
-            
-            # Combined score with weighting
-            w_detail = self._detail_prune_weight
-            combined_score = (1.0 - w_detail) * opacity_score + w_detail * detail_score
-            
-            # Apply detail-based pruning only to borderline cases
-            # Gaussians that barely pass the opacity threshold but have low detail_importance
-            borderline_mask = torch.logical_and(
-                self.get_opacity.squeeze() >= min_opacity,
-                self.get_opacity.squeeze() < min_opacity * 2.0  # Within 2x of threshold
-            )
-            # Among borderline cases, prune those with very low detail_importance
-            low_detail_threshold = 0.15  # Bottom 15% of importance range
-            borderline_low_detail = torch.logical_and(
-                borderline_mask,
-                self.detail_importance < low_detail_threshold
-            )
-            # Add these to prune mask (soft pruning of low-detail borderline cases)
-            prune_mask = torch.logical_or(prune_mask, borderline_low_detail)
+            is_huge_screen = self.max_radii2D > max_screen_size
+            is_transparent = self.get_opacity.squeeze() < 0.5
+            is_artifact = torch.logical_and(is_huge_screen, is_transparent)
+            prune_mask = torch.logical_or(prune_mask, is_artifact)
         
         self.prune_points(prune_mask)
-
         torch.cuda.empty_cache()
 
     def maybe_densify_and_prune(
@@ -1183,16 +1034,12 @@ class GaussianModel:
         mask_prune_threshold: float = 0.005,
     ):
         """
-        Capacity-controlled densification wrapper (GlowGS innovation #3: N_max enforcement).
+        Capacity-controlled densification wrapper.
         
         Design:
-        - Enforces hard point budget (N_max, default 6M) to prevent memory explosion.
+        - Enforces hard point budget (N_max) to prevent memory explosion.
         - Densification only proceeds if: (1) within schedule, (2) under capacity.
-        - Works synergistically with feature-weighted densification: limited budget
-          is allocated to high-importance regions via detail_importance modulation.
         - Post-densification: periodic mask pruning to remove low-contribution Gaussians.
-        
-        Does NOT modify core densify/prune algorithms, only adds capacity gating.
         
         Args:
             iteration: Current training iteration
@@ -1209,9 +1056,19 @@ class GaussianModel:
         
         num_points = self.get_xyz.shape[0]
         
+        # Dynamic threshold: raise threshold as we approach capacity
+        # This naturally slows down point growth when resources are tight
+        capacity_ratio = num_points / max_points
+        if capacity_ratio > 0.5:
+            # Scale threshold: at 50% capacity -> 1x, at 100% capacity -> 3x
+            threshold_scale = 1.0 + 2.0 * (capacity_ratio - 0.5) / 0.5
+            adaptive_grad = max_grad * threshold_scale
+        else:
+            adaptive_grad = max_grad
+        
         # Densify only if under capacity and within schedule
         if iteration < densify_until and num_points < max_points:
-            self.densify_and_prune(max_grad, min_opacity, extent, max_screen_size)
+            self.densify_and_prune(adaptive_grad, min_opacity, extent, max_screen_size)
             new_count = self.get_xyz.shape[0]
             # Log capacity warning if approaching limit
             if new_count >= max_points * 0.9:
@@ -1232,84 +1089,29 @@ class GaussianModel:
         self.prune_points(prune_mask)
         torch.cuda.empty_cache()
 
-    def add_densification_stats(self, viewspace_point_tensor, update_filter):
-        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
-        self.denom[update_filter] += 1
-
-    def update_detail_importance(self, pixel_importance, visibility_filter, radii):
+    def add_densification_stats(self, viewspace_point_tensor, update_filter, opacity=None):
         """
-        Update per-Gaussian detail_importance via EMA using pixel-level importance.
+        Accumulate gradients for densification decision.
         
-        Uses a lightweight approximation: for visible Gaussians, sample the mean
-        pixel_importance in a small region around their projected screen position.
-        This avoids expensive per-pixel-per-Gaussian weight accumulation.
+        Key insight: Weight gradient by opacity to favor "solid" points.
+        - High opacity points (solid geometry): full gradient contribution
+        - Low opacity points (floaters/fog): reduced gradient contribution
+        This prevents transparent noise from triggering densification.
         
         Args:
-            pixel_importance: [H, W] tensor with values in [0, 1]
-            visibility_filter: [N] boolean mask of visible Gaussians
-            radii: [N] screen-space radii of Gaussians (used as proxy for contribution extent)
+            viewspace_point_tensor: Tensor with .grad containing screen-space gradients
+            update_filter: Boolean mask for visible points
+            opacity: Optional opacity tensor [N, 1]. If provided, used for weighting.
         """
-        if not self._detail_aware_enabled:
-            return
+        grad_norm = torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         
-        N = self.get_xyz.shape[0]
-        if N == 0 or pixel_importance is None:
-            return
+        if opacity is not None:
+            # Opacity-weighted gradient: solid points get full credit, transparent points penalized
+            opacity_weight = opacity[update_filter].clamp(0.0, 1.0)
+            grad_norm = grad_norm * opacity_weight
         
-        # Ensure detail_importance is correctly sized
-        if self.detail_importance.shape[0] != N:
-            self.detail_importance = torch.full((N,), 0.5, device="cuda")
-        
-        # For visible Gaussians, estimate their importance from pixel_importance
-        # Simple approximation: use spatial mean of pixel_importance as proxy
-        # (More accurate would require splatting weights, but too expensive)
-        visible_mask = visibility_filter
-        num_visible = visible_mask.sum().item()
-        
-        if num_visible == 0:
-            return
-        
-        # Compute mean pixel importance as a global batch statistic
-        # Visible Gaussians inherit this weighted by their screen coverage
-        mean_pixel_importance = pixel_importance.mean().item()
-        
-        # Radii-weighted importance: larger screen footprint → more contribution
-        # Normalize radii to [0, 1] range for weighting
-        radii_visible = radii[visible_mask].float()
-        if radii_visible.numel() > 0:
-            radii_norm = radii_visible / (radii_visible.max().clamp(min=1.0))
-            # Gaussians with larger radii contribute more to image → weight them higher
-            # but also cap influence to avoid single large Gaussian dominating
-            weight = (0.3 + 0.7 * radii_norm.clamp(0.0, 1.0))
-        else:
-            weight = torch.ones(num_visible, device="cuda")
-        
-        # Sample-based approximation: each visible Gaussian gets importance
-        # proportional to mean_pixel_importance * its coverage weight
-        tmp_importance = torch.full((N,), 0.0, device="cuda")
-        tmp_importance[visible_mask] = mean_pixel_importance * weight
-        
-        # EMA update: smooth over iterations to avoid single-frame noise
-        ema_decay = self._detail_ema_decay
-        # Only update visible Gaussians; others retain their current importance
-        self.detail_importance[visible_mask] = (
-            ema_decay * self.detail_importance[visible_mask] +
-            (1.0 - ema_decay) * tmp_importance[visible_mask]
-        )
-        
-        # Clamp to valid range
-        self.detail_importance.clamp_(0.0, 1.0)
-
-    def get_detail_importance_stats(self):
-        """Return percentile statistics for logging."""
-        if self.detail_importance.numel() == 0:
-            return {'p5': 0.0, 'p50': 0.0, 'p95': 0.0}
-        di = self.detail_importance
-        return {
-            'p5': torch.quantile(di, 0.05).item(),
-            'p50': torch.quantile(di, 0.50).item(),
-            'p95': torch.quantile(di, 0.95).item(),
-        }
+        self.xyz_gradient_accum[update_filter] += grad_norm
+        self.denom[update_filter] += 1
 
     def sort_attributes(self):
         xyz = self.get_xyz.float().detach().cpu().numpy()
