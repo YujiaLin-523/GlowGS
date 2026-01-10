@@ -162,6 +162,8 @@ class GaussianModel:
         self.optimizer_i = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        # Precomputed attribute cache for fast inference (populated by precompute_attributes)
+        self._precomputed_cache = None
         self.setup_functions()
         self.setup_configs(hash_size, width, depth)
         self.setup_params()
@@ -328,6 +330,15 @@ class GaussianModel:
         Args:
             force_update: If True, bypass cache and force recomputation
         """
+        # Fast path: use precomputed cache if available (for inference)
+        if self._precomputed_cache is not None and not force_update:
+            self._opacity = self._precomputed_cache['opacity']
+            self._scaling = self._precomputed_cache['scaling']
+            self._rotation = self._precomputed_cache['rotation']
+            if 'features_rest' in self._precomputed_cache:
+                self._features_rest = self._precomputed_cache['features_rest']
+            return
+        
         # 3DGS mode: skip encoder, use explicit SH parameters only
         # In this mode, _features_rest is directly optimized (no encoder)
         if self._encoder_variant == '3dgs':
@@ -481,6 +492,33 @@ class GaussianModel:
         # NOTE: Removed torch.cuda.empty_cache() here for real-time performance
         # empty_cache() is expensive (~1-2ms) and should only be called when necessary
     
+    def precompute_attributes(self):
+        """
+        Precompute and cache all Gaussian attributes for fast inference.
+        
+        Call this once after model loading to avoid per-frame MLP inference.
+        The cached attributes will be used by update_attributes() automatically.
+        """
+        if self._encoder_variant == '3dgs':
+            print("[Precompute] 3DGS mode: no encoder decoding needed")
+            return
+        
+        # Force compute all attributes
+        self._precomputed_cache = None  # Clear any existing cache
+        self.update_attributes(force_update=True)
+        
+        # Cache the computed attributes (detach to save memory)
+        self._precomputed_cache = {
+            'opacity': self._opacity.detach().clone(),
+            'scaling': self._scaling.detach().clone(),
+            'rotation': self._rotation.detach().clone(),
+        }
+        if self.max_sh_degree > 0 and self._features_rest.numel() > 0:
+            self._precomputed_cache['features_rest'] = self._features_rest.detach().clone()
+        
+        n_points = self._xyz.shape[0]
+        print(f"[Precompute] Cached {n_points:,} Gaussian attributes for fast rendering")
+    
     def get_cache_stats(self):
         """Return cache hit/miss statistics for update_attributes."""
         hits = getattr(self, '_cache_hit_count', 0)
@@ -600,7 +638,8 @@ class GaussianModel:
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._scaling_base = nn.Parameter(scales.requires_grad_(True))
         self._mask = nn.Parameter(torch.ones((fused_point_cloud.shape[0], 1), device="cuda").requires_grad_(True))
-        self._sh_mask = nn.Parameter(torch.ones((fused_point_cloud.shape[0], self.max_sh_degree), device="cuda").requires_grad_(True))
+        # Initialize SH mask high so sigmoid(6.0)~0.997, allowing full specular details from start
+        self._sh_mask = nn.Parameter(torch.full((fused_point_cloud.shape[0], self.max_sh_degree), 6.0, device="cuda").requires_grad_(True))
 
         # In 3DGS mode, initialize _features_rest as explicit parameters
         if self._encoder_variant == '3dgs' and self.max_sh_degree > 0:
@@ -1011,13 +1050,26 @@ class GaussianModel:
         self.densify_and_split(grads, max_grad, extent)
         self.update_attributes(force_update=True)
         
-        # === Pruning: Low opacity points are removed ===
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        # === Pruning: Size-Aware Opacity Thresholds ===
+        opacity = self.get_opacity.squeeze()
         
-        # Artifact cleanup (fog/floaters): large screen-space but transparent
+        # Base pruning: extremely low opacity (original 3DGS)
+        prune_mask = (opacity < min_opacity)
+        
+        # Size-Aware Pruning: penalize large semi-transparent volumes
+        # Theory: Large low-opacity Gaussians cause overdraw and volumetric artifacts.
+        # - Small radius (<20px): details/spokes, keep even if semi-transparent (>0.005)
+        # - Large radius (>20px): must be solid (>0.05) or get pruned
+        # This forces the model to create compact surfaces instead of volumetric fog.
+        large_radius_mask = self.max_radii2D > 20.0
+        semi_transparent_mask = opacity < 0.05
+        volumetric_bloat = torch.logical_and(large_radius_mask, semi_transparent_mask)
+        prune_mask = torch.logical_or(prune_mask, volumetric_bloat)
+        
+        # Additional artifact cleanup for extremely large points
         if max_screen_size:
             is_huge_screen = self.max_radii2D > max_screen_size
-            is_transparent = self.get_opacity.squeeze() < 0.5
+            is_transparent = opacity < 0.5
             is_artifact = torch.logical_and(is_huge_screen, is_transparent)
             prune_mask = torch.logical_or(prune_mask, is_artifact)
         
@@ -1089,24 +1141,50 @@ class GaussianModel:
         self.prune_points(prune_mask)
         torch.cuda.empty_cache()
 
-    def add_densification_stats(self, viewspace_point_tensor, update_filter, opacity=None):
+    def add_densification_stats(self, viewspace_point_tensor, update_filter, opacity=None, radii=None):
         """
-        Accumulate gradients for densification decision.
+        Accumulate gradients for densification decision using Mass-Aware Gradient Weighting.
         
-        Key insight: Weight gradient by opacity to favor "solid" points.
-        - High opacity points (solid geometry): full gradient contribution
-        - Low opacity points (floaters/fog): reduced gradient contribution
-        This prevents transparent noise from triggering densification.
+        Theory (for paper):
+        We decompose gradient confidence into two orthogonal factors:
+        1. Visibility Boost (sqrt(alpha)): Non-linear rescaling to compensate for 
+           sub-pixel structures that appear semi-transparent due to rasterization averaging.
+           This prevents fine details (bike spokes) from being ignored.
+        2. Mass Regularization (1/(1 + alpha*r/tau)): Penalizes large, solid regions 
+           where high gradients often indicate lighting variation rather than geometric 
+           deficiency. This prevents over-densification on smooth surfaces (roads).
+        
+        Formula: weight = sqrt(alpha) / (1 + alpha * radius / tau)
         
         Args:
             viewspace_point_tensor: Tensor with .grad containing screen-space gradients
             update_filter: Boolean mask for visible points
             opacity: Optional opacity tensor [N, 1]. If provided, used for weighting.
+            radii: Optional screen-space radii tensor [N]. If provided, used for mass regularization.
         """
         grad_norm = torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         
-        if opacity is not None:
-            # Opacity-weighted gradient: solid points get full credit, transparent points penalized
+        if opacity is not None and radii is not None:
+            # Mass-Aware Gradient Weighting
+            alpha = opacity[update_filter].clamp(0.01, 1.0)  # [N_visible, 1]
+            r = radii[update_filter].float().unsqueeze(-1).clamp(min=1.0)  # [N_visible, 1]
+            
+            # Hyperparameter: characteristic radius scale (typical detail size in pixels)
+            tau = 50.0
+            
+            # Visibility boost: sqrt(alpha) - helps small/thin structures with low opacity
+            visibility_boost = torch.sqrt(alpha)
+            
+            # Mass regularization: penalize large solid regions to prevent road artifacts
+            mass = alpha * r
+            mass_penalty = 1.0 / (1.0 + mass / tau)
+            
+            # Combined weight
+            weight = visibility_boost * mass_penalty
+            grad_norm = grad_norm * weight
+            
+        elif opacity is not None:
+            # Fallback: simple opacity weighting (backward compatible)
             opacity_weight = opacity[update_filter].clamp(0.0, 1.0)
             grad_norm = grad_norm * opacity_weight
         

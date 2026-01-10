@@ -554,31 +554,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gt_image = viewpoint_cam.original_image.cuda()
             
             # ----------------------------------------------------------------
-            # Background-weighted loss: emphasize peripheral regions to give
-            # background/edge areas more gradient, encouraging densification
-            # there without drastically increasing total Gaussian count.
-            # This is part of GlowGS edge-aware optimization (tied to use_edge_loss).
+            # Standard pixel-wise loss: treat all regions equally for optimal PSNR
             # ----------------------------------------------------------------
-            H, W = gt_image.shape[1], gt_image.shape[2]
-            
-            if use_edge_loss:
-                # V2/V3: Use background weighting for edge-aware densification
-                background_weight_map = build_background_weight_map(H, W, alpha=0.6, device="cuda")
-                weight_map_4d = background_weight_map[None, None, :, :]
-                
-                # Weighted L1 loss
-                rgb_residual = (image - gt_image).abs()
-                weighted_rgb_residual = weight_map_4d * rgb_residual
-                Ll1 = weighted_rgb_residual.mean()
-                
-                # Weighted SSIM loss: use per-pixel dissimilarity map
-                dssim_map = ssim_raw(image, gt_image)  # [1, 1, H, W]
-                ssim_loss_weighted = (weight_map_4d * dssim_map).mean()
-            else:
-                # V0/V1: Standard 3DGS loss without background weighting
-                Ll1 = l1_loss(image, gt_image)
-                ssim_loss_weighted = 1.0 - ssim(image, gt_image)
-            
+            Ll1 = l1_loss(image, gt_image)
+            ssim_loss_weighted = 1.0 - ssim(image, gt_image)
             pixel_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss_weighted
             
             # Edge loss: unified interface for ablation studies
@@ -702,8 +681,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # -----------------------------------------------------------------
             # Keep track of max radii in image-space for pruning (always needed)
             gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-            # Pass opacity to weight gradients: solid points get full credit, transparent points penalized
-            gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, opacity=gaussians.get_opacity)
+            # Pass opacity and radii for Mass-Aware Gradient Weighting
+            gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, 
+                                              opacity=gaussians.get_opacity, radii=radii)
             
             if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                 size_threshold = 20 if iteration > opt.opacity_reset_interval else None

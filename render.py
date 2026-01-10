@@ -52,6 +52,9 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
             densify_strategy=densify_strategy,
         )
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+        
+        # Precompute attributes once for fast rendering (skip per-frame MLP inference)
+        gaussians.precompute_attributes()
 
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
