@@ -33,6 +33,7 @@ coverage.xml
 
 # -------------------- Editor settings --------------------
 .vscode/
+.github/
 .idea/
 *.sublime-project
 *.sublime-workspace
