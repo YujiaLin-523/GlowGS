@@ -893,23 +893,114 @@ class GaussianModel:
         return optimizable_tensors
 
     def prune_points(self, mask):
-        valid_points_mask = ~mask
-        optimizable_tensors = self._prune_optimizer(valid_points_mask)
-
-        self._xyz = optimizable_tensors["xyz"]
-        self._features_dc = optimizable_tensors["f_dc"]
-        self._scaling_base = optimizable_tensors["scaling_base"]
-        self._mask = optimizable_tensors["mask"]
-        self._sh_mask = optimizable_tensors["sh_mask"]
+        """
+        Prune Gaussians based on boolean mask.
         
-        # In 3DGS mode, also prune f_rest
-        if self._encoder_variant == '3dgs' and "f_rest" in optimizable_tensors:
-            self._features_rest = optimizable_tensors["f_rest"]
+        Args:
+            mask: Boolean tensor where True indicates points to REMOVE
+        """
+        # Ensure mask is on CUDA for consistency
+        if not mask.is_cuda:
+            mask = mask.cuda()
+        
+        valid_points_mask = ~mask
+        
+        if self.optimizer is None:
+            # ============================================
+            # INFERENCE MODE: No optimizer, manual pruning
+            # ============================================
+            def safe_prune(tensor, mask, name=""):
+                """Safely prune a tensor/parameter, handling all edge cases."""
+                if tensor is None:
+                    return tensor
+                if not isinstance(tensor, (torch.Tensor, nn.Parameter)):
+                    return tensor
+                if tensor.numel() == 0:
+                    return tensor
+                # Check shape compatibility
+                if len(tensor.shape) == 0 or tensor.shape[0] != mask.shape[0]:
+                    # Shape mismatch - skip this tensor
+                    return tensor
+                
+                # Ensure device match
+                mask_device = mask
+                if tensor.is_cuda and not mask.is_cuda:
+                    mask_device = mask.cuda()
+                elif not tensor.is_cuda and mask.is_cuda:
+                    mask_device = mask.cpu()
+                
+                # Perform slicing
+                pruned = tensor[mask_device]
+                
+                # Preserve type (Parameter vs Tensor)
+                if isinstance(tensor, nn.Parameter):
+                    return nn.Parameter(pruned)
+                return pruned
+            
+            # Prune core attributes
+            self._xyz = safe_prune(self._xyz, valid_points_mask, "xyz")
+            self._features_dc = safe_prune(self._features_dc, valid_points_mask, "f_dc")
+            self._scaling_base = safe_prune(self._scaling_base, valid_points_mask, "scaling_base")
+            self._mask = safe_prune(self._mask, valid_points_mask, "mask")
+            self._sh_mask = safe_prune(self._sh_mask, valid_points_mask, "sh_mask")
+            
+            # Prune f_rest if applicable
+            if self._encoder_variant == '3dgs':
+                if isinstance(self._features_rest, (torch.Tensor, nn.Parameter)) and self._features_rest.numel() > 0:
+                    self._features_rest = safe_prune(self._features_rest, valid_points_mask, "f_rest")
+            else:
+                # For encoder models, prune if it exists and matches shape
+                if isinstance(self._features_rest, torch.Tensor) and self._features_rest.numel() > 0:
+                    if self._features_rest.shape[0] == mask.shape[0]:
+                        self._features_rest = safe_prune(self._features_rest, valid_points_mask, "f_rest")
+            
+            # Prune computed attributes (from update_attributes)
+            for attr_name in ['_opacity', '_scaling', '_rotation']:
+                attr = getattr(self, attr_name, None)
+                if isinstance(attr, torch.Tensor) and attr.numel() > 0 and attr.shape[0] == mask.shape[0]:
+                    setattr(self, attr_name, safe_prune(attr, valid_points_mask, attr_name))
+            
+            # Prune precomputed cache
+            if getattr(self, '_precomputed_cache', None) is not None:
+                for k in list(self._precomputed_cache.keys()):
+                    v = self._precomputed_cache[k]
+                    if isinstance(v, torch.Tensor) and v.numel() > 0 and v.shape[0] == mask.shape[0]:
+                        self._precomputed_cache[k] = safe_prune(v, valid_points_mask, f"cache_{k}")
+            
+            # Prune training buffers ONLY if they exist and are initialized
+            # In pure inference mode, these might be uninitialized or on wrong device
+            if hasattr(self, 'xyz_gradient_accum') and isinstance(self.xyz_gradient_accum, torch.Tensor):
+                if self.xyz_gradient_accum.numel() > 0 and self.xyz_gradient_accum.shape[0] == mask.shape[0]:
+                    self.xyz_gradient_accum = safe_prune(self.xyz_gradient_accum, valid_points_mask, "grad_accum")
+            
+            if hasattr(self, 'denom') and isinstance(self.denom, torch.Tensor):
+                if self.denom.numel() > 0 and self.denom.shape[0] == mask.shape[0]:
+                    self.denom = safe_prune(self.denom, valid_points_mask, "denom")
+            
+            if hasattr(self, 'max_radii2D') and isinstance(self.max_radii2D, torch.Tensor):
+                if self.max_radii2D.numel() > 0 and self.max_radii2D.shape[0] == mask.shape[0]:
+                    self.max_radii2D = safe_prune(self.max_radii2D, valid_points_mask, "max_radii2D")
+            
+        else:
+            # ============================================
+            # TRAINING MODE: Use optimizer-aware pruning
+            # ============================================
+            optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
-        self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
+            self._xyz = optimizable_tensors["xyz"]
+            self._features_dc = optimizable_tensors["f_dc"]
+            self._scaling_base = optimizable_tensors["scaling_base"]
+            self._mask = optimizable_tensors["mask"]
+            self._sh_mask = optimizable_tensors["sh_mask"]
+            
+            # In 3DGS mode, also prune f_rest
+            if self._encoder_variant == '3dgs' and "f_rest" in optimizable_tensors:
+                self._features_rest = optimizable_tensors["f_rest"]
 
-        self.denom = self.denom[valid_points_mask]
-        self.max_radii2D = self.max_radii2D[valid_points_mask]
+            # Training buffers - these MUST exist and match in training mode
+            self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
+            self.denom = self.denom[valid_points_mask]
+            self.max_radii2D = self.max_radii2D[valid_points_mask]
         
         # Clear cached contracted_xyz since xyz changed
         if hasattr(self, '_cached_contracted_xyz'):
