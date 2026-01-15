@@ -1149,11 +1149,11 @@ class GaussianModel:
         
         # Size-Aware Pruning: penalize large semi-transparent volumes
         # Theory: Large low-opacity Gaussians cause overdraw and volumetric artifacts.
-        # - Small radius (<20px): details/spokes, keep even if semi-transparent (>0.005)
-        # - Large radius (>20px): must be solid (>0.05) or get pruned
-        # This forces the model to create compact surfaces instead of volumetric fog.
-        large_radius_mask = self.max_radii2D > 20.0
-        semi_transparent_mask = opacity < 0.05
+        # - Small radius (<50px): details/spokes/background, keep even if semi-transparent
+        # - Large radius (>50px): must be solid (>0.005) or get pruned
+        # TUNED: Relaxed from (20px, 0.05) to (50px, 0.005) to preserve background/sky
+        large_radius_mask = self.max_radii2D > 50.0
+        semi_transparent_mask = opacity < 0.005
         volumetric_bloat = torch.logical_and(large_radius_mask, semi_transparent_mask)
         prune_mask = torch.logical_or(prune_mask, volumetric_bloat)
         
@@ -1261,7 +1261,8 @@ class GaussianModel:
             r = radii[update_filter].float().unsqueeze(-1).clamp(min=1.0)  # [N_visible, 1]
             
             # Hyperparameter: characteristic radius scale (typical detail size in pixels)
-            tau = 50.0
+            # TUNED: Increased from 50 to 100 to reduce under-densification of large surfaces
+            tau = 100.0
             
             # Visibility boost: sqrt(alpha) - helps small/thin structures with low opacity
             visibility_boost = torch.sqrt(alpha)

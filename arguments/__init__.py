@@ -75,8 +75,9 @@ class ModelParams(ParamGroup):
         self.width = 64              # MLP hidden width
         self.depth = 2               # MLP depth
         # GeoEncoder (tri-plane) parameters - tuned for size/quality balance
-        self.geo_resolution = 48     # Tri-plane resolution (48x48, reduced from 64 for smaller model)
-        self.geo_rank = 6            # Low-rank factorization rank (reduced from 8)
+        # TUNED: Increased resolution (48→96) and rank (6→12) for better spatial guidance
+        self.geo_resolution = 96     # Tri-plane resolution (96x96, ~2MB VRAM)
+        self.geo_rank = 12           # Low-rank factorization rank (improved capacity)
         self.geo_channels = 8        # Output feature channels
         self.feature_role_split = True  # Enable geometry/appearance feature disentanglement
         
