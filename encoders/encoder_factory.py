@@ -19,6 +19,7 @@ def create_gaussian_encoder(
     geo_resolution: int = 48,
     geo_rank: int = 6,
     geo_channels: int = 8,
+    feature_mod_type: str = "film",
 ):
     """
     Factory function to create encoder based on variant type.
@@ -34,6 +35,7 @@ def create_gaussian_encoder(
         geo_resolution: Tri-plane resolution for VM encoder
         geo_rank: Low-rank factorization rank
         geo_channels: VM encoder output channels
+        feature_mod_type: 'film' (FiLM modulation) or 'concat' (naive concatenation)
     
     Returns:
         encoder: Encoder instance with consistent interface
@@ -44,13 +46,16 @@ def create_gaussian_encoder(
     if variant == "hybrid":
         # Full GlowGS: Hash grid + VM tri-plane with geometry/appearance role split
         hash_encoder = tcnn.Encoding(n_input_dims=3, encoding_config=encoding_config)
+        # Determine if FiLM modulation is enabled (feature_mod_type='film')
+        use_film = (feature_mod_type == 'film')
         encoder = GeometryAppearanceEncoder(
             hash_encoder=hash_encoder,
             out_dim=hash_encoder.n_output_dims,
             geo_channels=geo_channels,
             geo_resolution=geo_resolution,
             geo_rank=geo_rank,
-            feature_role_split=True  # Enable disentanglement
+            feature_role_split=True,  # Enable disentanglement
+            use_film=use_film,        # FiLM vs concat mode
         )
         return encoder
     

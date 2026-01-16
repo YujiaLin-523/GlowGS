@@ -19,8 +19,13 @@ class GroupParams:
 class ParamGroup:
     def __init__(self, parser: ArgumentParser, name : str, fill_none = False):
         group = parser.add_argument_group(name)
-        # Ablation switches that need explicit True/False values
-        ablation_switches = {'use_hybrid_encoder', 'use_edge_loss', 'use_feature_densify'}
+        # String choice parameters for ECCV ablation study (A→B→C→D)
+        choice_params = {
+            'feature_mod_type': ['concat', 'film'],
+            'densification_mode': ['standard', 'mass_aware']
+        }
+        # Boolean parameters that need explicit True/False parsing (not just presence)
+        explicit_bool_params = {'use_edge_loss'}
         
         for key, value in vars(self).items():
             shorthand = False
@@ -31,24 +36,28 @@ class ParamGroup:
             value = value if not fill_none else None 
             if shorthand:
                 if t == bool:
-                    if key in ablation_switches:
-                        # Ablation switches: require explicit True/False value
-                        group.add_argument("--" + key, ("-" + key[0:1]), default=value, 
-                                         type=lambda x: (str(x).lower() == 'true'))
+                    if key in explicit_bool_params:
+                        # Explicit True/False parsing for ablation switches
+                        group.add_argument("--" + key, ("-" + key[0:1]), default=value,
+                                         type=lambda x: str(x).lower() in ('true', '1', 'yes'))
                     else:
-                        # Regular bool flags: presence = True
                         group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
+                elif key in choice_params:
+                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, 
+                                     type=str, choices=choice_params[key])
                 else:
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, type=t)
             else:
                 if t == bool:
-                    if key in ablation_switches:
-                        # Ablation switches: require explicit True/False value
-                        group.add_argument("--" + key, default=value, 
-                                         type=lambda x: (str(x).lower() == 'true'))
+                    if key in explicit_bool_params:
+                        # Explicit True/False parsing for ablation switches
+                        group.add_argument("--" + key, default=value,
+                                         type=lambda x: str(x).lower() in ('true', '1', 'yes'))
                     else:
-                        # Regular bool flags: presence = True
                         group.add_argument("--" + key, default=value, action="store_true")
+                elif key in choice_params:
+                    group.add_argument("--" + key, default=value, 
+                                     type=str, choices=choice_params[key])
                 else:
                     group.add_argument("--" + key, default=value, type=t)
 
@@ -81,10 +90,11 @@ class ModelParams(ParamGroup):
         self.geo_channels = 8        # Output feature channels
         self.feature_role_split = True  # Enable geometry/appearance feature disentanglement
         
-        # Ablation switches - moved to ModelParams because they affect model structure
-        self.use_hybrid_encoder = True     # Enable hybrid hash+VM encoder with role split
-        self.use_edge_loss = True          # Enable unified edge-aware gradient loss
-        self.use_feature_densify = True    # Enable feature-weighted densification
+        # Ablation Controls (A→B→C→D additive study)
+        # A: Concat (baseline) → B: +FiLM → C: +MassAware → D: +EdgeLoss (full GlowGS)
+        self.feature_mod_type = "film"        # 'concat' (naive fusion) or 'film' (FiLM modulation)
+        self.densification_mode = "mass_aware"  # 'standard' (3DGS) or 'mass_aware' (GlowGS)
+        self.use_edge_loss = True             # Enable unified edge-aware gradient loss
         
         super().__init__(parser, "Loading Parameters", sentinel)
 

@@ -119,9 +119,10 @@ def save_ablation_config(output_dir, dataset, opt, pipe):
     """Save ablation study configuration to YAML file for experiment tracking."""
     config = {
         'ablation_settings': {
-            'use_hybrid_encoder': getattr(dataset, 'use_hybrid_encoder', True),
+            # Additive ablation controls (A→B→C→D)
+            'feature_mod_type': getattr(dataset, 'feature_mod_type', 'film'),
+            'densification_mode': getattr(dataset, 'densification_mode', 'mass_aware'),
             'use_edge_loss': getattr(dataset, 'use_edge_loss', True),
-            'use_feature_densify': getattr(dataset, 'use_feature_densify', True),
         },
         'training_hyperparameters': {
             'iterations': opt.iterations,
@@ -164,36 +165,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     debug_full_gap = pipe.debug_full_gap or os.getenv("DEBUG_FULL_GAP", "0") in {"1", "true", "True"}
     
     # ========================================================================
-    # Map three binary ablation switches to internal implementation modes
+    # Additive ablation controls (A→B→C→D)
+    # A: Concat (baseline) - naive feature fusion
+    # B: +FiLM - add FiLM modulation (geometry guides appearance)
+    # C: +MassAware - add mass-aware densification
+    # D: +EdgeLoss - add edge-aware gradient loss (full GlowGS)
     # ========================================================================
-    use_hybrid_encoder = getattr(dataset, 'use_hybrid_encoder', True)
+    feature_mod_type = getattr(dataset, 'feature_mod_type', 'film')  # 'concat' or 'film'
+    densification_mode = getattr(dataset, 'densification_mode', 'mass_aware')  # 'standard' or 'mass_aware'
     use_edge_loss = getattr(dataset, 'use_edge_loss', True)
-    use_feature_densify = getattr(dataset, 'use_feature_densify', True)
     
-    # Map encoder switch: hybrid (on) or 3dgs (off)
-    encoder_variant = 'hybrid' if use_hybrid_encoder else '3dgs'
+    # Always use hybrid encoder (GlowGS core architecture)
+    encoder_variant = 'hybrid'
     
-    # Map edge loss switch: sobel_weighted (on) or none (off)
+    # Map edge loss setting
     edge_loss_mode = 'sobel_weighted' if use_edge_loss else 'none'
     
-    # Map densification switch: feature_weighted (on) or original_3dgs (off)
-    densify_strategy = 'feature_weighted' if use_feature_densify else 'original_3dgs'
+    # Map densification mode to internal strategy name
+    densify_strategy = 'feature_weighted' if densification_mode == 'mass_aware' else 'original_3dgs'
     
-    # ========================================================================
-    # EQUIVALENCE FIX: Force edge_loss_mode into opt for consistent access
-    # Ensures edge loss is truly disabled in V0 config (all innovations off)
-    # ========================================================================
+    # Store feature_mod_type in dataset for encoder to use
+    dataset.feature_mod_type = feature_mod_type
+    
+    # Store edge_loss_mode in opt for consistent access
     opt.edge_loss_mode = edge_loss_mode
-    
-    # EQUIVALENCE FIX: V0 baseline should disable all GlowGS-specific losses
-    if not use_hybrid_encoder and not use_edge_loss and not use_feature_densify:
-        # V0: 3DGS baseline - zero out all new loss terms
-        opt.lambda_mask = 0.0
-        opt.lambda_sh_mask = 0.0
-        opt.lambda_grad = 0.0
-        opt.enable_detail_aware = False
-        if pipe.debug_equiv:
-            print("[Equivalence] V0 detected: disabled lambda_mask/sh_mask/grad, detail_aware")
     
     # Save ablation study configuration for experiment tracking
     save_ablation_config(dataset.model_path, dataset, opt, pipe)
@@ -202,7 +197,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         dataset.sh_degree, dataset.hash_size, dataset.width, dataset.depth, 
         dataset.feature_role_split, dataset.geo_resolution, dataset.geo_rank, dataset.geo_channels,
         encoder_variant=encoder_variant,
-        densify_strategy=densify_strategy
+        densify_strategy=densify_strategy,
+        feature_mod_type=feature_mod_type,
     )
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
@@ -310,24 +306,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
-    # Print ablation study configuration summary
+    # Print ablation study configuration summary (ECCV A→B→C→D)
     print("\n" + "=" * 90)
     print("  ABLATION STUDY CONFIGURATION")
     print("-" * 90)
-    print(f"  [GlowGS] use_hybrid_encoder    : {use_hybrid_encoder}")
+    print(f"  [GlowGS] feature_mod_type      : {feature_mod_type}")
+    print(f"  [GlowGS] densification_mode    : {densification_mode}")
     print(f"  [GlowGS] use_edge_loss         : {use_edge_loss}")
-    print(f"  [GlowGS] use_feature_densify   : {use_feature_densify}")
     print("-" * 90)
     
-    # Derive variant label
-    if not use_hybrid_encoder and not use_edge_loss and not use_feature_densify:
-        variant_label = "V0: 3DGS Baseline"
-    elif use_hybrid_encoder and not use_edge_loss and not use_feature_densify:
-        variant_label = "V1: +Hybrid Encoder"
-    elif use_hybrid_encoder and use_edge_loss and not use_feature_densify:
-        variant_label = "V2: +Edge Loss"
-    elif use_hybrid_encoder and use_edge_loss and use_feature_densify:
-        variant_label = "V3: Full GlowGS"
+    # Derive variant label (Additive ablation study A→B→C→D)
+    if feature_mod_type == 'concat' and densification_mode == 'standard' and not use_edge_loss:
+        variant_label = "A: Concat (Baseline)"
+    elif feature_mod_type == 'film' and densification_mode == 'standard' and not use_edge_loss:
+        variant_label = "B: +FiLM Modulation"
+    elif feature_mod_type == 'film' and densification_mode == 'mass_aware' and not use_edge_loss:
+        variant_label = "C: +Mass-Aware Densify"
+    elif feature_mod_type == 'film' and densification_mode == 'mass_aware' and use_edge_loss:
+        variant_label = "D: Full GlowGS"
     else:
         variant_label = "Custom"
     
@@ -735,6 +731,117 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if profiler:
         profiler.stop()
         print(f"[Profiler] Trace captured. Logs stored at {profiler_logdir}")
+
+    # ========================================================================
+    # Final Evaluation & Stats Export (for ECCV ablation study)
+    # ========================================================================
+    print("\n" + "=" * 90)
+    print("  FINAL EVALUATION & STATS EXPORT")
+    print("=" * 90)
+    
+    # Import required modules for final evaluation
+    from lpipsPyTorch import lpips
+    import json
+    import time
+    
+    with torch.no_grad():
+        # Get test cameras for final evaluation
+        test_cams = scene.getTestCameras()
+        
+        if len(test_cams) > 0:
+            # Final metrics computation
+            final_psnrs = []
+            final_ssims = []
+            final_lpipss = []
+            
+            # Precompute attributes for fast rendering
+            gaussians.precompute_attributes()
+            
+            # Render all test views and compute metrics
+            for viewpoint in test_cams:
+                image = torch.clamp(render(viewpoint, gaussians, pipe, background)["render"], 0.0, 1.0)
+                gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                
+                final_psnrs.append(psnr(image.unsqueeze(0), gt_image.unsqueeze(0)).mean().item())
+                final_ssims.append(ssim_raw(image.unsqueeze(0), gt_image.unsqueeze(0)).mean().item())
+                final_lpipss.append(lpips(image.unsqueeze(0), gt_image.unsqueeze(0), net_type='vgg').item())
+            
+            avg_psnr = sum(final_psnrs) / len(final_psnrs)
+            avg_ssim = sum(final_ssims) / len(final_ssims)
+            avg_lpips = sum(final_lpipss) / len(final_lpipss)
+            
+            # FPS measurement (warm up + benchmark)
+            torch.cuda.synchronize()
+            warmup_frames = 10
+            for _ in range(warmup_frames):
+                _ = render(test_cams[0], gaussians, pipe, background)
+            torch.cuda.synchronize()
+            
+            # Benchmark
+            benchmark_frames = 50
+            start_time = time.perf_counter()
+            for i in range(benchmark_frames):
+                _ = render(test_cams[i % len(test_cams)], gaussians, pipe, background)
+            torch.cuda.synchronize()
+            end_time = time.perf_counter()
+            fps = benchmark_frames / (end_time - start_time)
+            
+            # Model size calculation (point_cloud.ply file)
+            ply_path = os.path.join(dataset.model_path, "point_cloud", f"iteration_{opt.iterations}", "point_cloud.ply")
+            if os.path.exists(ply_path):
+                size_mb = os.path.getsize(ply_path) / (1024 * 1024)
+            else:
+                # Fallback: estimate from number of Gaussians
+                num_gaussians = gaussians.get_xyz.shape[0]
+                size_mb = num_gaussians * 60 / (1024 * 1024)  # ~60 bytes per Gaussian estimate
+            
+            # Extract scene name from source_path
+            scene_name = os.path.basename(dataset.source_path.rstrip('/'))
+            
+            # Determine method name from ECCV ablation config (A→B→C→D)
+            if feature_mod_type == 'concat' and densification_mode == 'standard' and not use_edge_loss:
+                method_name = "A_Concat"
+            elif feature_mod_type == 'film' and densification_mode == 'standard' and not use_edge_loss:
+                method_name = "B_FiLM"
+            elif feature_mod_type == 'film' and densification_mode == 'mass_aware' and not use_edge_loss:
+                method_name = "C_MassAware"
+            elif feature_mod_type == 'film' and densification_mode == 'mass_aware' and use_edge_loss:
+                method_name = "D_Full"
+            else:
+                method_name = "Custom"
+            
+            # Create stats dictionary
+            stats = {
+                "scene": scene_name,
+                "method": method_name,
+                "psnr": round(avg_psnr, 4),
+                "ssim": round(avg_ssim, 4),
+                "lpips": round(avg_lpips, 4),
+                "size_mb": round(size_mb, 2),
+                "fps": round(fps, 1),
+                "num_gaussians": gaussians.get_xyz.shape[0],
+                "config": {
+                    "feature_mod_type": feature_mod_type,
+                    "densification_mode": densification_mode,
+                    "use_edge_loss": use_edge_loss,
+                }
+            }
+            
+            # Save stats.json
+            stats_path = os.path.join(dataset.model_path, "stats.json")
+            with open(stats_path, 'w') as f:
+                json.dump(stats, f, indent=2)
+            
+            print(f"\n  Scene: {scene_name}")
+            print(f"  Method: {method_name}")
+            print(f"  PSNR: {avg_psnr:.4f}  |  SSIM: {avg_ssim:.4f}  |  LPIPS: {avg_lpips:.4f}")
+            print(f"  Size: {size_mb:.2f} MB  |  FPS: {fps:.1f}")
+            print(f"  Gaussians: {gaussians.get_xyz.shape[0]:,}")
+            print(f"\n  Stats saved to: {stats_path}")
+        else:
+            print("  [WARN] No test cameras available for final evaluation")
+    
+    print("=" * 90 + "\n")
 
 def prepare_output_and_logger(args):    
     if not args.model_path:

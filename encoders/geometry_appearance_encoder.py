@@ -37,6 +37,7 @@ class GeometryAppearanceEncoder(nn.Module):
         geo_resolution (int): Tri-plane spatial resolution.
         geo_rank (int): Low-rank factorization rank.
         feature_role_split (bool): Enable geometry/appearance disentanglement.
+        use_film (bool): Use FiLM modulation (True) or naive concatenation (False).
     """
     
     def __init__(
@@ -46,12 +47,14 @@ class GeometryAppearanceEncoder(nn.Module):
         geo_channels: int = 8,
         geo_resolution: int = 64,
         geo_rank: int = 8,
-        feature_role_split: bool = True
+        feature_role_split: bool = True,
+        use_film: bool = True,
     ):
         super().__init__()
         
         self.hash_encoder = hash_encoder
         self.hash_dim = hash_encoder.n_output_dims
+        self.use_film = use_film
         
         self.geo_encoder = GeoEncoder(
             resolution=geo_resolution,
@@ -61,15 +64,20 @@ class GeometryAppearanceEncoder(nn.Module):
         )
         self.geo_dim = geo_channels
         
-        # Feature Modulation (FiLM) Generators
+        # Feature Modulation (FiLM) Generators - only used when use_film=True
         # Instead of concatenating large features, we use lightweight VM features 
         # to modulate the high-frequency Hash Grid features.
         # Input: geo_dim (VM context) -> Output: hash_dim * 2 (Scale + Shift)
         self.geometry_modulator = nn.Linear(self.geo_dim, self.hash_dim * 2, bias=True)
         self.appearance_modulator = nn.Linear(self.geo_dim, self.hash_dim * 2, bias=True)
 
-        # Fallback fusion layer for non-split mode (preserve original behavior)
+        # Fallback fusion layer for non-split mode or concat mode
         self.fusion_layer = nn.Linear(self.hash_dim + self.geo_dim, out_dim, bias=True)
+        
+        # Projection layers for concat mode (when use_film=False)
+        # Map concatenated features [hash_dim + geo_dim] -> [out_dim] for each branch
+        self.geometry_proj_concat = nn.Linear(self.hash_dim + self.geo_dim, out_dim, bias=True)
+        self.appearance_proj_concat = nn.Linear(self.hash_dim + self.geo_dim, out_dim, bias=True)
 
         # Initialize modulators for identity mapping (scale=0, shift=0)
         # This ensures training starts with pure Hash Grid behavior, gradually introducing VM influence
@@ -142,8 +150,31 @@ class GeometryAppearanceEncoder(nn.Module):
     def _forward_split(self, hash_latent: torch.Tensor, geo_latent: torch.Tensor):
         """
         Internal forward logic for feature_role_split mode.
+        Dispatches to FiLM or concat based on use_film flag.
         """
-        return self._forward_split_compiled(hash_latent, geo_latent)
+        if self.use_film:
+            return self._forward_split_compiled(hash_latent, geo_latent)
+        else:
+            return self._forward_concat(hash_latent, geo_latent)
+    
+    def _forward_concat(self, hash_latent: torch.Tensor, geo_latent: torch.Tensor):
+        """
+        Naive concatenation mode (Model A baseline).
+        Simply concatenates hash and geo features, then projects to role-specific outputs.
+        """
+        combined = torch.cat([hash_latent, geo_latent], dim=-1)  # [N, hash_dim + geo_dim]
+        
+        # Project to role-specific dimensions
+        geometry_latent = self.geometry_proj_concat(combined)
+        appearance_latent = self.appearance_proj_concat(combined)
+        shared_latent = self.fusion_layer(combined)
+        
+        # Clamp for stability
+        geometry_latent = torch.clamp(geometry_latent, -10.0, 10.0)
+        appearance_latent = torch.clamp(appearance_latent, -10.0, 10.0)
+        shared_latent = torch.clamp(shared_latent, -10.0, 10.0)
+        
+        return shared_latent, geometry_latent, appearance_latent
     
     def forward(
         self, 

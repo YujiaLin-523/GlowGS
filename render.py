@@ -38,18 +38,20 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
     with torch.no_grad():
-        # Map ablation switches (saved in cfg_args) to encoder/densify choices
-        use_hybrid_encoder = getattr(dataset, 'use_hybrid_encoder', True)
-        use_feature_densify = getattr(dataset, 'use_feature_densify', True)
+        # ECCV Ablation Config (A→B→C→D)
+        feature_mod_type = getattr(dataset, 'feature_mod_type', 'film')
+        densification_mode = getattr(dataset, 'densification_mode', 'mass_aware')
 
-        encoder_variant = 'hybrid' if use_hybrid_encoder else '3dgs'
-        densify_strategy = 'feature_weighted' if use_feature_densify else 'original_3dgs'
+        # Always use hybrid encoder (GlowGS architecture)
+        encoder_variant = 'hybrid'
+        densify_strategy = 'feature_weighted' if densification_mode == 'mass_aware' else 'original_3dgs'
 
         gaussians = GaussianModel(
             dataset.sh_degree, dataset.hash_size, dataset.width, dataset.depth, 
             dataset.feature_role_split, dataset.geo_resolution, dataset.geo_rank, dataset.geo_channels,
             encoder_variant=encoder_variant,
             densify_strategy=densify_strategy,
+            feature_mod_type=feature_mod_type,
         )
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         

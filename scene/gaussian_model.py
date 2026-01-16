@@ -90,6 +90,7 @@ class GaussianModel:
             geo_resolution=self._geo_resolution,
             geo_rank=self._geo_rank,
             geo_channels=self._geo_channels,
+            feature_mod_type=self._feature_mod_type,
         )
         # Move encoder and its submodules to GPU
         self._grid = self._grid.cuda()
@@ -127,13 +128,14 @@ class GaussianModel:
 
     def __init__(self, sh_degree: int, hash_size=19, width=64, depth=2, feature_role_split=True,
                  geo_resolution=48, geo_rank=6, geo_channels=8, encoder_variant="hybrid",
-                 densify_strategy="feature_weighted"):
+                 densify_strategy="feature_weighted", feature_mod_type="film"):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree
         # Store encoder variant and densification strategy for ablation studies
         self._encoder_variant = encoder_variant
         self._densify_strategy = densify_strategy
         self._feature_role_split = feature_role_split  # Geometry/appearance disentanglement flag
+        self._feature_mod_type = feature_mod_type  # 'film' or 'concat' for ECCV ablation
         # Store GeoEncoder parameters for serialization/deserialization
         self._geo_resolution = geo_resolution
         self._geo_rank = geo_rank
@@ -1255,8 +1257,11 @@ class GaussianModel:
         """
         grad_norm = torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         
-        if opacity is not None and radii is not None:
-            # Mass-Aware Gradient Weighting
+        # Only apply Mass-Aware weighting when densify_strategy is 'feature_weighted'
+        use_mass_aware = (self._densify_strategy == 'feature_weighted')
+        
+        if use_mass_aware and opacity is not None and radii is not None:
+            # Mass-Aware Gradient Weighting (GlowGS innovation)
             alpha = opacity[update_filter].clamp(0.01, 1.0)  # [N_visible, 1]
             r = radii[update_filter].float().unsqueeze(-1).clamp(min=1.0)  # [N_visible, 1]
             
@@ -1275,10 +1280,11 @@ class GaussianModel:
             weight = visibility_boost * mass_penalty
             grad_norm = grad_norm * weight
             
-        elif opacity is not None:
+        elif opacity is not None and use_mass_aware:
             # Fallback: simple opacity weighting (backward compatible)
             opacity_weight = opacity[update_filter].clamp(0.0, 1.0)
             grad_norm = grad_norm * opacity_weight
+        # else: Standard 3DGS densification - no weighting applied
         
         self.xyz_gradient_accum[update_filter] += grad_norm
         self.denom[update_filter] += 1

@@ -11,19 +11,22 @@ import time
 
 def measure_fps(dataset: ModelParams, iteration: int, pipeline: PipelineParams, skip_train: bool, skip_test: bool, optimize: bool = False, prune_opacity_th: float = 0.01, force_sh: int = -1):
     with torch.no_grad():
-        # --- GlowGS 特有配置逻辑 ---
-        use_hybrid_encoder = getattr(dataset, 'use_hybrid_encoder', True)
-        use_feature_densify = getattr(dataset, 'use_feature_densify', True)
-        encoder_variant = 'hybrid' if use_hybrid_encoder else '3dgs'
-        densify_strategy = 'feature_weighted' if use_feature_densify else 'original_3dgs'
+        # --- ECCV Ablation Config (A→B→C→D) ---
+        feature_mod_type = getattr(dataset, 'feature_mod_type', 'film')
+        densification_mode = getattr(dataset, 'densification_mode', 'mass_aware')
         
-        print(f"[Config] Encoder: {encoder_variant}, Densify: {densify_strategy}")
+        # Always use hybrid encoder (GlowGS architecture)
+        encoder_variant = 'hybrid'
+        densify_strategy = 'feature_weighted' if densification_mode == 'mass_aware' else 'original_3dgs'
+        
+        print(f"[Config] Encoder: {encoder_variant}, Densify: {densify_strategy}, ModType: {feature_mod_type}")
 
         gaussians = GaussianModel(
             dataset.sh_degree, dataset.hash_size, dataset.width, dataset.depth, 
             dataset.feature_role_split, dataset.geo_resolution, dataset.geo_rank, dataset.geo_channels,
             encoder_variant=encoder_variant,
             densify_strategy=densify_strategy,
+            feature_mod_type=feature_mod_type,
         )
         # ---------------------------
 
