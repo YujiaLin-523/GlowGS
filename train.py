@@ -24,6 +24,8 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+import subprocess
+import shutil
 
 
 def _is_true_env(var_name: str) -> bool:
@@ -770,30 +772,53 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             avg_ssim = sum(final_ssims) / len(final_ssims)
             avg_lpips = sum(final_lpipss) / len(final_lpipss)
             
-            # FPS measurement (warm up + benchmark)
-            torch.cuda.synchronize()
-            warmup_frames = 10
-            for _ in range(warmup_frames):
-                _ = render(test_cams[0], gaussians, pipe, background)
-            torch.cuda.synchronize()
+            # FPS measurement via external script (fps_test.py)
+            print("Measuring FPS via fps_test.py...")
+            fps = 0.0
+            try:
+                fps_cmd = [sys.executable, "fps_test.py", "-m", dataset.model_path, "--iteration", str(opt.iterations), "--quiet", "--skip_train", "--skip_test"]
+                result = subprocess.run(fps_cmd, capture_output=True, text=True, cwd=os.getcwd())
+                if result.returncode != 0:
+                     print(f"fps_test.py failed with return code {result.returncode}")
+                     print(result.stderr)
+                else:
+                    import re
+                    match = re.search(r"Average FPS\s*:\s*([\d\.]+)", result.stdout)
+                    if match:
+                        fps = float(match.group(1))
+                        print(f"  Parsed FPS: {fps}")
+                    else:
+                        print("  Could not parse FPS from output.")
+                        print(result.stdout)
+            except Exception as e:
+                print(f"Error running fps_test.py: {e}")
             
-            # Benchmark
-            benchmark_frames = 50
-            start_time = time.perf_counter()
-            for i in range(benchmark_frames):
-                _ = render(test_cams[i % len(test_cams)], gaussians, pipe, background)
-            torch.cuda.synchronize()
-            end_time = time.perf_counter()
-            fps = benchmark_frames / (end_time - start_time)
+            # Model size calculation (GPCC compressed)
+            print("Computing compressed model size (GPCC)...")
+            from utils.gpcc_utils import encode_xyz
             
-            # Model size calculation (point_cloud.ply file)
-            ply_path = os.path.join(dataset.model_path, "point_cloud", f"iteration_{opt.iterations}", "point_cloud.ply")
-            if os.path.exists(ply_path):
-                size_mb = os.path.getsize(ply_path) / (1024 * 1024)
-            else:
-                # Fallback: estimate from number of Gaussians
-                num_gaussians = gaussians.get_xyz.shape[0]
-                size_mb = num_gaussians * 60 / (1024 * 1024)  # ~60 bytes per Gaussian estimate
+            size_mb = 0.0
+            try:
+                temp_dir = os.path.join(dataset.model_path, "gpcc_temp")
+                os.makedirs(temp_dir, exist_ok=True)
+                
+                xyz = gaussians.get_xyz.detach().cpu().numpy()
+                encode_xyz(xyz, temp_dir, show=False)
+                
+                bin_path = os.path.join(temp_dir, "xyz.bin")
+                if os.path.exists(bin_path):
+                    size_mb = os.path.getsize(bin_path) / (1024 * 1024)
+                    print(f"  Compressed Size: {size_mb:.2f} MB")
+                else:
+                    print("  Compression output xyz.bin not found.")
+                
+                shutil.rmtree(temp_dir)
+            except Exception as e:
+                print(f"Error computing compressed size: {e}")
+                # Fallback to PLY size if compression fails
+                ply_path = os.path.join(dataset.model_path, "point_cloud", f"iteration_{opt.iterations}", "point_cloud.ply")
+                if os.path.exists(ply_path):
+                    size_mb = os.path.getsize(ply_path) / (1024 * 1024)
             
             # Extract scene name from source_path
             scene_name = os.path.basename(dataset.source_path.rstrip('/'))

@@ -29,9 +29,6 @@ set -e  # Exit on error
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Conda environment (modify if using a different env name)
-CONDA_ENV="glowgs"
-
 OUTPUT_BASE="output/ablation_study"
 LOG_DIR="$OUTPUT_BASE/logs"
 RESULTS_CSV="$OUTPUT_BASE/ablation_results.csv"
@@ -47,12 +44,17 @@ SAVE_ITERATIONS="30000"
 
 # Parse command line arguments
 DRY_RUN=false
+FORCE=false
 SCENES=("${ALL_SCENES[@]}")
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --dry-run)
             DRY_RUN=true
+            shift
+            ;;
+        --force|-f)
+            FORCE=true
             shift
             ;;
         --scenes)
@@ -74,18 +76,23 @@ done
 # Safety: Clean up old experiments (with warning)
 # ==============================================================================
 if [ -d "$OUTPUT_BASE" ]; then
-    echo ""
-    echo "========================================================================"
-    echo "  ⚠️  WARNING: Existing ablation study found at $OUTPUT_BASE"
-    echo "========================================================================"
-    echo ""
-    read -p "Delete and start fresh? (y/N): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        echo "[INFO] Removing old experiments..."
+    if [ "$FORCE" = true ]; then
+        echo "[INFO] Force mode: Removing old experiments..."
         rm -rf "$OUTPUT_BASE"
     else
-        echo "[INFO] Keeping existing experiments. New runs will overwrite matching configs."
+        echo ""
+        echo "========================================================================"
+        echo "  ⚠️  WARNING: Existing ablation study found at $OUTPUT_BASE"
+        echo "========================================================================"
+        echo ""
+        read -p "Delete and start fresh? (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            echo "[INFO] Removing old experiments..."
+            rm -rf "$OUTPUT_BASE"
+        else
+            echo "[INFO] Keeping existing experiments. New runs will overwrite matching configs."
+        fi
     fi
 fi
 
@@ -169,10 +176,22 @@ run_experiment() {
     echo "  Log: $log_file"
     echo ""
     
-    # Construct training command (ECCV ablation: 3 parameters)
-    local cmd="conda run -n $CONDA_ENV python train.py \
-        -s $scene_path \
-        -m $output_dir \
+    if [ "$DRY_RUN" = true ]; then
+        echo "[DRY RUN] python -u train.py -s $scene_path -m $output_dir --iterations $ITERATIONS --eval --feature_mod_type $mod_type --densification_mode $densify_mode --use_edge_loss $edge_loss --test_iterations $TEST_ITERATIONS --save_iterations $SAVE_ITERATIONS $pcd_arg"
+        echo ""
+        return 0
+    fi
+    
+    # Run training with unbuffered output, visible in terminal AND logged to file
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════════════════╗"
+    echo "║  [TRAIN] Starting: $scene / $model"                                  ║
+    echo "╚══════════════════════════════════════════════════════════════════════╝"
+    echo ""
+    
+    if ! python -u train.py \
+        -s "$scene_path" \
+        -m "$output_dir" \
         --iterations $ITERATIONS \
         --eval \
         --feature_mod_type $mod_type \
@@ -180,30 +199,30 @@ run_experiment() {
         --use_edge_loss $edge_loss \
         --test_iterations $TEST_ITERATIONS \
         --save_iterations $SAVE_ITERATIONS \
-        $pcd_arg"
-    
-    if [ "$DRY_RUN" = true ]; then
-        echo "[DRY RUN] $cmd"
+        $pcd_arg 2>&1 | tee "$log_file"; then
         echo ""
-        return 0
-    fi
-    
-    # Run training
-    echo "[TRAIN] Starting training..."
-    if ! $cmd > "$log_file" 2>&1; then
         echo "[ERROR] Training failed for $scene / $model. Check $log_file"
         return 1
     fi
     
+    echo ""
+    echo "  ✓ Training finished: $scene / $model"
+    echo ""
+    
     # Run render.py
-    echo "[RENDER] Rendering test views..."
-    conda run -n $CONDA_ENV python render.py -m "$output_dir" >> "$log_file" 2>&1 || true
+    echo "[RENDER] Rendering test views for $scene / $model ..."
+    python -u render.py -m "$output_dir" 2>&1 | tee -a "$log_file"
+    echo "  ✓ Rendering finished"
     
     # Run metrics.py  
-    echo "[METRICS] Computing final metrics..."
-    conda run -n $CONDA_ENV python metrics.py -m "$output_dir" >> "$log_file" 2>&1 || true
+    echo "[METRICS] Computing final metrics for $scene / $model ..."
+    python -u metrics.py -m "$output_dir" 2>&1 | tee -a "$log_file"
+    echo "  ✓ Metrics computed"
     
-    echo "[DONE] $scene / $model completed"
+    echo ""
+    echo "══════════════════════════════════════════════════════════════════════"
+    echo "  ✅ COMPLETED: $scene / $model"
+    echo "══════════════════════════════════════════════════════════════════════"
     echo ""
 }
 
