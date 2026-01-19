@@ -19,7 +19,25 @@ from utils.system_utils import searchForMaxIteration
 
 def convert(dataset : ModelParams, iteration : int):
     with torch.no_grad():
-        gaussians = GaussianModel(dataset.sh_degree, dataset.hash_size, dataset.width, dataset.depth)
+        # Mirror render/train instantiation to respect saved ablation config
+        feature_mod_type = getattr(dataset, 'feature_mod_type', 'film')
+        densification_mode = getattr(dataset, 'densification_mode', 'mass_aware')
+        encoder_variant = 'hybrid'
+        densify_strategy = 'feature_weighted' if densification_mode == 'mass_aware' else 'original_3dgs'
+
+        gaussians = GaussianModel(
+            dataset.sh_degree,
+            dataset.hash_size,
+            dataset.width,
+            dataset.depth,
+            dataset.feature_role_split,
+            dataset.geo_resolution,
+            dataset.geo_rank,
+            dataset.geo_channels,
+            encoder_variant=encoder_variant,
+            densify_strategy=densify_strategy,
+            feature_mod_type=feature_mod_type,
+        )
 
         if iteration:
             if iteration == -1:

@@ -1482,7 +1482,31 @@ class GaussianModel:
                     grid_state_dict[orig_key] = torch.from_numpy(np.asarray(grid_params)).half().cuda()
 
         if grid_state_dict:
-            self._grid.load_state_dict(grid_state_dict, strict=True)
+            # Lenient load to stay compatible with older checkpoints
+            target_sd = self._grid.state_dict()
+            filtered_sd = {}
+            skipped_keys = []
+            mismatched = []
+
+            for key, tensor in grid_state_dict.items():
+                if key not in target_sd:
+                    skipped_keys.append(key)
+                    continue
+                if target_sd[key].shape != tensor.shape:
+                    mismatched.append((key, tuple(tensor.shape), tuple(target_sd[key].shape)))
+                    continue
+                filtered_sd[key] = tensor
+
+            if skipped_keys:
+                print(f"[WARN] Ignoring unexpected grid params: {skipped_keys}")
+            if mismatched:
+                for name, saved_shape, model_shape in mismatched:
+                    print(f"[WARN] Grid param shape mismatch for {name}: saved {saved_shape} vs model {model_shape}; skipping")
+            missing_after_filter = [k for k in target_sd.keys() if k not in filtered_sd]
+            if missing_after_filter:
+                print(f"[WARN] Missing grid params; using model defaults for: {missing_after_filter}")
+
+            self._grid.load_state_dict(filtered_sd, strict=False)
 
         # sh_mask
         sh_mask = np.load(os.path.join(path, 'sh_mask.npz'))['data'].astype(np.float32)
