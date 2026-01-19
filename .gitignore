@@ -75,6 +75,8 @@ output_*/
 output/**
 renderings/
 render/
+*.npz
+*.npy
 
 # -------------------- Project-specific artifacts --------------------
 cameras.json
