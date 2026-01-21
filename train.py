@@ -135,6 +135,7 @@ def save_ablation_config(output_dir, dataset, opt, pipe):
             'max_gaussians': getattr(opt, 'max_gaussians', 6_000_000),
             'densify_until_iter': getattr(opt, 'densify_until_iter', 15000),
             'densify_grad_threshold': opt.densify_grad_threshold,
+            'mass_aware_scale': getattr(opt, 'mass_aware_scale', 0.1),
         },
         'dataset_settings': {
             'source_path': dataset.source_path,
@@ -201,6 +202,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         encoder_variant=encoder_variant,
         densify_strategy=densify_strategy,
         feature_mod_type=feature_mod_type,
+        mass_aware_scale=getattr(opt, 'mass_aware_scale', 0.1),
     )
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
@@ -765,7 +767,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                 
                 final_psnrs.append(psnr(image.unsqueeze(0), gt_image.unsqueeze(0)).mean().item())
-                final_ssims.append(ssim_raw(image.unsqueeze(0), gt_image.unsqueeze(0)).mean().item())
+                final_ssims.append(ssim(image.unsqueeze(0), gt_image.unsqueeze(0)).item())
                 final_lpipss.append(lpips(image.unsqueeze(0), gt_image.unsqueeze(0), net_type='vgg').item())
             
             avg_psnr = sum(final_psnrs) / len(final_psnrs)

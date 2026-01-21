@@ -1,274 +1,276 @@
 #!/usr/bin/env python3
 """
-Hybrid background comparison figure (white canvas, black panels) for 3DGS vs Ours.
-Gamma-corrected RGB, percentile-stretched magma depth (shared vmin/vmax), normals mapped to [0,1].
+RGB + zoom + error + normal evidence chain for 3DGS vs GlowGS.
+This script saves every required subplot individually (no need to stitch).
 """
 
 import os
-import numpy as np
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
 import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image, ImageColor, ImageDraw, ImageFont
 
 OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_PATH = os.path.join(OUTPUT_DIR, "figure_2_geo_comparison.png")
-# Set these to your data paths. Preferred: separate npz for baseline and ours.
-NPZ_3DGS_PATH = "/home/ubuntu/lyj/Project/gaussian-splatting/baseline_view0.npz"  # e.g., "/path/to/3dgs_view0.npz"
-NPZ_OURS_PATH = "/home/ubuntu/lyj/Project/GlowGS/ours_view0.npz"  # e.g., "/path/to/ours_view0.npz"
-# If you instead have a single NPZ containing both methods, set COMBINED_NPZ_PATH
-COMBINED_NPZ_PATH = None
+
+# -----------------------------------------------------------------------------
+# Input configuration (edit these paths and labels as needed)
+# -----------------------------------------------------------------------------
+GT_RGB_PATH: Optional[str] = "/home/ubuntu/lyj/Project/GlowGS/output/bicycle/test/ours_30000/gt/00000.png"  # e.g., "/path/to/gt.png"; if None, expect rgb_gt in NPZ
+ZOOM_BOX = (2200, 1450, 420, 420)  # (x, y, w, h) in pixel space of the full image
+ZOOM_SCALE = 4                     # ×4 or ×8 magnification label appears on zoomed patches
+RECT_COLOR = "#00A0FF"            # uniform zoom box color
+RECT_LINEWIDTH = 2.5
+ERROR_CMAP = plt.cm.magma
+FIG_BG = "#FFFFFF"
+
+
+@dataclass
+class MethodEntry:
+    name: str
+    npz_path: str
+    size_fps: str  # text shown on the RGB corner, e.g., "49 MB / 65 FPS"
+
+
+METHODS: List[MethodEntry] = [
+    MethodEntry(
+        name="3DGS",
+        npz_path="/home/ubuntu/lyj/Project/gaussian-splatting/baseline_view0.npz",
+        size_fps="734 MB / 134 FPS",
+    ),
+    MethodEntry(
+        name="GlowGS",
+        npz_path="/home/ubuntu/lyj/Project/GlowGS/ours_view0.npz",
+        size_fps="11 MB / 195 FPS",
+    ),
+]
+
 plt.rcParams.update({
     "font.family": "serif",
     "font.serif": ["Times New Roman", "DejaVu Serif", "Computer Modern Roman"],
+    "axes.titlesize": 13,
+    "axes.titleweight": "bold",
 })
 
+
 # -----------------------------------------------------------------------------
-# Helper utilities
+# Helpers
 # -----------------------------------------------------------------------------
-def ensure_rgb(img):
-    """
-    Handle RGB or RGBA. If RGBA, composite on black (to preserve dark background).
-    If RGB, return as-is. Assumes values in [0,1] or [0,255].
-    """
-    img = _to_unit_range(img)
-    if img.ndim == 3 and img.shape[2] == 4:
-        rgb = img[..., :3]
-        alpha = img[..., 3:]
-        return rgb * alpha  # black background
-    if img.ndim == 3 and img.shape[2] == 3:
-        return img
-    raise ValueError("Input must be RGB or RGBA array.")
-
-
-def gamma_correct(img, gamma=2.2):
-    return np.power(np.clip(img, 0.0, 1.0), 1.0 / gamma)
-
-
-def prepare_depth(depth):
-    """Mask invalid (<=0) as NaN for black background via set_bad."""
-    depth = np.asarray(depth, dtype=np.float32)
-    return np.where(depth <= 0, np.nan, depth)
-
-
-def prepare_normal(norm):
-    """Map normals from [-1,1] to [0,1]; keep background black (all zeros)."""
-    if norm is None:
-        return None
-    norm = np.asarray(norm, dtype=np.float32)
-    mapped = (norm + 1.0) / 2.0
-    mask_black = np.all(norm == 0.0, axis=-1, keepdims=True)
-    return np.where(mask_black, 0.0, mapped)
-
-
 def ensure_output_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
-def _to_unit_range(arr):
-    """If data looks like 0-255, scale to 0-1; otherwise clip to [0,1]."""
+def _to_unit_range(arr: np.ndarray) -> np.ndarray:
     arr = np.asarray(arr)
     if arr.max() > 1.5:
         return np.clip(arr / 255.0, 0.0, 1.0)
     return np.clip(arr, 0.0, 1.0)
 
 
-def load_from_npz(path: str):
-    """
-    Expect keys: rgb_3dgs, depth_3dgs, norm_3dgs, rgb_ours, depth_ours, norm_ours.
-    RGB may be uint8 or float; depths/normals should be float.
-    """
+def ensure_rgb(img: np.ndarray) -> np.ndarray:
+    img = _to_unit_range(img)
+    if img.ndim == 3 and img.shape[2] == 4:
+        rgb = img[..., :3]
+        alpha = img[..., 3:]
+        return rgb * alpha
+    if img.ndim == 3 and img.shape[2] == 3:
+        return img
+    raise ValueError("Input must be RGB or RGBA array.")
+
+
+def gamma_correct(img: np.ndarray, gamma: float = 2.2) -> np.ndarray:
+    return np.power(np.clip(img, 0.0, 1.0), 1.0 / gamma)
+
+
+def prepare_normal(norm: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    if norm is None:
+        return None
+    mapped = (np.asarray(norm, dtype=np.float32) + 1.0) / 2.0
+    mask_black = np.all(norm == 0.0, axis=-1, keepdims=True)
+    return np.where(mask_black, 0.0, mapped)
+
+
+def load_single_npz(path: str) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
     if not path or not os.path.isfile(path) or not path.endswith(".npz"):
-        raise FileNotFoundError(f"NPZ file missing or not a .npz: {path}")
+        raise FileNotFoundError(f"NPZ missing: {path}")
     try:
         data = np.load(path, allow_pickle=False)
     except ValueError:
         data = np.load(path, allow_pickle=True)
-    required = [
-        "rgb_3dgs", "depth_3dgs", "norm_3dgs",
-        "rgb_ours", "depth_ours", "norm_ours",
-    ]
-    missing = [k for k in required if k not in data]
-    if missing:
-        raise KeyError(f"Missing keys in NPZ: {missing}")
-    rgb_3dgs = _to_unit_range(data["rgb_3dgs"])
-    rgb_ours = _to_unit_range(data["rgb_ours"])
-    depth_3dgs = np.asarray(data["depth_3dgs"], dtype=np.float32)
-    depth_ours = np.asarray(data["depth_ours"], dtype=np.float32)
-    norm_3dgs = np.asarray(data["norm_3dgs"], dtype=np.float32)
-    norm_ours = np.asarray(data["norm_ours"], dtype=np.float32)
-    return rgb_3dgs, depth_3dgs, norm_3dgs, rgb_ours, depth_ours, norm_ours
+
+    rgb = ensure_rgb(data["rgb"])
+    depth = np.asarray(data.get("depth"), dtype=np.float32) if "depth" in data else None
+    norm = np.asarray(data.get("norm"), dtype=np.float32) if "norm" in data else None
+    rgb_gt = ensure_rgb(data.get("rgb_gt")) if "rgb_gt" in data else None
+    return rgb, depth, norm, rgb_gt
 
 
-def load_single_npz(path: str):
-    """
-    Expect keys: rgb, depth, norm (aliases also accepted: normal).
-    """
-    if not path or not os.path.isfile(path) or not path.endswith(".npz"):
-        raise FileNotFoundError(f"NPZ file missing or not a .npz: {path}")
+def load_gt_image(path: str, target_shape: Tuple[int, int]) -> np.ndarray:
+    img = Image.open(path).convert("RGB")
+    if img.size != (target_shape[1], target_shape[0]):
+        img = img.resize((target_shape[1], target_shape[0]), resample=Image.BICUBIC)
+    return ensure_rgb(np.asarray(img))
+
+
+def crop(image: np.ndarray, box: Tuple[int, int, int, int]) -> np.ndarray:
+    x, y, w, h = box
+    h_img, w_img = image.shape[:2]
+    x0 = max(0, x)
+    y0 = max(0, y)
+    x1 = min(w_img, x + w)
+    y1 = min(h_img, y + h)
+    patch = image[y0:y1, x0:x1]
+    if patch.size == 0:
+        raise ValueError("Zoom box is outside the image bounds; adjust ZOOM_BOX.")
+    return patch
+
+
+def upscale_patch(patch: np.ndarray, scale: int) -> np.ndarray:
+    h, w = patch.shape[:2]
+    new_size = (w * scale, h * scale)
+    return np.asarray(Image.fromarray((patch * 255).astype(np.uint8)).resize(new_size, resample=Image.BICUBIC)) / 255.0
+
+
+def draw_box_on_rgb(rgb: np.ndarray, box: Tuple[int, int, int, int]) -> np.ndarray:
+    img = (rgb * 255).clip(0, 255).astype(np.uint8).copy()
+    x, y, w, h = box
+    t = max(1, int(round(RECT_LINEWIDTH)))
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(img.shape[1], x + w), min(img.shape[0], y + h)
+    # Top and bottom edges
+    img[y0:y0 + t, x0:x1, :] = np.array(ImageColor.getrgb(RECT_COLOR), dtype=np.uint8)
+    img[y1 - t:y1, x0:x1, :] = np.array(ImageColor.getrgb(RECT_COLOR), dtype=np.uint8)
+    # Left and right edges
+    img[y0:y1, x0:x0 + t, :] = np.array(ImageColor.getrgb(RECT_COLOR), dtype=np.uint8)
+    img[y0:y1, x1 - t:x1, :] = np.array(ImageColor.getrgb(RECT_COLOR), dtype=np.uint8)
+    return img.astype(np.float32) / 255.0
+
+
+def annotate_rgb(rgb: np.ndarray, text: str) -> np.ndarray:
+    img = Image.fromarray((rgb * 255).clip(0, 255).astype(np.uint8))
+    draw = ImageDraw.Draw(img, mode="RGB")
     try:
-        data = np.load(path, allow_pickle=False)
-    except ValueError:
-        data = np.load(path, allow_pickle=True)
-    rgb_key = "rgb"
-    depth_key = "depth"
-    norm_key = None
-    if "norm" in data:
-        norm_key = "norm"
-    elif "normal" in data:
-        norm_key = "normal"
-    elif "normals" in data:
-        norm_key = "normals"
-    for k in [rgb_key, depth_key]:
-        if k not in data:
-            raise KeyError(f"Missing key '{k}' in {path}")
-    if norm_key is None:
-        norm = None
-    else:
-        norm = np.asarray(data[norm_key], dtype=np.float32)
-    rgb = _to_unit_range(data[rgb_key])
-    depth = np.asarray(data[depth_key], dtype=np.float32)
-    return rgb, depth, norm
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 18)
+    except OSError:
+        font = ImageFont.load_default()
+    text_pos = (int(0.02 * img.width), int(0.05 * img.height))
+    padding = 4
+    bbox = draw.textbbox(text_pos, text, font=font)
+    bg_rect = (bbox[0] - padding, bbox[1] - padding, bbox[2] + padding, bbox[3] + padding)
+    draw.rectangle(bg_rect, fill=(0, 0, 0))
+    draw.text(text_pos, text, fill=(255, 255, 255), font=font)
+    return np.asarray(img).astype(np.float32) / 255.0
 
 
-def _valid_npz(path: str) -> bool:
-    return isinstance(path, str) and path.endswith(".npz") and os.path.isfile(path)
+def save_with_colorbar(img: np.ndarray, vmin: float, vmax: float, label: str, path: str, cmap) -> None:
+    fig, ax = plt.subplots(figsize=(4, 4), dpi=200)
+    im = ax.imshow(img, vmin=vmin, vmax=vmax, cmap=cmap)
+    ax.axis("off")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+    cbar.ax.tick_params(labelsize=8)
+    cbar.ax.set_ylabel("|I-GT|", rotation=270, labelpad=10)
+    fig.tight_layout(pad=0.1)
+    fig.savefig(path, bbox_inches="tight", dpi=300, facecolor=FIG_BG)
+    plt.close(fig)
 
 
-# -----------------------------------------------------------------------------
-# Data source: prefer separate NPZs; fallback to combined; else synthetic demo
-# -----------------------------------------------------------------------------
-if _valid_npz(NPZ_3DGS_PATH) and _valid_npz(NPZ_OURS_PATH):
-    rgb_3dgs, depth_3dgs, norm_3dgs = load_single_npz(NPZ_3DGS_PATH)
-    rgb_ours, depth_ours, norm_ours = load_single_npz(NPZ_OURS_PATH)
-    print(f"Loaded separate NPZs:\n  3DGS: {NPZ_3DGS_PATH}\n  Ours: {NPZ_OURS_PATH}")
-elif _valid_npz(COMBINED_NPZ_PATH):
-    (rgb_3dgs, depth_3dgs, norm_3dgs,
-     rgb_ours, depth_ours, norm_ours) = load_from_npz(COMBINED_NPZ_PATH)
-    print(f"Loaded combined NPZ: {COMBINED_NPZ_PATH}")
-else:
-    print("No valid NPZ paths provided; using synthetic demo data.")
-    H, W = 320, 480
-    y, x = np.mgrid[0:H, 0:W]
-    center = np.array([H / 2, W / 2])[:, None, None]
-    dist = np.sqrt((y - center[0]) ** 2 + (x - center[1]) ** 2)
-    vignette = np.clip(1 - dist / (0.8 * max(H, W)), 0, 1)
+def main() -> None:
+    ensure_output_dir(OUTPUT_DIR)
 
-    rgb_3dgs = np.stack([0.8 * vignette, 0.5 * vignette, 0.3 * vignette], axis=-1)
-    rgb_ours = np.stack([0.7 * vignette, 0.8 * vignette, 0.4 * vignette], axis=-1)
-    rgb_3dgs[dist > 0.7 * max(H, W)] = 0  # black background
-    rgb_ours[dist > 0.7 * max(H, W)] = 0   # black background
+    records: List[Dict[str, np.ndarray]] = []
+    gt_rgb: Optional[np.ndarray] = None
 
-    depth_3dgs = np.linspace(0, 10, W)[None, :].repeat(H, axis=0)
-    depth_ours = np.linspace(2, 8, W)[None, :].repeat(H, axis=0)
-    depth_3dgs[dist > 0.7 * max(H, W)] = 0
-    depth_ours[dist > 0.7 * max(H, W)] = 0
+    for entry in METHODS:
+        rgb, depth, norm, rgb_gt = load_single_npz(entry.npz_path)
+        rgb = gamma_correct(rgb)
+        norm = prepare_normal(norm)
+        records.append({
+            "name": entry.name,
+            "size_fps": entry.size_fps,
+            "rgb": rgb,
+            "depth": depth,
+            "norm": norm,
+        })
+        if gt_rgb is None and rgb_gt is not None:
+            gt_rgb = gamma_correct(rgb_gt)
 
-    nx = (x - W / 2) / (W / 2)
-    ny = (y - H / 2) / (H / 2)
-    nz = np.sqrt(np.clip(1 - nx**2 - ny**2, 0, 1))
-    norm_3dgs = np.stack([nx, ny, nz], axis=-1)
-    norm_ours = np.stack([nx, ny * 0.5, nz], axis=-1)
-    norm_3dgs[dist > 0.7 * max(H, W)] = 0
-    norm_ours[dist > 0.7 * max(H, W)] = 0
+    if gt_rgb is None:
+        if GT_RGB_PATH is None:
+            raise ValueError("Provide GT_RGB_PATH or include rgb_gt in NPZ.")
+        gt_rgb = load_gt_image(GT_RGB_PATH, target_shape=records[0]["rgb"].shape[:2])
+        gt_rgb = gamma_correct(gt_rgb)
 
-# -----------------------------------------------------------------------------
-# Preprocess images
-# -----------------------------------------------------------------------------
-rgb_3dgs_vis = gamma_correct(ensure_rgb(rgb_3dgs))
-rgb_ours_vis = gamma_correct(ensure_rgb(rgb_ours))
+    # Shared error range across methods
+    error_maps = []
+    for rec in records:
+        error = np.mean(np.abs(rec["rgb"] - gt_rgb), axis=-1)
+        error_maps.append(error)
+    stacked_errors = np.concatenate([e.flatten() for e in error_maps])
+    vmax_err = np.percentile(stacked_errors, 99.5)
+    vmax_err = max(vmax_err, 1e-4)
 
-depth_3dgs_vis = prepare_depth(depth_3dgs)
-depth_ours_vis = prepare_depth(depth_ours)
+    # Save per-method subplots
+    for rec, error in zip(records, error_maps):
+        name = rec["name"]
+        rgb = rec["rgb"]
+        norm = rec["norm"]
 
-norm_3dgs_vis = prepare_normal(norm_3dgs)
-norm_ours_vis = prepare_normal(norm_ours)
+        boxed = draw_box_on_rgb(rgb, ZOOM_BOX)
+        boxed = annotate_rgb(boxed, rec["size_fps"])
+        plt.imsave(os.path.join(OUTPUT_DIR, f"{name}_rgb_full.png"), boxed)
 
-# Shared depth vmin/vmax using 2nd-98th percentiles of valid pixels across both
-valid_depths = np.concatenate([
-    depth_3dgs[np.isfinite(depth_3dgs_vis) & (depth_3dgs > 0)],
-    depth_ours[np.isfinite(depth_ours_vis) & (depth_ours > 0)],
-])
-if valid_depths.size == 0:
-    vmin, vmax = 0.0, 1.0
-else:
-    vmin = np.percentile(valid_depths, 2)
-    vmax = np.percentile(valid_depths, 98)
-    if vmin == vmax:
-        vmax = vmin + 1e-6
+        zoom_rgb = crop(rgb, ZOOM_BOX)
+        zoom_rgb = upscale_patch(zoom_rgb, ZOOM_SCALE)
+        zoom_fig, zoom_ax = plt.subplots(figsize=(zoom_rgb.shape[1] / 200, zoom_rgb.shape[0] / 200), dpi=200)
+        zoom_ax.imshow(zoom_rgb)
+        zoom_ax.text(0.02, 0.95, f"×{ZOOM_SCALE}", color="white", fontsize=12, fontweight="bold", transform=zoom_ax.transAxes, bbox=dict(facecolor="black", alpha=0.65, pad=3, edgecolor="none"), va="top")
+        zoom_ax.axis("off")
+        zoom_fig.tight_layout(pad=0)
+        zoom_fig.savefig(os.path.join(OUTPUT_DIR, f"{name}_zoom_rgb.png"), bbox_inches="tight", dpi=300, facecolor=FIG_BG)
+        plt.close(zoom_fig)
 
-# -----------------------------------------------------------------------------
-# Plotting
-# -----------------------------------------------------------------------------
-ensure_output_dir(OUTPUT_DIR)
-fig, axes = plt.subplots(
-    2, 3,
-    figsize=(12, 7),
-    gridspec_kw={"wspace": 0.02, "hspace": 0.02},
-    facecolor="white",
-)
-fig.patch.set_facecolor("white")
+        zoom_err = crop(error, ZOOM_BOX)
+        zoom_err = upscale_patch(zoom_err, ZOOM_SCALE)
+        save_with_colorbar(zoom_err, vmin=0.0, vmax=vmax_err, label="Error", path=os.path.join(OUTPUT_DIR, f"{name}_error.png"), cmap=ERROR_CMAP)
 
-titles = ["RGB", "Depth", "Normal"]
-row_labels = ["3DGS", "Ours"]
+        if norm is None:
+            raise ValueError(f"Missing normals for {name}; required for geometry evidence.")
+        norm_patch = crop(norm, ZOOM_BOX)
+        norm_patch = upscale_patch(norm_patch, ZOOM_SCALE)
+        norm_fig, norm_ax = plt.subplots(figsize=(norm_patch.shape[1] / 200, norm_patch.shape[0] / 200), dpi=200)
+        norm_ax.imshow(norm_patch)
+        norm_ax.axis("off")
+        norm_ax.set_title("Normal")
+        norm_fig.tight_layout(pad=0)
+        norm_fig.savefig(os.path.join(OUTPUT_DIR, f"{name}_normal.png"), bbox_inches="tight", dpi=300, facecolor=FIG_BG)
+        plt.close(norm_fig)
 
-# Modified: Use magma_r (reversed) so low depth (close) is bright, high depth (far) is dark.
-# This ensures objects pop against the black background.
-depth_cmap = plt.cm.magma_r.copy()
-depth_cmap.set_bad(color="black")
+    # Optional combined grid for quick sanity check
+    fig, axes = plt.subplots(2, 4, figsize=(12, 6), facecolor=FIG_BG)
+    col_titles = ["RGB", "Zoom", "", "Normal"]
+    for c, title in enumerate(col_titles):
+        if title:
+            axes[0, c].set_title(title)
 
-for r, (rgb_img, depth_img, norm_img) in enumerate([
-    (rgb_3dgs_vis, depth_3dgs_vis, norm_3dgs_vis),
-    (rgb_ours_vis, depth_ours_vis, norm_ours_vis),
-]):
-    for c, ax in enumerate(axes[r]):
-        # 1. Main Figure Plotting
-        ax.set_facecolor("black")
-        if c == 0:
-            ax.imshow(rgb_img)
-        elif c == 1:
-            ax.imshow(depth_img, cmap=depth_cmap, vmin=vmin, vmax=vmax)
-        else:
-            if norm_img is not None:
-                ax.imshow(norm_img)
-            else:
-                # No normals: show black placeholder to blend with panel
-                ax.imshow(np.zeros((*depth_img.shape, 3)))
-        ax.axis("off")
-        if r == 0:
-            ax.set_title(titles[c], fontsize=14, fontweight="bold", color="#000000")
-        if c == 0:
-            ax.text(
-                -0.08, 0.5, row_labels[r],
-                fontsize=14, fontweight="bold", color="#000000",
-                va="center", ha="right", transform=ax.transAxes,
-            )
+    for r, rec in enumerate(records):
+        axes[r, 0].imshow(draw_box_on_rgb(rec["rgb"], ZOOM_BOX))
+        axes[r, 0].axis("off")
+        axes[r, 0].text(-0.06, 0.5, rec["name"], transform=axes[r, 0].transAxes, fontsize=12, fontweight="bold", va="center", ha="right")
 
-        # ---------------------------------------------------------------------
-        # 2. Save Individual Subplots (True Original Resolution, No Crop)
-        # ---------------------------------------------------------------------
-        method_name = row_labels[r]  # "3DGS" or "Ours"
-        col_name = titles[c]         # "RGB", "Depth", "Normal"
-        sub_filename = f"{method_name}_{col_name}.png"
-        sub_path = os.path.join(OUTPUT_DIR, sub_filename)
+        axes[r, 1].imshow(upscale_patch(crop(rec["rgb"], ZOOM_BOX), ZOOM_SCALE))
+        axes[r, 1].axis("off")
 
-        if c == 0:  # RGB
-            # Assuming rgb_img is already [0,1] float or [0,255] int
-            plt.imsave(sub_path, rgb_img)
-            
-        elif c == 1:  # Depth
-            # Use the same colormap and vmin/vmax as the main figure
-            # plt.imsave handles NaNs by using the cmap's 'bad' color (black here)
-            plt.imsave(sub_path, depth_img, cmap=depth_cmap, vmin=vmin, vmax=vmax)
-            
-        else:  # Normal
-            if norm_img is not None:
-                plt.imsave(sub_path, norm_img)
-            else:
-                # Save a purely black image of the correct size
-                h, w = depth_img.shape[:2]
-                black_img = np.zeros((h, w, 3), dtype=np.uint8)
-                plt.imsave(sub_path, black_img)
-        
-        print(f"Saved individual image: {sub_path}")
+        axes[r, 2].imshow(upscale_patch(crop(error_maps[r], ZOOM_BOX), ZOOM_SCALE), vmin=0.0, vmax=vmax_err, cmap=ERROR_CMAP)
+        axes[r, 2].axis("off")
 
-# Save combined figure
-fig.savefig(OUTPUT_PATH, dpi=300, bbox_inches="tight", facecolor="white")
-print(f"Saved combined figure to {OUTPUT_PATH}")
+        axes[r, 3].imshow(upscale_patch(crop(records[r]["norm"], ZOOM_BOX), ZOOM_SCALE))
+        axes[r, 3].axis("off")
+
+    fig.tight_layout(pad=0.3, w_pad=0.2, h_pad=0.2)
+    fig.savefig(os.path.join(OUTPUT_DIR, "figure_2_geo_quickgrid.png"), dpi=300, bbox_inches="tight", facecolor=FIG_BG)
+    plt.close(fig)
+
+
+if __name__ == "__main__":
+    main()

@@ -168,6 +168,8 @@ class OptimizationParams(ParamGroup):
         self.opacity_reset_interval = 3000  # reset opacity to prevent over-saturation
         self.densify_from_iter = 500        # start densification after warmup
         self.densify_until_iter = 15_000    # LocoGS: 15K (stop densification)
+        # Mass-aware densification strength (xi). Larger = stronger pruning.
+        self.mass_aware_scale = 0.1
         
         # densify_grad_threshold: gradient magnitude to trigger clone/split
         # LocoGS original: 0.0002

@@ -128,7 +128,8 @@ class GaussianModel:
 
     def __init__(self, sh_degree: int, hash_size=19, width=64, depth=2, feature_role_split=True,
                  geo_resolution=48, geo_rank=6, geo_channels=8, encoder_variant="hybrid",
-                 densify_strategy="feature_weighted", feature_mod_type="film"):
+                 densify_strategy="feature_weighted", feature_mod_type="film",
+                 mass_aware_scale: float = 0.1):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree
         # Store encoder variant and densification strategy for ablation studies
@@ -136,6 +137,8 @@ class GaussianModel:
         self._densify_strategy = densify_strategy
         self._feature_role_split = feature_role_split  # Geometry/appearance disentanglement flag
         self._feature_mod_type = feature_mod_type  # 'film' or 'concat' for ECCV ablation
+        # Mass-aware gradient weighting scale (xi): higher = stronger pruning, lower = softer
+        self._mass_aware_scale = mass_aware_scale
         # Store GeoEncoder parameters for serialization/deserialization
         self._geo_resolution = geo_resolution
         self._geo_rank = geo_rank
@@ -1274,7 +1277,8 @@ class GaussianModel:
             
             # Mass regularization: penalize large solid regions to prevent road artifacts
             mass = alpha * r
-            mass_penalty = 1.0 / (1.0 + mass / tau)
+            # Softer or stronger mass penalty is controlled by self._mass_aware_scale (xi)
+            mass_penalty = 1.0 / (1.0 + self._mass_aware_scale * (mass / tau))
             
             # Combined weight
             weight = visibility_boost * mass_penalty
