@@ -98,6 +98,10 @@ class GeometryAppearanceEncoder(nn.Module):
         except Exception:
             self._forward_split_compiled = self._forward_split_impl
     
+    def set_warmup_progress(self, progress: float):
+        """Set FiLM warmup progress (0.0 to 1.0). Called by training loop."""
+        self._warmup_progress = max(0.0, min(1.0, progress))
+    
     @property
     def n_output_dims(self) -> int:
         """Output dimension per branch (compatible with tcnn interface)."""
@@ -132,10 +136,18 @@ class GeometryAppearanceEncoder(nn.Module):
         g_scale, g_shift = g_params.chunk(2, dim=-1)
         a_scale, a_shift = a_params.chunk(2, dim=-1)
         
+        # FIX: Scale alignment for shift term (prevent hash magnitude mismatch)
+        # Compute characteristic scale from hash features (detached to avoid feedback)
+        hash_scale = hash_latent.detach().abs().mean(dim=-1, keepdim=True).clamp_min(1e-3)
+        
+        # FIX: Warmup schedule (0->1 over first 5k iterations)
+        # Reduces early training instability when VM encoder outputs are small
+        warmup_progress = getattr(self, '_warmup_progress', 1.0)  # Default to 1.0 (no warmup)
+        
         # 2. Apply modulation: feat = hash * (1 + scale) + shift
         # Using (1 + scale) allows scale to be initialized to 0 for identity
-        geometry_latent = hash_latent * (1.0 + g_scale) + g_shift
-        appearance_latent = hash_latent * (1.0 + a_scale) + a_shift
+        geometry_latent = hash_latent * (1.0 + warmup_progress * g_scale) + (warmup_progress * g_shift * hash_scale)
+        appearance_latent = hash_latent * (1.0 + warmup_progress * a_scale) + (warmup_progress * a_shift * hash_scale)
         
         # Shared latent is just the raw hash features (or could be averaged)
         shared_latent = hash_latent

@@ -187,9 +187,16 @@ class OptimizationParams(ParamGroup):
 
         # Edge-aware loss configuration (GlowGS innovation #2)
         self.enable_edge_loss = True        # master switch for unified edge-aware gradient loss
-        self.edge_loss_start_iter = 5000    # delay edge loss until geometry stabilizes (warmup)
+        self.edge_loss_start_iter = 5000    # edge loss ramp start (begin transition)
+        self.edge_loss_end_iter = 7000      # edge loss ramp end (full strength)
         self.lambda_grad = 0.1              # edge loss weight (0.02~0.1 typical; 0.05 balanced)
         self.edge_flat_weight = 0.5         # flat region penalty weight (alpha in paper; 0.5 = equal)
+        
+        # Warmup/Ramp configuration for step-free training (avoid 5k iteration discontinuity)
+        self.mass_aware_start_iter = 3000   # mass-aware gradient weighting ramp start
+        self.mass_aware_end_iter = 5000     # mass-aware gradient weighting ramp end
+        self.size_prune_start_iter = 4000   # size-aware pruning ramp start
+        self.size_prune_end_iter = 6000     # size-aware pruning ramp end
         # Profiling 相关参数（默认关闭）
         self.profile_iters = 0
         self.profile_wait = 2

@@ -105,8 +105,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             dir_pp = pc.get_xyz - viewpoint_camera.camera_center[None, :]
             dir_pp_normalized = dir_pp / (dir_pp.norm(dim=1, keepdim=True) + 1e-7)  # Add epsilon for stability
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
-            # 回退为线性偏移以避免sigmoid饱和造成梯度缩小
-            colors_precomp = torch.clamp(sh2rgb + 0.5, 0.0, 1.0)
+            # FIX: Apply DC bias (0.5) INSIDE mask to avoid gray fog when mask=0
+            # Compute overall mask weight (average across SH degrees for DC channel)
+            dc_mask = sh_mask_expanded[:, 0, :].mean(dim=-1, keepdim=True) if pc.active_sh_degree > 0 else torch.ones((sh2rgb.shape[0], 1), device=sh2rgb.device)
+            colors_precomp = torch.clamp(sh2rgb + 0.5 * dc_mask, 0.0, 1.0)
         else:
             shs = pc.get_features
             # Fully vectorized SH mask application (no loop, faster)
@@ -201,7 +203,7 @@ def render_eval(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Ten
             dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
-            # 回退为线性偏移以避免sigmoid饱和造成梯度缩小
+            # FIX: DC bias aligned with eval mode (no mask in render_eval, always use 0.5)
             colors_precomp = torch.clamp(sh2rgb + 0.5, 0.0, 1.0)
         else:
             shs = pc.get_features

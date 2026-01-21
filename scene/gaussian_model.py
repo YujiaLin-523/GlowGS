@@ -668,6 +668,13 @@ class GaussianModel:
         max_gaussians = getattr(training_args, 'max_gaussians', 6_000_000)
         densify_until = getattr(training_args, 'densify_until_iter', 15000)
         prune_interval = getattr(training_args, 'prune_interval', 1000)
+        
+        # Store warmup/ramp schedule from training args
+        self.mass_aware_start_iter = getattr(training_args, 'mass_aware_start_iter', 3000)
+        self.mass_aware_end_iter = getattr(training_args, 'mass_aware_end_iter', 5000)
+        self.size_prune_start_iter = getattr(training_args, 'size_prune_start_iter', 4000)
+        self.size_prune_end_iter = getattr(training_args, 'size_prune_end_iter', 6000)
+        
         self.gaussian_capacity_config.update({
             "max_point_count": max_gaussians,
             "densify_until_iter": densify_until,
@@ -1133,7 +1140,7 @@ class GaussianModel:
         self.densification_postfix(new_xyz, new_features_dc, new_scaling_base, new_mask, new_sh_mask, new_features_rest)
         self.update_attributes(force_update=True)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, iteration=0):
         """
         Core densification and pruning logic.
         Simplified to use original 3DGS approach with opacity-based pruning.
@@ -1146,18 +1153,29 @@ class GaussianModel:
         self.densify_and_split(grads, max_grad, extent)
         self.update_attributes(force_update=True)
         
-        # === Pruning: Size-Aware Opacity Thresholds ===
+        # === Pruning: Size-Aware Opacity Thresholds with Ramp ===
         opacity = self.get_opacity.squeeze()
         
         # Base pruning: extremely low opacity (original 3DGS)
         prune_mask = (opacity < min_opacity)
         
-        # Size-Aware Pruning: penalize large semi-transparent volumes
-        # Theory: Large low-opacity Gaussians cause overdraw and volumetric artifacts.
+        # FIX: Size-aware pruning with smooth ramp (4k-6k iterations)
+        # Use continuous threshold transition to avoid step discontinuity
+        size_prune_start = getattr(self, 'size_prune_start_iter', 4000)
+        size_prune_end = getattr(self, 'size_prune_end_iter', 6000)
+        
+        # Ramp weight: 0 at start, 1 at end (linear transition)
+        ramp_w = max(0.0, min(1.0, (iteration - size_prune_start) / max(1, size_prune_end - size_prune_start)))
+        
+        # Smooth radius threshold transition: 1e9 (never trigger) -> 50.0 (original threshold)
+        # This ensures w=0 behaves as "disabled", w=1 as "fully enabled"
+        radius_threshold = (1.0 - ramp_w) * 1e9 + ramp_w * 50.0
+        
+        # Size-Aware Pruning: penalize large semi-transparent volumes (now always applied with smooth threshold)
         # - Small radius (<50px): details/spokes/background, keep even if semi-transparent
         # - Large radius (>50px): must be solid (>0.005) or get pruned
         # TUNED: Relaxed from (20px, 0.05) to (50px, 0.005) to preserve background/sky
-        large_radius_mask = self.max_radii2D > 50.0
+        large_radius_mask = self.max_radii2D > radius_threshold
         semi_transparent_mask = opacity < 0.005
         volumetric_bloat = torch.logical_and(large_radius_mask, semi_transparent_mask)
         prune_mask = torch.logical_or(prune_mask, volumetric_bloat)
@@ -1171,6 +1189,11 @@ class GaussianModel:
         
         self.prune_points(prune_mask)
         torch.cuda.empty_cache()
+
+    @staticmethod
+    def _compute_ramp_weight(iteration, start_iter, end_iter):
+        """Compute linear ramp weight: 0 at start, 1 at end."""
+        return max(0.0, min(1.0, (iteration - start_iter) / max(1, end_iter - start_iter)))
 
     def maybe_densify_and_prune(
         self,
@@ -1216,7 +1239,7 @@ class GaussianModel:
         
         # Densify only if under capacity and within schedule
         if iteration < densify_until and num_points < max_points:
-            self.densify_and_prune(adaptive_grad, min_opacity, extent, max_screen_size)
+            self.densify_and_prune(adaptive_grad, min_opacity, extent, max_screen_size, iteration=iteration)
             new_count = self.get_xyz.shape[0]
             # Log capacity warning if approaching limit
             if new_count >= max_points * 0.9:
@@ -1237,7 +1260,7 @@ class GaussianModel:
         self.prune_points(prune_mask)
         torch.cuda.empty_cache()
 
-    def add_densification_stats(self, viewspace_point_tensor, update_filter, opacity=None, radii=None):
+    def add_densification_stats(self, viewspace_point_tensor, update_filter, opacity=None, radii=None, iteration=0):
         """
         Accumulate gradients for densification decision using Mass-Aware Gradient Weighting.
         
@@ -1257,31 +1280,40 @@ class GaussianModel:
             update_filter: Boolean mask for visible points
             opacity: Optional opacity tensor [N, 1]. If provided, used for weighting.
             radii: Optional screen-space radii tensor [N]. If provided, used for mass regularization.
+            iteration: Current training iteration (for warmup schedule)
         """
         grad_norm = torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         
         # Only apply Mass-Aware weighting when densify_strategy is 'feature_weighted'
         use_mass_aware = (self._densify_strategy == 'feature_weighted')
         
+        # FIX: Mass-aware with smooth ramp (3k-5k iterations)
+        # Prevents abrupt gradient distribution change at 5k iteration
+        mass_start = getattr(self, 'mass_aware_start_iter', 3000)
+        mass_end = getattr(self, 'mass_aware_end_iter', 5000)
+        
+        # Compute ramp weight: 0->1 over [start, end]
+        ramp_w = self._compute_ramp_weight(iteration, mass_start, mass_end)
+        
         if use_mass_aware and opacity is not None and radii is not None:
             # Mass-Aware Gradient Weighting (GlowGS innovation)
             alpha = opacity[update_filter].clamp(0.01, 1.0)  # [N_visible, 1]
             r = radii[update_filter].float().unsqueeze(-1).clamp(min=1.0)  # [N_visible, 1]
             
-            # Hyperparameter: characteristic radius scale (typical detail size in pixels)
-            # TUNED: Increased from 50 to 100 to reduce under-densification of large surfaces
             tau = 100.0
             
             # Visibility boost: sqrt(alpha) - helps small/thin structures with low opacity
             visibility_boost = torch.sqrt(alpha)
             
-            # Mass regularization: penalize large solid regions to prevent road artifacts
+            # Mass penalty: computed but smoothly ramped in
             mass = alpha * r
-            # Softer or stronger mass penalty is controlled by self._mass_aware_scale (xi)
             mass_penalty = 1.0 / (1.0 + self._mass_aware_scale * (mass / tau))
             
-            # Combined weight
-            weight = visibility_boost * mass_penalty
+            # Smooth interpolation: w=0 -> weight=visibility_boost (no penalty)
+            #                       w=1 -> weight=visibility_boost*mass_penalty (full penalty)
+            # Equivalent to: weight = visibility_boost * (1 + w * (mass_penalty - 1))
+            weight = visibility_boost * (1.0 + ramp_w * (mass_penalty - 1.0))
+            
             grad_norm = grad_norm * weight
             
         elif opacity is not None and use_mass_aware:

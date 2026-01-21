@@ -553,6 +553,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Loss
             gt_image = viewpoint_cam.original_image.cuda()
             
+            # Update FiLM warmup progress (0->1 over first 5k iterations)
+            if hasattr(gaussians._grid, 'set_warmup_progress'):
+                warmup_progress = min(1.0, iteration / 5000.0)
+                gaussians._grid.set_warmup_progress(warmup_progress)
+            
             # ----------------------------------------------------------------
             # Standard pixel-wise loss: treat all regions equally for optimal PSNR
             # ----------------------------------------------------------------
@@ -564,19 +569,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Mode can be "none" | "sobel_basic" | "laplacian_weighted" (paper default)
             edge_loss_mode = getattr(opt, 'edge_loss_mode', 'laplacian_weighted')
             edge_loss_start_iter = getattr(opt, 'edge_loss_start_iter', 0)
+            edge_loss_end_iter = getattr(opt, 'edge_loss_end_iter', edge_loss_start_iter + 2000)
             lambda_grad = getattr(opt, 'lambda_grad', 0.05)
             flat_weight = getattr(opt, 'edge_flat_weight', 0.5)
             
-            if iteration >= edge_loss_start_iter:
+            # Compute edge loss ramp weight: smooth transition from 0 to 1
+            if iteration < edge_loss_start_iter:
+                edge_ramp_w = 0.0
+            elif iteration >= edge_loss_end_iter:
+                edge_ramp_w = 1.0
+            else:
+                edge_ramp_w = (iteration - edge_loss_start_iter) / max(1, edge_loss_end_iter - edge_loss_start_iter)
+            
+            # Always compute edge loss, but scale by ramp weight
+            if edge_ramp_w > 0.0:
                 Lgrad, Lgrad_edge, Lgrad_flat = compute_edge_loss(
                     image, gt_image, 
                     mode=edge_loss_mode,
-                    lambda_edge=lambda_grad,
+                    lambda_edge=lambda_grad * edge_ramp_w,  # Smooth ramp: 0 -> lambda_grad
                     flat_weight=flat_weight,
                     return_components=True
                 )
             else:
-                # Before start_iter: no edge loss
                 Lgrad = torch.tensor(0.0, device=image.device)
                 Lgrad_edge = torch.tensor(0.0, device=image.device)
                 Lgrad_flat = torch.tensor(0.0, device=image.device)
@@ -683,7 +697,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
             # Pass opacity and radii for Mass-Aware Gradient Weighting
             gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, 
-                                              opacity=gaussians.get_opacity, radii=radii)
+                                              opacity=gaussians.get_opacity, radii=radii, iteration=iteration)
             
             if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                 size_threshold = 20 if iteration > opt.opacity_reset_interval else None
