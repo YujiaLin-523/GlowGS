@@ -26,14 +26,15 @@ evaluate_model() {
     echo "Model: ${model_dir}"
     echo "----------------------------------------"
     
-    # Render test images if not present
-    local test_dir="${model_dir}/test"
-    if [ ! -d "${test_dir}" ] || [ -z "$(ls -A "${test_dir}" 2>/dev/null)" ]; then
-        echo "Rendering test images..."
-        python render.py -m "${model_dir}"
-    else
-        echo "Test renders already exist, skipping render step"
-    fi
+    # Clean up old renders and tfevents
+    echo "Cleaning up old renders and TensorBoard files..."
+    rm -rf "${model_dir}/test"
+    rm -rf "${model_dir}/train"
+    find "${model_dir}" -name "events.out.tfevents.*" -type f -delete
+    
+    # Always render test images
+    echo "Rendering test images..."
+    python render.py -m "${model_dir}"
     
     # Compute metrics
     echo "Computing metrics..."
