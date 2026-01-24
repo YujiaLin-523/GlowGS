@@ -67,7 +67,7 @@ models/
 
 # -------------------- Datasets & outputs --------------------
 /data/
-data/
+data
 datasets/
 outputs/
 output/
