@@ -17,7 +17,7 @@ ns-train nerfacto --data ../data/tandt/train \
                   --timestamp run \
                   --vis tensorboard \
                   --machine.seed 0  \
-                  --pipeline.model.camera-optimizer.mode off \
+                  --pipeline.model.camera-optimizer.mode off
 
 # export pointcloud
 ns-export pointcloud --load-config ../output/train/nerfacto/run/config.yml \
@@ -42,7 +42,7 @@ ns-train nerfacto --data ../data/tandt/truck \
                   --timestamp run \
                   --vis tensorboard \
                   --machine.seed 0  \
-                  --pipeline.model.camera-optimizer.mode off \
+                  --pipeline.model.camera-optimizer.mode off
 
 # export pointcloud
 ns-export pointcloud --load-config ../output/truck/nerfacto/run/config.yml \
