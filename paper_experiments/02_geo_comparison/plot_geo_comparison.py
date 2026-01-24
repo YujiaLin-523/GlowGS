@@ -22,7 +22,7 @@ ZOOM_BOX = (2200, 1450, 420, 420)  # (x, y, w, h) in pixel space of the full ima
 ZOOM_SCALE = 4                     # ×4 or ×8 magnification label appears on zoomed patches
 RECT_COLOR = "#00A0FF"            # uniform zoom box color
 RECT_LINEWIDTH = 2.5
-ERROR_CMAP = plt.cm.magma
+ERROR_CMAP = "inferno"             # high contrast: black-red-yellow
 FIG_BG = "#FFFFFF"
 
 
@@ -163,15 +163,47 @@ def annotate_rgb(rgb: np.ndarray, text: str) -> np.ndarray:
     return np.asarray(img).astype(np.float32) / 255.0
 
 
-def save_with_colorbar(img: np.ndarray, vmin: float, vmax: float, label: str, path: str, cmap) -> None:
-    fig, ax = plt.subplots(figsize=(4, 4), dpi=200)
+def save_with_colorbar(img: np.ndarray, vmin: int, vmax: int, label: str, path: str, cmap) -> None:
+    """Save error map with inset colorbar in lower-right corner."""
+    from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+    import matplotlib.font_manager as fm
+    
+    h, w = img.shape[:2]
+    fig, ax = plt.subplots(figsize=(w / 200, h / 200), dpi=200)
+    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
     im = ax.imshow(img, vmin=vmin, vmax=vmax, cmap=cmap)
-    ax.axis("off")
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
-    cbar.ax.tick_params(labelsize=8)
-    cbar.ax.set_ylabel("|I-GT|", rotation=270, labelpad=10)
-    fig.tight_layout(pad=0.1)
-    fig.savefig(path, bbox_inches="tight", dpi=300, facecolor=FIG_BG)
+    ax.set_axis_off()
+    ax.set_position([0, 0, 1, 1])  # Fill entire figure
+    
+    # Inset colorbar in lower-right corner (vertical, 40% height)
+    axins = inset_axes(
+        ax,
+        width="5%",
+        height="40%",
+        loc="lower right",
+        borderpad=3.0,  # Increased to shift colorbar left
+    )
+    
+    cbar = fig.colorbar(im, cax=axins, orientation="vertical", ticks=[vmin, vmax])
+    
+    # Remove tick marks (length=0)
+    axins.tick_params(axis="y", which="both", length=0)
+    
+    # Font: DejaVu Sans bold white (cross-platform compatible)
+    font_props = fm.FontProperties(family="DejaVu Sans", weight="bold", size=10)
+    
+    # Set tick labels
+    axins.set_yticklabels(["0", "1"], fontproperties=font_props, color="white")
+    
+    # Title (MAE) above colorbar
+    axins.set_title("MAE", fontproperties=font_props, color="white", pad=4)
+    
+    # Thin white border around colorbar
+    for spine in axins.spines.values():
+        spine.set_edgecolor("white")
+        spine.set_linewidth(0.5)
+    
+    fig.savefig(path, dpi=300, pad_inches=0)
     plt.close(fig)
 
 
@@ -218,7 +250,7 @@ def main() -> None:
 
         boxed = draw_box_on_rgb(rgb, ZOOM_BOX)
         boxed = annotate_rgb(boxed, rec["size_fps"])
-        plt.imsave(os.path.join(OUTPUT_DIR, f"{name}_rgb_full.png"), boxed)
+        # plt.imsave(os.path.join(OUTPUT_DIR, f"{name}_rgb_full.png"), boxed)
 
         zoom_rgb = crop(rgb, ZOOM_BOX)
         zoom_rgb = upscale_patch(zoom_rgb, ZOOM_SCALE)
@@ -227,12 +259,12 @@ def main() -> None:
         zoom_ax.text(0.02, 0.95, f"×{ZOOM_SCALE}", color="white", fontsize=12, fontweight="bold", transform=zoom_ax.transAxes, bbox=dict(facecolor="black", alpha=0.65, pad=3, edgecolor="none"), va="top")
         zoom_ax.axis("off")
         zoom_fig.tight_layout(pad=0)
-        zoom_fig.savefig(os.path.join(OUTPUT_DIR, f"{name}_zoom_rgb.png"), bbox_inches="tight", dpi=300, facecolor=FIG_BG)
+        # zoom_fig.savefig(os.path.join(OUTPUT_DIR, f"{name}_zoom_rgb.png"), bbox_inches="tight", dpi=300, facecolor=FIG_BG)
         plt.close(zoom_fig)
 
         zoom_err = crop(error, ZOOM_BOX)
         zoom_err = upscale_patch(zoom_err, ZOOM_SCALE)
-        save_with_colorbar(zoom_err, vmin=0.0, vmax=vmax_err, label="Error", path=os.path.join(OUTPUT_DIR, f"{name}_error.png"), cmap=ERROR_CMAP)
+        save_with_colorbar(zoom_err, vmin=0, vmax=int(vmax_err), label="Error", path=os.path.join(OUTPUT_DIR, f"{name}_error.png"), cmap=ERROR_CMAP)
 
         if norm is None:
             raise ValueError(f"Missing normals for {name}; required for geometry evidence.")
@@ -243,7 +275,7 @@ def main() -> None:
         norm_ax.axis("off")
         norm_ax.set_title("Normal")
         norm_fig.tight_layout(pad=0)
-        norm_fig.savefig(os.path.join(OUTPUT_DIR, f"{name}_normal.png"), bbox_inches="tight", dpi=300, facecolor=FIG_BG)
+        # norm_fig.savefig(os.path.join(OUTPUT_DIR, f"{name}_normal.png"), bbox_inches="tight", dpi=300, facecolor=FIG_BG)
         plt.close(norm_fig)
 
     # Optional combined grid for quick sanity check
