@@ -1390,6 +1390,11 @@ class GaussianModel:
         # sh mask
         sh_mask = (sh_mask > 0.01).cumprod(axis=-1).astype(np.uint8)
         np.savez_compressed(os.path.join(path, "sh_mask.npz"), data=sh_mask)
+        
+        # opacity mask (binarized to save space)
+        mask = self.get_mask.detach().cpu().numpy()
+        mask_bin = (mask > 0.01).astype(np.uint8)
+        np.savez_compressed(os.path.join(path, "mask.npz"), data=mask_bin)
 
         # mlps: quantize MLP parameter tensors to 8-bit (log) and pack into one file
         mlp_save = {}
@@ -1547,6 +1552,16 @@ class GaussianModel:
         # sh_mask
         sh_mask = np.load(os.path.join(path, 'sh_mask.npz'))['data'].astype(np.float32)
         self._sh_mask = torch.from_numpy(np.asarray(sh_mask)).cuda()
+        
+        # opacity mask
+        mask_path = os.path.join(path, 'mask.npz')
+        if os.path.exists(mask_path):
+            mask = np.load(mask_path)['data'].astype(np.float32)
+            self._mask = torch.from_numpy(np.asarray(mask)).cuda()
+        else:
+            # Legacy checkpoint: default to all-ones mask
+            N = self._xyz.shape[0]
+            self._mask = torch.ones((N, 1), device="cuda")
 
         # mlps: prefer combined mlps.npz (quantized) else fallback to older float16 files
         mlps_path = os.path.join(path, 'mlps.npz')

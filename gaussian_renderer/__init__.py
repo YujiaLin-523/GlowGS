@@ -150,6 +150,9 @@ def render_eval(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Ten
     Background tensor (bg_color) must be on GPU!
     """
  
+    # Ensure implicit attributes are in sync (uses cache when available)
+    pc.update_attributes()
+
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     try:
@@ -180,7 +183,21 @@ def render_eval(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Ten
 
     means3D = pc.get_xyz
     means2D = screenspace_points
-    opacity = pc.get_opacity
+    # Some legacy checkpoints do not store mask; default to all-ones to avoid shape/device issues
+    mask = pc.get_mask
+    if mask.numel() == 0 or mask.shape[0] != pc.get_opacity.shape[0]:
+        mask = torch.ones((pc.get_opacity.shape[0], 1), device=pc.get_opacity.device, dtype=pc.get_opacity.dtype)
+    else:
+        mask = mask.to(pc.get_opacity.device)
+    mask = ((mask > 0.01).float() - mask).detach() + mask
+    sh_mask = pc.get_sh_mask
+    if sh_mask.numel() == 0 or sh_mask.shape[0] != pc.get_opacity.shape[0]:
+        sh_mask = torch.ones((pc.get_opacity.shape[0], pc.max_sh_degree), device=pc.get_opacity.device, dtype=pc.get_opacity.dtype)
+    else:
+        sh_mask = sh_mask.to(pc.get_opacity.device)
+    sh_mask = ((sh_mask > 0.01).float() - sh_mask).detach() + sh_mask
+
+    opacity = pc.get_opacity * mask
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -190,23 +207,41 @@ def render_eval(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Ten
     if pipe.compute_cov3D_python:
         cov3D_precomp = pc.get_covariance(scaling_modifier)
     else:
-        scales = pc.get_scaling
+        scales = pc.get_scaling * mask
         rotations = pc.get_rotation
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
     shs = None
     colors_precomp = None
+    features = pc.get_features
+
+    sh_mask_expanded = None
+    if pc.active_sh_degree > 0:
+        N, C, _ = features.shape
+        sh_mask_expanded = torch.ones((N, C, 3), device=features.device, dtype=features.dtype)
+
+        for degree in range(1, min(pc.active_sh_degree + 1, sh_mask.shape[1] + 1)):
+            start_idx = degree ** 2
+            end_idx = min((degree + 1) ** 2, C) if degree < pc.max_sh_degree else C
+            sh_mask_expanded[:, start_idx:end_idx, :] *= sh_mask[:, degree - 1:degree, None]
+
     if override_color is None:
         if pipe.convert_SHs_python:
-            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
-            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
+            shs_masked = features
+            if sh_mask_expanded is not None:
+                shs_masked = shs_masked * sh_mask_expanded
+
+            shs_view = shs_masked.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(features.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             # FIX: DC bias aligned with eval mode (no mask in render_eval, always use 0.5)
             colors_precomp = torch.clamp(sh2rgb + 0.5, 0.0, 1.0)
         else:
-            shs = pc.get_features
+            shs = features
+            if sh_mask_expanded is not None:
+                shs = shs * sh_mask_expanded
     else:
         colors_precomp = override_color
     
