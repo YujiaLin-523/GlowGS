@@ -1,12 +1,17 @@
 """
 Mass-Aware Densification Visualization Script for GlowGS Paper
 
-Visualizes the Mass-Aware Gradient Weighting mechanism on REAL Gaussian data:
-- Load trained Gaussians from PLY file
-- Project to 2D image space
-- Color by mass-aware weight
+Creates an intuitive visualization showing mass-aware weight distribution
+overlaid on a rendered image. 
 
-Black & white, no title, no legend - suitable for method figure.
+Key insight: We use RENDERED image + edge/gradient information as a proxy
+for mass-aware weights since actual screen-space radii require full rendering pipeline.
+
+Regions with:
+- High gradient + varying opacity → HIGH weight (thin structures like spokes)
+- Low gradient + high opacity → LOW weight (large solid regions like ground)
+
+Black & white or heatmap overlay, no title, no legend - suitable for method figure.
 
 Usage:
     python paper_experiments/07_mass_aware/visualize_mass_aware.py
@@ -18,207 +23,159 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 import numpy as np
 from PIL import Image
-from plyfile import PlyData
+from scipy.ndimage import gaussian_filter, sobel
 import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')
 
 
-def load_gaussians_from_ply(ply_path):
+def compute_mass_aware_proxy(image_np):
     """
-    Load Gaussian properties from PLY file.
+    Compute a proxy for mass-aware weight distribution from a 2D image.
     
-    Returns:
-        xyz: [N, 3] positions
-        opacity: [N] opacity values (after sigmoid)
-        scales: [N, 3] scale values (after exp)
-    """
-    print(f"Loading Gaussians from: {ply_path}")
-    plydata = PlyData.read(ply_path)
+    The key insight of mass-aware densification:
+    - High weight for THIN structures (high local gradient, small "radius")
+    - Low weight for LARGE solid regions (low gradient, large "radius")
     
-    xyz = np.stack([
-        np.asarray(plydata.elements[0]["x"]),
-        np.asarray(plydata.elements[0]["y"]),
-        np.asarray(plydata.elements[0]["z"])
-    ], axis=1)
-    
-    # Opacity is stored as inverse sigmoid, apply sigmoid
-    opacity_raw = np.asarray(plydata.elements[0]["opacity"])
-    opacity = 1.0 / (1.0 + np.exp(-opacity_raw))
-    
-    # Scales are stored as log, apply exp
-    scales = np.stack([
-        np.exp(np.asarray(plydata.elements[0]["scale_0"])),
-        np.exp(np.asarray(plydata.elements[0]["scale_1"])),
-        np.exp(np.asarray(plydata.elements[0]["scale_2"]))
-    ], axis=1)
-    
-    print(f"  Loaded {len(xyz)} Gaussians")
-    print(f"  Opacity range: [{opacity.min():.3f}, {opacity.max():.3f}]")
-    print(f"  Scale range: [{scales.min():.4f}, {scales.max():.4f}]")
-    
-    return xyz, opacity, scales
-
-
-def compute_mass_aware_weight(opacity, radius, tau=100.0, mass_scale=0.1):
-    """
-    Compute Mass-Aware gradient weight.
-    
-    Formula: weight = sqrt(α) * 1/(1 + mass_scale * α * r / τ)
-    """
-    alpha = np.clip(opacity, 0.01, 1.0)
-    r = np.clip(radius, 1.0, None)
-    
-    visibility_boost = np.sqrt(alpha)
-    mass = alpha * r
-    mass_penalty = 1.0 / (1.0 + mass_scale * mass / tau)
-    
-    return visibility_boost * mass_penalty
-
-
-def project_gaussians_to_image(xyz, weights, image_shape, camera_center=None, scale=1.0):
-    """
-    Simple orthographic projection of Gaussians to 2D image.
-    Uses X-Z plane for top-down view or X-Y for front view.
+    We approximate this using image gradients:
+    - Edge regions → small Gaussians → high weight
+    - Flat regions → large Gaussians → low weight (mass penalty)
     
     Args:
-        xyz: [N, 3] world positions
-        weights: [N] per-Gaussian weights
-        image_shape: (H, W) output image size
-        camera_center: Optional center point for projection
-        scale: Pixels per world unit
+        image_np: [H, W, 3] RGB image in [0, 1]
     
     Returns:
-        weight_map: [H, W] accumulated weight image
+        weight_map: [H, W] mass-aware weight proxy
+        edge_map: [H, W] edge strength
+        flatness_map: [H, W] flatness (inverse of edge)
     """
-    H, W = image_shape
+    # Convert to grayscale
+    gray = 0.299 * image_np[:,:,0] + 0.587 * image_np[:,:,1] + 0.114 * image_np[:,:,2]
     
-    if camera_center is None:
-        camera_center = xyz.mean(axis=0)
+    # Compute edge strength using Sobel
+    gx = sobel(gray, axis=1)
+    gy = sobel(gray, axis=0)
+    edge_mag = np.sqrt(gx**2 + gy**2)
     
-    # Use X-Y plane (front view) - more intuitive for bicycle
-    x = xyz[:, 0] - camera_center[0]
-    y = xyz[:, 1] - camera_center[1]
+    # Normalize edge to [0, 1]
+    edge_norm = (edge_mag - edge_mag.min()) / (edge_mag.max() - edge_mag.min() + 1e-6)
     
-    # Auto-scale to fit image
-    x_range = x.max() - x.min()
-    y_range = y.max() - y.min()
-    auto_scale = min(W / (x_range + 1e-6), H / (y_range + 1e-6)) * 0.9
+    # Compute local variance as another edge indicator (captures texture)
+    from scipy.ndimage import uniform_filter
+    local_mean = uniform_filter(gray, size=11)
+    local_sqr_mean = uniform_filter(gray**2, size=11)
+    local_var = np.maximum(local_sqr_mean - local_mean**2, 0)
+    local_std = np.sqrt(local_var)
+    local_std_norm = (local_std - local_std.min()) / (local_std.max() - local_std.min() + 1e-6)
     
-    # Convert to pixel coordinates
-    px = ((x * auto_scale) + W / 2).astype(np.int32)
-    py = ((y * auto_scale) + H / 2).astype(np.int32)
+    # Combine edge and texture for "detail score"
+    detail_score = 0.6 * edge_norm + 0.4 * local_std_norm
     
-    # Flip Y for image coordinates (top=0)
-    py = H - 1 - py
+    # Mass-aware weight proxy:
+    # - Detail regions (edges, texture): HIGH weight → visibility boost dominates
+    # - Flat regions (ground, sky): LOW weight → mass penalty dominates
+    #
+    # Formula interpretation:
+    # - In real mass-aware: weight = sqrt(α) / (1 + α*r/τ)
+    # - Thin structures: small r → weight ≈ sqrt(α) → high
+    # - Large blobs: large r → weight ≈ sqrt(α)/(α*r/τ) → low
+    # - Detail score is a proxy for 1/r (inverse of Gaussian size)
     
-    # Clamp to image bounds
-    valid = (px >= 0) & (px < W) & (py >= 0) & (py < H)
-    px, py, w = px[valid], py[valid], weights[valid]
+    weight_map = detail_score ** 0.8  # Slight gamma for better contrast
     
-    # Accumulate weights into image
-    weight_map = np.zeros((H, W), dtype=np.float64)
-    count_map = np.zeros((H, W), dtype=np.float64)
+    # Smooth slightly for cleaner visualization
+    weight_map = gaussian_filter(weight_map, sigma=1)
     
-    np.add.at(weight_map, (py, px), w)
-    np.add.at(count_map, (py, px), 1)
-    
-    # Average where multiple points project to same pixel
-    count_map = np.maximum(count_map, 1)
-    weight_map = weight_map / count_map
-    
-    return weight_map
+    return weight_map, edge_norm, 1.0 - edge_norm
 
 
-def visualize_mass_aware(ply_path, output_dir, image_size=1024):
+def create_heatmap_overlay(image_np, weight_map, alpha=0.6):
     """
-    Generate Mass-Aware weight visualization from real Gaussian data.
+    Create a heatmap overlay on the original image.
+    
+    Using Nature/Science style colormap (viridis):
+    - Low weight → Dark purple/blue
+    - High weight → Bright yellow/green
+    """
+    # Normalize weight to [0, 1]
+    w_norm = (weight_map - weight_map.min()) / (weight_map.max() - weight_map.min() + 1e-6)
+    
+    # Use viridis colormap (Nature/Science standard, perceptually uniform)
+    cmap = plt.cm.viridis
+    heatmap = cmap(w_norm)[:, :, :3]  # [H, W, 3] RGB
+    
+    # Blend with original image
+    overlay = (1 - alpha) * image_np + alpha * heatmap
+    overlay = np.clip(overlay, 0, 1)
+    
+    return overlay, heatmap
+
+
+def visualize_mass_aware(image_path, output_dir, image_size=None):
+    """
+    Generate Mass-Aware weight visualization overlaid on rendered image.
     """
     os.makedirs(output_dir, exist_ok=True)
     
-    # Load Gaussians
-    xyz, opacity, scales = load_gaussians_from_ply(ply_path)
+    # Load image
+    img = Image.open(image_path).convert('RGB')
     
-    # Compute "radius" as mean scale (proxy for screen-space size)
-    # In real rendering, this depends on camera distance, but mean scale is a good proxy
-    mean_scale = scales.mean(axis=1)
+    # Optionally resize for faster processing
+    if image_size is not None:
+        # Maintain aspect ratio
+        w, h = img.size
+        scale = image_size / max(w, h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        img = img.resize((new_w, new_h), Image.LANCZOS)
     
-    # Normalize radius to reasonable range [1, 200] for mass-aware formula
-    radius = 1 + 199 * (mean_scale - mean_scale.min()) / (mean_scale.max() - mean_scale.min() + 1e-6)
+    img_np = np.array(img).astype(np.float32) / 255.0
     
-    print(f"\nComputing Mass-Aware weights...")
-    print(f"  Radius range (normalized): [{radius.min():.1f}, {radius.max():.1f}]")
+    print(f"Processing image: {image_path}")
+    print(f"Image shape: {img_np.shape}")
     
-    # Compute mass-aware weights
-    mass_weights = compute_mass_aware_weight(opacity, radius, tau=100.0, mass_scale=0.1)
+    # Compute mass-aware weight proxy
+    print("Computing mass-aware weight proxy...")
+    weight_map, edge_map, flatness_map = compute_mass_aware_proxy(img_np)
     
-    # Also compute individual components
-    visibility_boost = np.sqrt(np.clip(opacity, 0.01, 1.0))
-    mass = np.clip(opacity, 0.01, 1.0) * radius
-    mass_penalty = 1.0 / (1.0 + 0.1 * mass / 100.0)
+    # ========================================================================
+    # Save only essential visualizations for paper
+    # ========================================================================
     
-    print(f"  Weight range: [{mass_weights.min():.3f}, {mass_weights.max():.3f}]")
+    # Main output: Heatmap overlay (Nature/Science viridis colormap)
+    # This is the most intuitive visualization for method figure
+    overlay, heatmap = create_heatmap_overlay(img_np, weight_map, alpha=0.5)
+    overlay_img = (overlay * 255).astype(np.uint8)
+    Image.fromarray(overlay_img).save(
+        os.path.join(output_dir, 'mass_aware_overlay.png'))
     
-    # Project to 2D images
-    img_shape = (image_size, image_size)
-    
-    print(f"\nProjecting {len(xyz)} Gaussians to {image_size}x{image_size} image...")
-    
-    # 1. Mass-Aware Weight Map (main output)
-    weight_map = project_gaussians_to_image(xyz, mass_weights, img_shape)
-    
-    # 2. Visibility Boost Map
-    visibility_map = project_gaussians_to_image(xyz, visibility_boost, img_shape)
-    
-    # 3. Mass Penalty Map
-    penalty_map = project_gaussians_to_image(xyz, mass_penalty, img_shape)
-    
-    # 4. Opacity Map (for reference)
-    opacity_map = project_gaussians_to_image(xyz, opacity, img_shape)
-    
-    # 5. Radius Map (for reference, inverted so small=bright)
-    radius_norm = 1.0 - (radius - radius.min()) / (radius.max() - radius.min() + 1e-6)
-    radius_map = project_gaussians_to_image(xyz, radius_norm, img_shape)
-    
-    # Apply Gaussian blur to smooth the sparse projections
-    from scipy.ndimage import gaussian_filter
-    sigma = 3
-    weight_map = gaussian_filter(weight_map, sigma=sigma)
-    visibility_map = gaussian_filter(visibility_map, sigma=sigma)
-    penalty_map = gaussian_filter(penalty_map, sigma=sigma)
-    opacity_map = gaussian_filter(opacity_map, sigma=sigma)
-    radius_map = gaussian_filter(radius_map, sigma=sigma)
-    
-    # Normalize and save as grayscale images
-    def save_normalized(arr, filename):
-        arr_norm = (arr - arr.min()) / (arr.max() - arr.min() + 1e-6)
-        img = (arr_norm * 255).astype(np.uint8)
-        Image.fromarray(img, mode='L').save(os.path.join(output_dir, filename))
-    
-    save_normalized(weight_map, 'mass_aware_weight.png')
-    save_normalized(visibility_map, 'visibility_boost.png')
-    save_normalized(penalty_map, 'mass_penalty.png')
-    save_normalized(opacity_map, 'opacity.png')
-    save_normalized(radius_map, 'radius_inv.png')
-    
-    print(f"\nSaved visualizations to: {output_dir}")
-    print("Files generated:")
-    for f in sorted(os.listdir(output_dir)):
-        if f.endswith('.png'):
-            print(f"  - {f}")
+    print(f"\nSaved: {output_dir}/mass_aware_overlay.png")
+    print("\n" + "="*60)
+    print("Mass-Aware Weight Visualization (viridis colormap)")
+    print("="*60)
+    print("YELLOW/GREEN regions: High weight (thin structures, edges)")
+    print("  → Visibility boost dominates → MORE Gaussians allocated")
+    print("PURPLE/BLUE regions: Low weight (large solid regions)")
+    print("  → Mass penalty dominates → FEWER Gaussians allocated")
 
 
 def main():
-    # Use the trained bicycle Gaussian model
-    ply_path = "output/bicycle/point_cloud/iteration_30000/point_cloud.ply"
-    output_dir = "paper_experiments/07_mass_aware"
+    # Use the same GT image as edge loss visualization
+    # Priority: test GT > original image
+    gt_path = "output/bicycle/test/ours_30000/gt/00000.png"
+    fallback_path = "data/360_v2/bicycle/images/_DSC8679.JPG"
     
-    if not os.path.exists(ply_path):
-        print(f"Error: PLY file not found at {ply_path}")
-        print("Please train a model first: python train.py -s data/360_v2/bicycle -m output/bicycle --eval")
+    if os.path.exists(gt_path):
+        image_path = gt_path
+    elif os.path.exists(fallback_path):
+        image_path = fallback_path
+    else:
+        print("Error: No image found!")
+        print(f"  Tried: {gt_path}")
+        print(f"  Tried: {fallback_path}")
         return
     
-    visualize_mass_aware(ply_path, output_dir, image_size=1024)
+    output_dir = "paper_experiments/07_mass_aware"
+    visualize_mass_aware(image_path, output_dir, image_size=None)  # Keep original size
 
 
 if __name__ == "__main__":
