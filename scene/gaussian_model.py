@@ -1556,23 +1556,19 @@ class GaussianModel:
             self._grid.load_state_dict(filtered_sd, strict=False)
 
         # sh_mask: compressed file stores post-sigmoid binary 0/1 values
-        # We need to convert back to logit space since get_sh_mask applies sigmoid
-        sh_mask_binary = np.load(os.path.join(path, 'sh_mask.npz'))['data'].astype(np.float32)
-        # Convert 0->-10 (sigmoid(-10)≈0), 1->+10 (sigmoid(10)≈1) as logit representation
-        sh_mask_logit = np.where(sh_mask_binary > 0.5, 10.0, -10.0)
-        self._sh_mask = torch.from_numpy(sh_mask_logit).cuda()
+        # _masks_preactivated flag will skip sigmoid in get_sh_mask/get_mask
+        sh_mask = np.load(os.path.join(path, 'sh_mask.npz'))['data'].astype(np.float32)
+        self._sh_mask = torch.from_numpy(sh_mask).float().cuda()
         
-        # opacity mask: same issue - compressed stores binary 0/1, needs logit conversion
+        # opacity mask: same - already post-sigmoid 0/1 values
         mask_path = os.path.join(path, 'mask.npz')
         if os.path.exists(mask_path):
-            mask_binary = np.load(mask_path)['data'].astype(np.float32)
-            # Convert 0->-10, 1->+10 for logit representation
-            mask_logit = np.where(mask_binary > 0.5, 10.0, -10.0)
-            self._mask = torch.from_numpy(mask_logit).cuda()
+            mask = np.load(mask_path)['data'].astype(np.float32)
+            self._mask = torch.from_numpy(mask).float().cuda()
         else:
-            # Legacy checkpoint: default to all-ones mask (in logit space: +10)
+            # Legacy checkpoint: default to all-ones mask
             N = self._xyz.shape[0]
-            self._mask = torch.full((N, 1), 10.0, device="cuda")
+            self._mask = torch.ones((N, 1), device="cuda", dtype=torch.float32)
 
         # mlps: prefer combined mlps.npz (quantized) else fallback to older float16 files
         mlps_path = os.path.join(path, 'mlps.npz')
