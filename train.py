@@ -204,6 +204,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         feature_mod_type=feature_mod_type,
         mass_aware_scale=getattr(opt, 'mass_aware_scale', 0.1),
     )
+    if getattr(dataset, "qat", False):
+        gaussians.enable_qat(
+            bit_grid=getattr(dataset, "qat_bit_grid", 6),
+            bit_mlp=getattr(dataset, "qat_bit_mlp", 8),
+            bit_dc=getattr(dataset, "qat_bit_dc", 8),
+            bit_scale=getattr(dataset, "qat_bit_scale", 8),
+            bit_rot=getattr(dataset, "qat_bit_rot", 8),
+            bit_opacity=getattr(dataset, "qat_bit_opacity", 8),
+            bit_sh=getattr(dataset, "qat_bit_sh", 8),
+            mask_th=getattr(dataset, "qat_mask_th", 0.01),
+            log_grid=getattr(dataset, "qat_log_grid", True),
+        )
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     if checkpoint:
@@ -792,7 +804,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print("Measuring FPS via fps_test.py...")
             fps = 0.0
             try:
-                fps_cmd = [sys.executable, "fps_test.py", "-m", dataset.model_path, "--iteration", str(opt.iterations), "--quiet", "--skip_train", "--skip_test"]
+                fps_cmd = [sys.executable, "fps_test.py", "-m", dataset.model_path, "--iteration", str(opt.iterations), "--quiet", "--skip_train"]
                 result = subprocess.run(fps_cmd, capture_output=True, text=True, cwd=os.getcwd())
                 if result.returncode != 0:
                      print(f"fps_test.py failed with return code {result.returncode}")
@@ -809,26 +821,47 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             except Exception as e:
                 print(f"Error running fps_test.py: {e}")
             
-            # Model size calculation (GPCC compressed)
-            print("Computing compressed model size (GPCC)...")
+            # Model size calculation: full compression directory if available, else GPCC xyz only
+            print("Computing compressed model size...")
             from utils.gpcc_utils import encode_xyz
             
             size_mb = 0.0
             try:
-                temp_dir = os.path.join(dataset.model_path, "gpcc_temp")
-                os.makedirs(temp_dir, exist_ok=True)
-                
-                xyz = gaussians.get_xyz.detach().cpu().numpy()
-                encode_xyz(xyz, temp_dir, show=False)
-                
-                bin_path = os.path.join(temp_dir, "xyz.bin")
-                if os.path.exists(bin_path):
-                    size_mb = os.path.getsize(bin_path) / (1024 * 1024)
-                    print(f"  Compressed Size: {size_mb:.2f} MB")
+                compression_root = os.path.join(dataset.model_path, "compression")
+                comp_dir = None
+                if os.path.isdir(compression_root):
+                    from utils.system_utils import searchForMaxIteration
+                    try:
+                        latest_iter = searchForMaxIteration(compression_root)
+                        candidate = os.path.join(compression_root, f"iteration_{latest_iter}")
+                        if os.path.isdir(candidate):
+                            comp_dir = candidate
+                    except Exception:
+                        pass
+                if comp_dir and os.path.isdir(comp_dir):
+                    total = 0
+                    for root, _, files in os.walk(comp_dir):
+                        for fn in files:
+                            total += os.path.getsize(os.path.join(root, fn))
+                    size_mb = total / (1024 * 1024)
+                    print(f"  Compression dir: {comp_dir}")
+                    print(f"  Size (all files): {size_mb:.2f} MB")
                 else:
-                    print("  Compression output xyz.bin not found.")
-                
-                shutil.rmtree(temp_dir)
+                    # Fallback: GPCC xyz only
+                    temp_dir = os.path.join(dataset.model_path, "gpcc_temp")
+                    os.makedirs(temp_dir, exist_ok=True)
+                    
+                    xyz = gaussians.get_xyz.detach().cpu().numpy()
+                    encode_xyz(xyz, temp_dir, show=False)
+                    
+                    bin_path = os.path.join(temp_dir, "xyz.bin")
+                    if os.path.exists(bin_path):
+                        size_mb = os.path.getsize(bin_path) / (1024 * 1024)
+                        print(f"  Compressed Size (xyz.bin only): {size_mb:.2f} MB")
+                    else:
+                        print("  Compression output xyz.bin not found.")
+                    
+                    shutil.rmtree(temp_dir)
             except Exception as e:
                 print(f"Error computing compressed size: {e}")
                 # Fallback to PLY size if compression fails

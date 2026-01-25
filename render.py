@@ -53,6 +53,18 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
             densify_strategy=densify_strategy,
             feature_mod_type=feature_mod_type,
         )
+        if getattr(dataset, "qat", False):
+            gaussians.enable_qat(
+                bit_grid=getattr(dataset, "qat_bit_grid", 6),
+                bit_mlp=getattr(dataset, "qat_bit_mlp", 8),
+                bit_dc=getattr(dataset, "qat_bit_dc", 8),
+                bit_scale=getattr(dataset, "qat_bit_scale", 8),
+                bit_rot=getattr(dataset, "qat_bit_rot", 8),
+                bit_opacity=getattr(dataset, "qat_bit_opacity", 8),
+                bit_sh=getattr(dataset, "qat_bit_sh", 8),
+                mask_th=getattr(dataset, "qat_mask_th", 0.01),
+                log_grid=getattr(dataset, "qat_log_grid", True),
+            )
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         
         # Precompute attributes once for fast rendering (skip per-frame MLP inference)

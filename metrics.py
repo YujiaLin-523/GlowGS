@@ -25,7 +25,7 @@ def readImages(renders_dir, gt_dir):
     renders = []
     gts = []
     image_names = []
-    for fname in tqdm(os.listdir(renders_dir), desc="Loading images"):
+    for fname in tqdm(os.listdir(renders_dir), desc="Loading images", leave=False):
         render = Image.open(renders_dir / fname)
         gt = Image.open(gt_dir / fname)
         renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].cuda())

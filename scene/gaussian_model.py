@@ -167,6 +167,19 @@ class GaussianModel:
         self.optimizer_i = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        # QAT config
+        self.qat_enabled = False
+        self.qat_bits = {
+            "grid": 6,
+            "mlp": 8,
+            "dc": 8,
+            "scale": 8,
+            "rot": 8,
+            "opacity": 8,
+            "sh": 8,
+        }
+        self.qat_mask_th = 0.01
+        self.qat_log_grid = True
         # Precomputed attribute cache for fast inference (populated by precompute_attributes)
         self._precomputed_cache = None
         self.setup_functions()
@@ -223,6 +236,43 @@ class GaussianModel:
             self._opacity_init,
             self.spatial_lr_scale,
         )
+
+    # === QAT helpers ===
+    def enable_qat(self, bit_grid=6, bit_mlp=8, bit_dc=8, bit_scale=8, bit_rot=8, bit_opacity=8, bit_sh=8, mask_th=0.01, log_grid=True):
+        self.qat_enabled = True
+        self.qat_bits.update({
+            "grid": bit_grid,
+            "mlp": bit_mlp,
+            "dc": bit_dc,
+            "scale": bit_scale,
+            "rot": bit_rot,
+            "opacity": bit_opacity,
+            "sh": bit_sh,
+        })
+        self.qat_mask_th = mask_th
+        self.qat_log_grid = log_grid
+
+    def _fake_quant(self, x: torch.Tensor, bit: int = 8, log: bool = False, eps: float = 1e-8):
+        if bit <= 0:
+            return x
+        with torch.no_grad():
+            x_det = x.detach()
+            if log:
+                x_sign = torch.sign(x_det)
+                x_log = torch.log1p(torch.abs(x_det))
+                xmin = x_log.min()
+                xmax = x_log.max()
+                scale = (xmax - xmin + eps) / (2 ** bit - 1)
+                x_q = torch.clamp(torch.round((x_log - xmin) / scale), 0, 2 ** bit - 1)
+                x_hat = torch.expm1(x_q * scale + xmin) * x_sign
+            else:
+                xmin = x_det.min()
+                xmax = x_det.max()
+                scale = (xmax - xmin + eps) / (2 ** bit - 1)
+                x_q = torch.clamp(torch.round((x_det - xmin) / scale), 0, 2 ** bit - 1)
+                x_hat = x_q * scale + xmin
+        # STE: keep gradient of original x
+        return x + (x_hat - x).detach()
     
     def restore(self, model_args, training_args):
         """
@@ -342,6 +392,7 @@ class GaussianModel:
             self._rotation = self._precomputed_cache['rotation']
             if 'features_rest' in self._precomputed_cache:
                 self._features_rest = self._precomputed_cache['features_rest']
+            # cached values already quantized (if QAT enabled during precompute)
             return
         
         # 3DGS mode: skip encoder, use explicit SH parameters only
@@ -425,6 +476,8 @@ class GaussianModel:
                     # Unexpected fused output; treat as fused latent
                     fused = encoder_out
                     fused = torch.clamp(fused, -10.0, 10.0)
+                    if self.qat_enabled:
+                        fused = self._fake_quant(fused, bit=self.qat_bits["grid"], log=self.qat_log_grid)
                     try:
                         self._opacity[i:end_idx] = self._opacity_head(fused) + self._opacity_init
                         self._scaling[i:end_idx] = self._scaling_head(fused)
@@ -440,6 +493,9 @@ class GaussianModel:
 
                 # Geometry heads: scale, rotation, opacity
                 # Project geometry_latent (C_shared + C_role) to head input dim (C_shared)
+                if self.qat_enabled:
+                    geometry_chunk = self._fake_quant(geometry_chunk, bit=self.qat_bits["grid"], log=self.qat_log_grid)
+                    appearance_chunk = self._fake_quant(appearance_chunk, bit=self.qat_bits["grid"], log=self.qat_log_grid)
                 geometry_proj = self._geometry_input_proj(geometry_chunk)  # [N, C_shared]
                 geometry_proj = torch.clamp(geometry_proj, -10.0, 10.0)
                 
@@ -478,6 +534,8 @@ class GaussianModel:
                 coords = contracted_xyz[i: end_idx]
                 encoder_out = self._grid(coords)
                 feats = encoder_out if not isinstance(encoder_out, tuple) else encoder_out[0]
+                if self.qat_enabled:
+                    feats = self._fake_quant(feats, bit=self.qat_bits["grid"], log=self.qat_log_grid)
                 # Encoder already clamps, skip redundant clamp
                 opacity_chunks.append(self._opacity_head(feats) + self._opacity_init)
                 scaling_chunks.append(self._scaling_head(feats))
@@ -494,6 +552,27 @@ class GaussianModel:
             # Update cache hash after successful computation
             self._cached_attributes_hash = (self._xyz.data_ptr(), N, self._xyz.requires_grad)
         
+        # Apply QAT fake quant + STE masks once per update
+        if self.qat_enabled:
+            self._opacity = self._fake_quant(self._opacity, bit=self.qat_bits["opacity"])
+            self._scaling = self._fake_quant(self._scaling, bit=self.qat_bits["scale"])
+            self._rotation = torch.nn.functional.normalize(
+                self._fake_quant(self._rotation, bit=self.qat_bits["rot"]), dim=-1
+            )
+            if self.max_sh_degree > 0:
+                self._features_rest = self._fake_quant(self._features_rest, bit=self.qat_bits["sh"])
+            # Explicit params
+            self._features_dc = self._fake_quant(self._features_dc, bit=self.qat_bits["dc"])
+
+            # Masks: single threshold + STE (skip if preactivated from compressed ckpt)
+            if not getattr(self, '_masks_preactivated', False):
+                mask_soft = self.mask_activation(self._mask)
+                mask_hard = (mask_soft > self.qat_mask_th).float()
+                self._mask_q = mask_hard + (mask_soft - mask_soft.detach())
+                sh_mask_soft = self.sh_mask_activation(self._sh_mask)
+                sh_mask_hard = (sh_mask_soft > self.qat_mask_th).float()
+                self._sh_mask_q = sh_mask_hard + (sh_mask_soft - sh_mask_soft.detach())
+
         # NOTE: Removed torch.cuda.empty_cache() here for real-time performance
         # empty_cache() is expensive (~1-2ms) and should only be called when necessary
     
@@ -551,7 +630,10 @@ class GaussianModel:
     def get_scaling_base(self):
         # Clamp before exp to prevent overflow (exp(10) ≈ 22026, exp(20) ≈ 4.8e8)
         clamped_scaling = torch.clamp(self._scaling_base, -15.0, 10.0)
-        return self.scaling_base_activation(clamped_scaling)
+        base = self.scaling_base_activation(clamped_scaling)
+        if self.qat_enabled:
+            base = self._fake_quant(base, bit=self.qat_bits["scale"])
+        return base
 
     @property
     def get_scaling(self):
@@ -570,7 +652,10 @@ class GaussianModel:
             rotation,
             torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=rotation.device, dtype=rotation.dtype).expand_as(rotation)
         )
-        return self.rotation_activation(rotation)
+        rot = self.rotation_activation(rotation)
+        if self.qat_enabled:
+            rot = torch.nn.functional.normalize(self._fake_quant(rot, bit=self.qat_bits["rot"]), dim=-1)
+        return rot
     
     @property
     def get_xyz(self):
@@ -602,13 +687,19 @@ class GaussianModel:
         features_dc = self._features_dc
         if self.max_sh_degree > 0:
             features_rest = self._features_rest
-            return torch.cat((features_dc, features_rest), dim=1)
+            feats = torch.cat((features_dc, features_rest), dim=1)
         else:
-            return features_dc
+            feats = features_dc
+        if self.qat_enabled and feats.numel() > 0:
+            feats = self._fake_quant(feats, bit=self.qat_bits["mlp"])
+        return feats
     
     @property
     def get_opacity(self):
-        return self.opacity_activation(self._opacity)
+        op = self.opacity_activation(self._opacity)
+        if self.qat_enabled:
+            op = self._fake_quant(op, bit=self.qat_bits["opacity"])
+        return op
     
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
@@ -618,6 +709,8 @@ class GaussianModel:
         # Skip sigmoid if masks were loaded from compressed checkpoint (already 0/1)
         if getattr(self, '_masks_preactivated', False):
             return self._mask
+        if self.qat_enabled and hasattr(self, "_mask_q"):
+            return self._mask_q
         return self.mask_activation(self._mask)
 
     @property
@@ -625,6 +718,8 @@ class GaussianModel:
         # Skip sigmoid if masks were loaded from compressed checkpoint (already 0/1)
         if getattr(self, '_masks_preactivated', False):
             return self._sh_mask
+        if self.qat_enabled and hasattr(self, "_sh_mask_q"):
+            return self._sh_mask_q
         return self.sh_mask_activation(self._sh_mask)
     
     def oneupSHdegree(self):
@@ -896,17 +991,28 @@ class GaussianModel:
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             stored_state = self.optimizer.state.get(group['params'][0], None)
+            param_tensor = group["params"][0]
+            # If shapes mismatch (can happen after densify/prune races), align mask length
+            if param_tensor.shape[0] != mask.shape[0]:
+                # truncate or pad mask to param length to avoid crash; logs kept minimal
+                if param_tensor.shape[0] < mask.shape[0]:
+                    local_mask = mask[:param_tensor.shape[0]]
+                else:
+                    pad = torch.zeros((param_tensor.shape[0] - mask.shape[0],), device=mask.device, dtype=mask.dtype).bool()
+                    local_mask = torch.cat([mask, pad], dim=0)
+            else:
+                local_mask = mask
             if stored_state is not None:
-                stored_state["exp_avg"] = stored_state["exp_avg"][mask]
-                stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
+                stored_state["exp_avg"] = stored_state["exp_avg"][local_mask]
+                stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][local_mask]
 
                 del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter((group["params"][0][mask].requires_grad_(True)))
+                group["params"][0] = nn.Parameter((group["params"][0][local_mask].requires_grad_(True)))
                 self.optimizer.state[group['params'][0]] = stored_state
 
                 optimizable_tensors[group["name"]] = group["params"][0]
             else:
-                group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(True))
+                group["params"][0] = nn.Parameter(group["params"][0][local_mask].requires_grad_(True))
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
@@ -920,7 +1026,14 @@ class GaussianModel:
         # Ensure mask is on CUDA for consistency
         if not mask.is_cuda:
             mask = mask.cuda()
-        
+        # Align mask length to current xyz length to avoid shape mismatches
+        n_xyz = self._xyz.shape[0]
+        if mask.shape[0] != n_xyz:
+            if mask.shape[0] > n_xyz:
+                mask = mask[:n_xyz]
+            else:
+                pad = torch.zeros((n_xyz - mask.shape[0],), device=mask.device, dtype=mask.dtype).bool()
+                mask = torch.cat([mask, pad], dim=0)
         valid_points_mask = ~mask
         
         if self.optimizer is None:
@@ -1016,9 +1129,24 @@ class GaussianModel:
                 self._features_rest = optimizable_tensors["f_rest"]
 
             # Training buffers - these MUST exist and match in training mode
-            self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
-            self.denom = self.denom[valid_points_mask]
-            self.max_radii2D = self.max_radii2D[valid_points_mask]
+            def _safe_slice(buf):
+                if buf is None or not isinstance(buf, torch.Tensor) or buf.numel() == 0:
+                    return buf
+                if buf.shape[0] != valid_points_mask.shape[0]:
+                    # align mask again to buffer length
+                    vm = valid_points_mask
+                    if vm.shape[0] > buf.shape[0]:
+                        vm = vm[:buf.shape[0]]
+                    else:
+                        pad = torch.zeros((buf.shape[0] - vm.shape[0],), device=vm.device, dtype=vm.dtype).bool()
+                        vm = torch.cat([vm, pad], dim=0)
+                else:
+                    vm = valid_points_mask
+                return buf[vm]
+
+            self.xyz_gradient_accum = _safe_slice(self.xyz_gradient_accum)
+            self.denom = _safe_slice(self.denom)
+            self.max_radii2D = _safe_slice(self.max_radii2D)
         
         # Clear cached contracted_xyz since xyz changed
         if hasattr(self, '_cached_contracted_xyz'):
@@ -1367,52 +1495,50 @@ class GaussianModel:
         # All files use underscore naming format for consistency
         
         grid_state_dict = self._grid.state_dict()
-        # Pack all grid components into a single compressed archive to reduce header
-        # overhead and improve compression across parameters.
         grid_save_dict = {}
+        grid_bit = self.qat_bits.get("grid", 6)
+        grid_log = self.qat_log_grid
         for key, value in grid_state_dict.items():
-            normalized_key = key.replace('.', '_')  # e.g., "hash_encoder.params" -> "hash_encoder_params"
+            normalized_key = key.replace('.', '_')
             param_data = value.detach().cpu().numpy()
-            # Quantize grid parameters (log quantization) to uint8
-            param_quant, param_scale, param_min = quantize(param_data, bit=6, log=True)
+            param_quant, param_scale, param_min = quantize(param_data, bit=grid_bit, log=grid_log)
             grid_save_dict[f"{normalized_key}_data"] = param_quant.astype(np.uint8)
             grid_save_dict[f"{normalized_key}_scale"] = param_scale
             grid_save_dict[f"{normalized_key}_min"] = param_min
             grid_save_dict[f"{normalized_key}_orig"] = np.array(key)
-
-        # Save single combined file
         np.savez_compressed(os.path.join(path, "grid_all.npz"), **grid_save_dict)
 
         # G-PCC encoding
         encode_xyz(xyz, path)
 
-        # uniform quantization
-        f_dc_quant, f_dc_scale, f_dc_min = quantize(f_dc, bit=8)
-        scaling_base_quant, scaling_base_scale, scaling_base_min = quantize(scale_base, bit=8)
+        # uniform quantization (bits from QAT config)
+        f_dc_quant, f_dc_scale, f_dc_min = quantize(f_dc, bit=self.qat_bits.get("dc", 8))
+        scaling_base_quant, scaling_base_scale, scaling_base_min = quantize(scale_base, bit=self.qat_bits.get("scale", 8))
 
         np.savez_compressed(os.path.join(path, "f_dc.npz"), data=f_dc_quant.astype(np.uint8), scale=f_dc_scale, min=f_dc_min)
         np.savez_compressed(os.path.join(path, "scale_base.npz"), data=scaling_base_quant.astype(np.uint8), scale=scaling_base_scale, min=scaling_base_min)
         
-        # sh mask
-        sh_mask = (sh_mask > 0.01).cumprod(axis=-1).astype(np.uint8)
+        # sh mask (single threshold)
+        sh_mask = (sh_mask > self.qat_mask_th).cumprod(axis=-1).astype(np.uint8)
         np.savez_compressed(os.path.join(path, "sh_mask.npz"), data=sh_mask)
         
         # opacity mask (binarized to save space)
         mask = self.get_mask.detach().cpu().numpy()
-        mask_bin = (mask > 0.01).astype(np.uint8)
+        mask_bin = (mask > self.qat_mask_th).astype(np.uint8)
         np.savez_compressed(os.path.join(path, "mask.npz"), data=mask_bin)
 
-        # mlps: quantize MLP parameter tensors to 8-bit (log) and pack into one file
+        # mlps: quantize MLP parameter tensors (configurable bit)
         mlp_save = {}
         opacity_params = self._opacity_head.state_dict()['params'].cpu().detach().numpy()
         f_rest_params = self._features_rest_head.state_dict()['params'].cpu().detach().numpy()
         scale_params = self._scaling_head.state_dict()['params'].cpu().detach().numpy()
         rotation_params = self._rotation_head.state_dict()['params'].cpu().detach().numpy()
 
-        o_q, o_s, o_m = quantize(opacity_params, bit=8, log=True)
-        fr_q, fr_s, fr_m = quantize(f_rest_params, bit=8, log=True)
-        sc_q, sc_s, sc_m = quantize(scale_params, bit=8, log=True)
-        rt_q, rt_s, rt_m = quantize(rotation_params, bit=8, log=True)
+        bit_mlp = self.qat_bits.get("mlp", 8)
+        o_q, o_s, o_m = quantize(opacity_params, bit=bit_mlp, log=False)
+        fr_q, fr_s, fr_m = quantize(f_rest_params, bit=bit_mlp, log=False)
+        sc_q, sc_s, sc_m = quantize(scale_params, bit=bit_mlp, log=False)
+        rt_q, rt_s, rt_m = quantize(rotation_params, bit=bit_mlp, log=False)
 
         mlp_save['opacity_data'] = o_q.astype(np.uint8)
         mlp_save['opacity_scale'] = o_s
@@ -1431,43 +1557,11 @@ class GaussianModel:
 
         # Calculate and print total size
         size = 0
-        size += os.path.getsize(os.path.join(path, "xyz.bin"))
-        print("xyz.bin", os.path.getsize(os.path.join(path, "xyz.bin")) / 1e6)
-        size += os.path.getsize(os.path.join(path, "f_dc.npz"))
-        print("f_dc.npz", os.path.getsize(os.path.join(path, "f_dc.npz")) / 1e6)
-        size += os.path.getsize(os.path.join(path, "scale_base.npz"))
-        print("scale_base.npz", os.path.getsize(os.path.join(path, "scale_base.npz")) / 1e6)
-        
-        # Calculate total size of grid archive (prefer combined file)
-        grid_total_size = 0
-        grid_all_path = os.path.join(path, "grid_all.npz")
-        if os.path.exists(grid_all_path):
-            grid_total_size = os.path.getsize(grid_all_path)
-            print("grid_all.npz", grid_total_size / 1e6)
-        else:
-            for filename in os.listdir(path):
-                if filename.startswith("grid_") and filename.endswith(".npz"):
-                    file_path = os.path.join(path, filename)
-                    file_size = os.path.getsize(file_path)
-                    grid_total_size += file_size
-                    print(f"{filename}", file_size / 1e6)
-        size += grid_total_size
-        print(f"grid_total (all components)", grid_total_size / 1e6)
-        
-        size += os.path.getsize(os.path.join(path, "sh_mask.npz"))
-        print("sh_mask.npz", os.path.getsize(os.path.join(path, "sh_mask.npz")) / 1e6)
-        # mlps are saved in a single file now
-        if os.path.exists(os.path.join(path, "mlps.npz")):
-            size += os.path.getsize(os.path.join(path, "mlps.npz"))
-            print("mlps.npz", os.path.getsize(os.path.join(path, "mlps.npz")) / 1e6)
-        else:
-            # backward-compatible individual mlp files
-            for name in ["opacity.npz", "f_rest.npz", "scale.npz", "rotation.npz"]:
-                if os.path.exists(os.path.join(path, name)):
-                    size += os.path.getsize(os.path.join(path, name))
-                    print(name, os.path.getsize(os.path.join(path, name)) / 1e6)
-
-        print(f"Total size: {(size / 1e6)} MB")
+        for root, _, files in os.walk(path):
+            for fn in files:
+                size += os.path.getsize(os.path.join(root, fn))
+        size_mb = size / 1e6
+        print(f"[Compression] Total size (all files): {size_mb:.2f} MB")
 
     def decompress_attributes(self, path):
         # Load and verify configuration
@@ -1605,10 +1699,10 @@ class GaussianModel:
 
         if os.path.exists(mlps_path):
             mlp_npz = np.load(mlps_path)
-            o = dequantize(mlp_npz['opacity_data'], mlp_npz['opacity_scale'], mlp_npz['opacity_min'], log=True)
-            fr = dequantize(mlp_npz['f_rest_data'], mlp_npz['f_rest_scale'], mlp_npz['f_rest_min'], log=True)
-            sc = dequantize(mlp_npz['scale_data'], mlp_npz['scale_scale'], mlp_npz['scale_min'], log=True)
-            rt = dequantize(mlp_npz['rotation_data'], mlp_npz['rotation_scale'], mlp_npz['rotation_min'], log=True)
+            o = dequantize(mlp_npz['opacity_data'], mlp_npz['opacity_scale'], mlp_npz['opacity_min'], log=False)
+            fr = dequantize(mlp_npz['f_rest_data'], mlp_npz['f_rest_scale'], mlp_npz['f_rest_min'], log=False)
+            sc = dequantize(mlp_npz['scale_data'], mlp_npz['scale_scale'], mlp_npz['scale_min'], log=False)
+            rt = dequantize(mlp_npz['rotation_data'], mlp_npz['rotation_scale'], mlp_npz['rotation_min'], log=False)
 
             _coerce_and_assign(self._opacity_head, o, 'opacity')
             _coerce_and_assign(self._features_rest_head, fr, 'features_rest')
@@ -1632,6 +1726,18 @@ class GaussianModel:
         self.decompress_attributes(path)
         # Mark masks as pre-activated (already 0/1, skip sigmoid in get_mask/get_sh_mask)
         self._masks_preactivated = True
+        # Align mask and sh_mask length with xyz to avoid shape mismatch at render time
+        def _align_mask(tensor, target_len, fill=1.0):
+            if tensor.shape[0] > target_len:
+                return tensor[:target_len]
+            if tensor.shape[0] < target_len:
+                pad_shape = (target_len - tensor.shape[0],) + tensor.shape[1:]
+                pad = torch.full(pad_shape, fill, device=tensor.device, dtype=tensor.dtype)
+                return torch.cat([tensor, pad], dim=0)
+            return tensor
+        target_len = self._xyz.shape[0]
+        self._mask = _align_mask(self._mask, target_len, fill=1.0)
+        self._sh_mask = _align_mask(self._sh_mask, target_len, fill=1.0)
         self.update_attributes()
         sh_mask = self._sh_mask
         self.sh_levels = (sh_mask > 0.01).float().sum(1).int()
