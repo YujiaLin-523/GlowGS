@@ -27,7 +27,7 @@ train_scene() {
     python train.py \
         -s "${scene_path}" \
         -m "${output_dir}" \
-        --eval --qat \
+        --eval \
         --pcd_path "${pcd_path}"
     
     echo "✓ Completed: ${scene_name}"
