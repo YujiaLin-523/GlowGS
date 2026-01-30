@@ -26,6 +26,40 @@ from utils.gpcc_utils import encode_xyz, decode_xyz
 from encoders import create_gaussian_encoder, get_encoder_output_dims
 import tinycudann as tcnn
 
+
+def _to_np_fp16(t: torch.Tensor):
+    """Detach tensor to CPU and store as float16 for lossless downstream reload."""
+    return t.detach().cpu().half().numpy()
+
+
+def _save_npz(path: str, **arrays):
+    """Wrapper to write compressed npz with clear intent."""
+    np.savez_compressed(path, **arrays)
+
+
+def _load_npz(path: str):
+    return np.load(path)
+
+
+def _np_to_torch(arr, device, dtype):
+    return torch.from_numpy(np.asarray(arr)).to(device=device, dtype=dtype)
+
+
+def _strict_assign(dst: torch.Tensor, src: torch.Tensor, name: str, path: str):
+    if dst.shape != src.shape:
+        raise RuntimeError(f"Shape mismatch for {name}: dst {dst.shape} vs src {src.shape} from {path}")
+    if dst.numel() != src.numel():
+        raise RuntimeError(f"Numel mismatch for {name}: dst {dst.numel()} vs src {src.numel()} from {path}")
+    dst.copy_(src.to(device=dst.device, dtype=dst.dtype))
+
+
+def _strict_assign_param(head, src: torch.Tensor, name: str, path: str):
+    dst = head.params
+    if dst.shape != src.shape:
+        raise RuntimeError(f"Shape mismatch for {name}: dst {dst.shape} vs src {src.shape} from {path}")
+    if dst.numel() != src.numel():
+        raise RuntimeError(f"Numel mismatch for {name}: dst {dst.numel()} vs src {src.numel()} from {path}")
+    head.params = nn.Parameter(src.to(device=dst.device, dtype=dst.dtype))
 class GaussianModel:
 
     def setup_functions(self):
@@ -1367,7 +1401,7 @@ class GaussianModel:
         for key, value in grid_state_dict.items():
             normalized_key = key.replace('.', '_')  # e.g., "hash_encoder.params" -> "hash_encoder_params"
             param_data = value.detach().cpu().numpy()
-            # Quantize grid parameters (log quantization) to uint8
+            # Quantize grid parameters (log quantization) to uint8 (legacy path)
             param_quant, param_scale, param_min = quantize(param_data, bit=6, log=True)
             grid_save_dict[f"{normalized_key}_data"] = param_quant.astype(np.uint8)
             grid_save_dict[f"{normalized_key}_scale"] = param_scale
@@ -1377,37 +1411,52 @@ class GaussianModel:
         # Save single combined file
         np.savez_compressed(os.path.join(path, "grid_all.npz"), **grid_save_dict)
 
-        # G-PCC encoding
+        # G-PCC encoding (geometry stays as legacy GPCC path)
         encode_xyz(xyz, path)
 
-        # uniform quantization
+        # -------- Quality-first artifacts (preferred for rendering fidelity) --------
+        # DC in FP16 to preserve SH0/base color fidelity.
+        _save_npz(os.path.join(path, "f_dc_fp16.npz"), data=_to_np_fp16(self._features_dc))
+        # Log-scale base stored in FP16 to avoid exp-amplified quantization error.
+        _save_npz(os.path.join(path, "scale_base_fp16.npz"), data=_to_np_fp16(self._scaling_base))
+        # Mask / SH mask stored as logits (no binarization) to keep activation semantics.
+        _save_npz(os.path.join(path, "mask_logits_fp16.npz"), data=_to_np_fp16(self._mask))
+        _save_npz(os.path.join(path, "sh_mask_logits_fp16.npz"), data=_to_np_fp16(self._sh_mask))
+        # Tri-plane VM parameters stored in FP16 to avoid implicit attribute drift.
+        if hasattr(self._grid, 'plane_xy'):
+            _save_npz(os.path.join(path, "vm_planes_fp16.npz"),
+                      plane_xy=_to_np_fp16(self._grid.plane_xy),
+                      plane_xz=_to_np_fp16(self._grid.plane_xz),
+                      plane_yz=_to_np_fp16(self._grid.plane_yz))
+        # Tinycudann heads stored FP16, no quantization.
+        _save_npz(os.path.join(path, "mlps_fp16.npz"),
+                  opacity=_to_np_fp16(self._opacity_head.state_dict()['params']),
+                  scaling=_to_np_fp16(self._scaling_head.state_dict()['params']),
+                  rotation=_to_np_fp16(self._rotation_head.state_dict()['params']),
+                  features_rest=_to_np_fp16(self._features_rest_head.state_dict()['params']),
+                  opacity_numel=np.array([self._opacity_head.state_dict()['params'].numel()]),
+                  scaling_numel=np.array([self._scaling_head.state_dict()['params'].numel()]),
+                  rotation_numel=np.array([self._rotation_head.state_dict()['params'].numel()]),
+                  features_rest_numel=np.array([self._features_rest_head.state_dict()['params'].numel()]))
+
+        # -------- Legacy quantized artifacts (kept for backward compatibility) --------
         f_dc_quant, f_dc_scale, f_dc_min = quantize(f_dc, bit=8)
         scaling_base_quant, scaling_base_scale, scaling_base_min = quantize(scale_base, bit=8)
-
         np.savez_compressed(os.path.join(path, "f_dc.npz"), data=f_dc_quant.astype(np.uint8), scale=f_dc_scale, min=f_dc_min)
         np.savez_compressed(os.path.join(path, "scale_base.npz"), data=scaling_base_quant.astype(np.uint8), scale=scaling_base_scale, min=scaling_base_min)
-        
-        # sh mask
-        sh_mask = (sh_mask > 0.01).cumprod(axis=-1).astype(np.uint8)
-        np.savez_compressed(os.path.join(path, "sh_mask.npz"), data=sh_mask)
-        
-        # opacity mask (binarized to save space)
-        mask = self.get_mask.detach().cpu().numpy()
-        mask_bin = (mask > 0.01).astype(np.uint8)
-        np.savez_compressed(os.path.join(path, "mask.npz"), data=mask_bin)
-
-        # mlps: quantize MLP parameter tensors to 8-bit (log) and pack into one file
+        sh_mask_legacy = (sh_mask > 0.01).cumprod(axis=-1).astype(np.uint8)
+        np.savez_compressed(os.path.join(path, "sh_mask.npz"), data=sh_mask_legacy)
+        mask_legacy = (self.get_mask.detach().cpu().numpy() > 0.01).astype(np.uint8)
+        np.savez_compressed(os.path.join(path, "mask.npz"), data=mask_legacy)
         mlp_save = {}
         opacity_params = self._opacity_head.state_dict()['params'].cpu().detach().numpy()
         f_rest_params = self._features_rest_head.state_dict()['params'].cpu().detach().numpy()
         scale_params = self._scaling_head.state_dict()['params'].cpu().detach().numpy()
         rotation_params = self._rotation_head.state_dict()['params'].cpu().detach().numpy()
-
         o_q, o_s, o_m = quantize(opacity_params, bit=8, log=True)
         fr_q, fr_s, fr_m = quantize(f_rest_params, bit=8, log=True)
         sc_q, sc_s, sc_m = quantize(scale_params, bit=8, log=True)
         rt_q, rt_s, rt_m = quantize(rotation_params, bit=8, log=True)
-
         mlp_save['opacity_data'] = o_q.astype(np.uint8)
         mlp_save['opacity_scale'] = o_s
         mlp_save['opacity_min'] = o_m
@@ -1420,7 +1469,6 @@ class GaussianModel:
         mlp_save['rotation_data'] = rt_q.astype(np.uint8)
         mlp_save['rotation_scale'] = rt_s
         mlp_save['rotation_min'] = rt_m
-
         np.savez_compressed(os.path.join(path, "mlps.npz"), **mlp_save)
 
         # Calculate and print total size
@@ -1486,15 +1534,15 @@ class GaussianModel:
         xyz = decode_xyz(path)
         self._xyz = torch.from_numpy(np.asarray(xyz)).cuda()
 
-        # uniform dequantization
-        f_dc_dict = np.load(os.path.join(path, 'f_dc.npz'))
-        scale_base_dict = np.load(os.path.join(path, 'scale_base.npz'))
-
-        f_dc = dequantize(f_dc_dict['data'], f_dc_dict['scale'], f_dc_dict['min'])
-        scaling_base = dequantize(scale_base_dict['data'], scale_base_dict['scale'], scale_base_dict['min'])
-
-        self._features_dc = torch.from_numpy(np.asarray(f_dc)).cuda()
-        self._scaling_base = torch.from_numpy(np.asarray(scaling_base)).cuda()
+        # Legacy uniform dequantization (kept for backward compatibility)
+        if os.path.exists(os.path.join(path, 'f_dc.npz')):
+            f_dc_dict = np.load(os.path.join(path, 'f_dc.npz'))
+            f_dc = dequantize(f_dc_dict['data'], f_dc_dict['scale'], f_dc_dict['min'])
+            self._features_dc = torch.from_numpy(np.asarray(f_dc)).cuda()
+        if os.path.exists(os.path.join(path, 'scale_base.npz')):
+            scale_base_dict = np.load(os.path.join(path, 'scale_base.npz'))
+            scaling_base = dequantize(scale_base_dict['data'], scale_base_dict['scale'], scale_base_dict['min'])
+            self._scaling_base = torch.from_numpy(np.asarray(scaling_base)).cuda()
         
         grid_state_dict = {}
         # Prefer loading combined grid archive if present
@@ -1563,61 +1611,75 @@ class GaussianModel:
             N = self._xyz.shape[0]
             self._mask = torch.ones((N, 1), device="cuda")
 
-        # mlps: prefer combined mlps.npz (quantized) else fallback to older float16 files
-        mlps_path = os.path.join(path, 'mlps.npz')
-        def _coerce_and_assign(head, np_array, name):
-            """Coerce loaded numpy params to the target size expected by the head and assign safely."""
-            flat = np.asarray(np_array).ravel()
-            try:
-                expected = head.state_dict()['params'].numel()
-            except Exception:
-                # Fallback: try length of params attribute if present
-                try:
-                    expected = int(head.params.numel())
-                except Exception:
-                    expected = flat.size
-
-            if flat.size != expected:
-                print(f"[WARN] Loaded '{name}' params size ({flat.size}) != expected ({expected}), coercing")
-                if flat.size > expected:
-                    flat = flat[:expected]
-                else:
-                    # pad with zeros
-                    pad = np.zeros(expected - flat.size, dtype=flat.dtype)
-                    flat = np.concatenate([flat, pad])
-
-            tensor = torch.from_numpy(flat).half().cuda()
-            # Assign to head in a way compatible with tinycudann
-            try:
-                head.params = nn.Parameter(tensor)
-            except Exception:
-                # Last resort: try to set via state_dict
-                sd = head.state_dict()
-                sd['params'] = tensor
-                head.load_state_dict(sd)
-
-        if os.path.exists(mlps_path):
-            mlp_npz = np.load(mlps_path)
-            o = dequantize(mlp_npz['opacity_data'], mlp_npz['opacity_scale'], mlp_npz['opacity_min'], log=True)
-            fr = dequantize(mlp_npz['f_rest_data'], mlp_npz['f_rest_scale'], mlp_npz['f_rest_min'], log=True)
-            sc = dequantize(mlp_npz['scale_data'], mlp_npz['scale_scale'], mlp_npz['scale_min'], log=True)
-            rt = dequantize(mlp_npz['rotation_data'], mlp_npz['rotation_scale'], mlp_npz['rotation_min'], log=True)
-
-            _coerce_and_assign(self._opacity_head, o, 'opacity')
-            _coerce_and_assign(self._features_rest_head, fr, 'features_rest')
-            _coerce_and_assign(self._scaling_head, sc, 'scaling')
-            _coerce_and_assign(self._rotation_head, rt, 'rotation')
+        # -------- Quality-first load (preferred) --------
+        mlps_fp16_path = os.path.join(path, 'mlps_fp16.npz')
+        if os.path.exists(mlps_fp16_path):
+            mlp_npz = _load_npz(mlps_fp16_path)
+            _strict_assign_param(self._opacity_head, _np_to_torch(mlp_npz['opacity'], device='cuda', dtype=torch.float16), "opacity_head.params", mlps_fp16_path)
+            _strict_assign_param(self._scaling_head, _np_to_torch(mlp_npz['scaling'], device='cuda', dtype=torch.float16), "scaling_head.params", mlps_fp16_path)
+            _strict_assign_param(self._rotation_head, _np_to_torch(mlp_npz['rotation'], device='cuda', dtype=torch.float16), "rotation_head.params", mlps_fp16_path)
+            _strict_assign_param(self._features_rest_head, _np_to_torch(mlp_npz['features_rest'], device='cuda', dtype=torch.float16), "features_rest_head.params", mlps_fp16_path)
         else:
-            # backward compatible loading
-            opacity_params = np.load(os.path.join(path, 'opacity.npz'))['data']
-            f_rest_params = np.load(os.path.join(path, 'f_rest.npz'))['data']
-            scale_params = np.load(os.path.join(path, 'scale.npz'))['data']
-            rotation_params = np.load(os.path.join(path, 'rotation.npz'))['data']
+            # -------- Legacy quantized load (compatibility) --------
+            mlps_path = os.path.join(path, 'mlps.npz')
+            def _coerce_and_assign(head, np_array, name):
+                print(f"[WARN] Legacy quantized '{name}' may reduce quality; consider regenerating compression.")
+                flat = np.asarray(np_array).ravel()
+                expected = head.state_dict()['params'].numel()
+                if flat.size != expected:
+                    print(f"[WARN] Loaded '{name}' params size ({flat.size}) != expected ({expected}), coercing")
+                    if flat.size > expected:
+                        flat = flat[:expected]
+                    else:
+                        pad = np.zeros(expected - flat.size, dtype=flat.dtype)
+                        flat = np.concatenate([flat, pad])
+                tensor = torch.from_numpy(flat).half().cuda()
+                head.params = nn.Parameter(tensor)
 
-            _coerce_and_assign(self._opacity_head, opacity_params, 'opacity')
-            _coerce_and_assign(self._features_rest_head, f_rest_params, 'features_rest')
-            _coerce_and_assign(self._scaling_head, scale_params, 'scaling')
-            _coerce_and_assign(self._rotation_head, rotation_params, 'rotation')
+            if os.path.exists(mlps_path):
+                mlp_npz = np.load(mlps_path)
+                o = dequantize(mlp_npz['opacity_data'], mlp_npz['opacity_scale'], mlp_npz['opacity_min'], log=True)
+                fr = dequantize(mlp_npz['f_rest_data'], mlp_npz['f_rest_scale'], mlp_npz['f_rest_min'], log=True)
+                sc = dequantize(mlp_npz['scale_data'], mlp_npz['scale_scale'], mlp_npz['scale_min'], log=True)
+                rt = dequantize(mlp_npz['rotation_data'], mlp_npz['rotation_scale'], mlp_npz['rotation_min'], log=True)
+                _coerce_and_assign(self._opacity_head, o, 'opacity')
+                _coerce_and_assign(self._features_rest_head, fr, 'features_rest')
+                _coerce_and_assign(self._scaling_head, sc, 'scaling')
+                _coerce_and_assign(self._rotation_head, rt, 'rotation')
+            else:
+                # backward compatible loading of individual float files
+                opacity_params = np.load(os.path.join(path, 'opacity.npz'))['data']
+                f_rest_params = np.load(os.path.join(path, 'f_rest.npz'))['data']
+                scale_params = np.load(os.path.join(path, 'scale.npz'))['data']
+                rotation_params = np.load(os.path.join(path, 'rotation.npz'))['data']
+                _coerce_and_assign(self._opacity_head, opacity_params, 'opacity')
+                _coerce_and_assign(self._features_rest_head, f_rest_params, 'features_rest')
+                _coerce_and_assign(self._scaling_head, scale_params, 'scaling')
+                _coerce_and_assign(self._rotation_head, rotation_params, 'rotation')
+
+        # Quality-first overrides for base attributes if present
+        f_dc_fp16_path = os.path.join(path, 'f_dc_fp16.npz')
+        if os.path.exists(f_dc_fp16_path):
+            f_dc_npz = _load_npz(f_dc_fp16_path)
+            _strict_assign(self._features_dc, _np_to_torch(f_dc_npz['data'], device='cuda', dtype=torch.float16), "features_dc", f_dc_fp16_path)
+        scale_base_fp16_path = os.path.join(path, 'scale_base_fp16.npz')
+        if os.path.exists(scale_base_fp16_path):
+            sb_npz = _load_npz(scale_base_fp16_path)
+            _strict_assign(self._scaling_base, _np_to_torch(sb_npz['data'], device='cuda', dtype=torch.float16), "scaling_base", scale_base_fp16_path)
+        mask_logits_fp16_path = os.path.join(path, 'mask_logits_fp16.npz')
+        if os.path.exists(mask_logits_fp16_path):
+            m_npz = _load_npz(mask_logits_fp16_path)
+            _strict_assign(self._mask, _np_to_torch(m_npz['data'], device='cuda', dtype=torch.float16), "mask", mask_logits_fp16_path)
+        sh_mask_logits_fp16_path = os.path.join(path, 'sh_mask_logits_fp16.npz')
+        if os.path.exists(sh_mask_logits_fp16_path):
+            sm_npz = _load_npz(sh_mask_logits_fp16_path)
+            _strict_assign(self._sh_mask, _np_to_torch(sm_npz['data'], device='cuda', dtype=torch.float16), "sh_mask", sh_mask_logits_fp16_path)
+        vm_planes_fp16_path = os.path.join(path, 'vm_planes_fp16.npz')
+        if os.path.exists(vm_planes_fp16_path) and hasattr(self._grid, 'plane_xy'):
+            vm_npz = _load_npz(vm_planes_fp16_path)
+            _strict_assign(self._grid.plane_xy, _np_to_torch(vm_npz['plane_xy'], device='cuda', dtype=torch.float16), "plane_xy", vm_planes_fp16_path)
+            _strict_assign(self._grid.plane_xz, _np_to_torch(vm_npz['plane_xz'], device='cuda', dtype=torch.float16), "plane_xz", vm_planes_fp16_path)
+            _strict_assign(self._grid.plane_yz, _np_to_torch(vm_npz['plane_yz'], device='cuda', dtype=torch.float16), "plane_yz", vm_planes_fp16_path)
 
         self.active_sh_degree = self.max_sh_degree
 
