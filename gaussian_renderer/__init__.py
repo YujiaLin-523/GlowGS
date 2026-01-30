@@ -56,9 +56,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     means3D = pc.get_xyz
     means2D = screenspace_points
 
-    # Use masks as produced by the model/QAT path; avoid double thresholding
     mask = pc.get_mask
+    mask = ((mask > 0.01).float() - mask).detach() + mask
+    
     sh_mask = pc.get_sh_mask
+    sh_mask = ((sh_mask > 0.01).float() - sh_mask).detach() + sh_mask
 
     opacity = pc.get_opacity * mask
 
@@ -187,12 +189,13 @@ def render_eval(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Ten
         mask = torch.ones((pc.get_opacity.shape[0], 1), device=pc.get_opacity.device, dtype=pc.get_opacity.dtype)
     else:
         mask = mask.to(pc.get_opacity.device)
-
+    mask = ((mask > 0.01).float() - mask).detach() + mask
     sh_mask = pc.get_sh_mask
     if sh_mask.numel() == 0 or sh_mask.shape[0] != pc.get_opacity.shape[0]:
         sh_mask = torch.ones((pc.get_opacity.shape[0], pc.max_sh_degree), device=pc.get_opacity.device, dtype=pc.get_opacity.dtype)
     else:
         sh_mask = sh_mask.to(pc.get_opacity.device)
+    sh_mask = ((sh_mask > 0.01).float() - sh_mask).detach() + sh_mask
 
     opacity = pc.get_opacity * mask
 

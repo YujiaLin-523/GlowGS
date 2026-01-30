@@ -177,7 +177,7 @@ run_experiment() {
     echo ""
     
     if [ "$DRY_RUN" = true ]; then
-        echo "[DRY RUN] python -u train.py -s $scene_path -m $output_dir --iterations $ITERATIONS --eval --qat --feature_mod_type $mod_type --densification_mode $densify_mode --use_edge_loss $edge_loss --test_iterations $TEST_ITERATIONS --save_iterations $SAVE_ITERATIONS $pcd_arg"
+        echo "[DRY RUN] python -u train.py -s $scene_path -m $output_dir --iterations $ITERATIONS --eval --feature_mod_type $mod_type --densification_mode $densify_mode --use_edge_loss $edge_loss --test_iterations $TEST_ITERATIONS --save_iterations $SAVE_ITERATIONS $pcd_arg"
         echo ""
         return 0
     fi
@@ -193,7 +193,7 @@ run_experiment() {
         -s "$scene_path" \
         -m "$output_dir" \
         --iterations $ITERATIONS \
-        --eval --qat \
+        --eval \
         --feature_mod_type $mod_type \
         --densification_mode $densify_mode \
         --use_edge_loss $edge_loss \

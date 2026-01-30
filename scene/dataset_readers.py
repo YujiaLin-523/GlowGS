@@ -67,11 +67,11 @@ def getNerfppNorm(cam_info):
 
 def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
     cam_infos = []
-    total = len(cam_extrinsics)
     for idx, key in enumerate(cam_extrinsics):
-        if idx % 25 == 0 or idx == total - 1:
-            sys.stdout.write(f"\rReading camera {idx+1}/{total}")
-            sys.stdout.flush()
+        sys.stdout.write('\r')
+        # the exact output you're looking for:
+        sys.stdout.write("Reading camera {}/{}".format(idx+1, len(cam_extrinsics)))
+        sys.stdout.flush()
 
         extr = cam_extrinsics[key]
         intr = cam_intrinsics[extr.camera_id]
@@ -101,8 +101,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                               image_path=image_path, image_name=image_name, width=width, height=height)
         cam_infos.append(cam_info)
-    sys.stdout.write('\r')
-    sys.stdout.flush()
+    sys.stdout.write('\n')
     return cam_infos
 
 def fetchPly(path):

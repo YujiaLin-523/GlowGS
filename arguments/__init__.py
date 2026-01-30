@@ -79,17 +79,6 @@ class ModelParams(ParamGroup):
         self.pcd_path = "none"
         self.data_device = "cuda"
         self.eval = False
-        # Quantization-aware training / inference
-        self.qat = False
-        self.qat_bit_grid = 6
-        self.qat_bit_mlp = 8
-        self.qat_bit_dc = 8
-        self.qat_bit_scale = 8
-        self.qat_bit_rot = 8
-        self.qat_bit_opacity = 8
-        self.qat_bit_sh = 8
-        self.qat_mask_th = 0.01
-        self.qat_log_grid = True
         # Hash grid parameters
         self.hash_size = 19          # log2_hashmap_size: 19 → 512K entries (balance of size/quality)
         self.width = 64              # MLP hidden width
@@ -282,3 +271,4 @@ def get_combined_args(parser : ArgumentParser):
             print(f"[INFO] Using default {key}={default_val}")
     
     return Namespace(**merged_dict)
+
