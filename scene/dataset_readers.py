@@ -13,6 +13,7 @@ import os
 import sys
 from PIL import Image
 from typing import NamedTuple
+from utils.general_utils import is_verbose
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
     read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
 from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
@@ -67,11 +68,14 @@ def getNerfppNorm(cam_info):
 
 def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
     cam_infos = []
+    verbose = is_verbose()
+    if not verbose and len(cam_extrinsics) > 0:
+        print(f"Reading {len(cam_extrinsics)} cameras...")
     for idx, key in enumerate(cam_extrinsics):
-        sys.stdout.write('\r')
-        # the exact output you're looking for:
-        sys.stdout.write("Reading camera {}/{}".format(idx+1, len(cam_extrinsics)))
-        sys.stdout.flush()
+        if verbose:
+            sys.stdout.write('\r')
+            sys.stdout.write("Reading camera {}/{}".format(idx+1, len(cam_extrinsics)))
+            sys.stdout.flush()
 
         extr = cam_extrinsics[key]
         intr = cam_intrinsics[extr.camera_id]
@@ -101,7 +105,10 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                               image_path=image_path, image_name=image_name, width=width, height=height)
         cam_infos.append(cam_info)
-    sys.stdout.write('\n')
+    if verbose:
+        sys.stdout.write('\n')
+    elif len(cam_extrinsics) > 0:
+        print("Finished reading cameras.")
     return cam_infos
 
 def fetchPly(path):

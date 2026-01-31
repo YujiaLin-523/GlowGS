@@ -12,6 +12,7 @@
 from argparse import ArgumentParser, Namespace
 import sys
 import os
+from utils.general_utils import is_verbose
 
 class GroupParams:
     pass
@@ -225,6 +226,7 @@ class OptimizationParams(ParamGroup):
 def get_combined_args(parser : ArgumentParser):
     cmdlne_string = sys.argv[1:]
     cfgfile_string = "Namespace()"
+    verbose = is_verbose()
     # Parse defaults separately so we can detect which CLI flags were
     # explicitly provided (vs. defaults). This prevents render/eval from
     # overwriting the training config in cfg_args with parser defaults.
@@ -233,12 +235,13 @@ def get_combined_args(parser : ArgumentParser):
 
     try:
         cfgfilepath = os.path.join(args_cmdline.model_path, "cfg_args")
-        print("Looking for config file in", cfgfilepath)
+        if verbose:
+            print("Looking for config file in", cfgfilepath)
         with open(cfgfilepath) as cfg_file:
-            print("Config file found: {}".format(cfgfilepath))
+            if verbose:
+                print("Config file found: {}".format(cfgfilepath))
             cfgfile_string = cfg_file.read()
     except TypeError:
-        print("Config file not found at")
         pass
     args_cfgfile = eval(cfgfile_string)
 
@@ -271,4 +274,3 @@ def get_combined_args(parser : ArgumentParser):
             print(f"[INFO] Using default {key}={default_val}")
     
     return Namespace(**merged_dict)
-

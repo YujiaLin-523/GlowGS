@@ -26,7 +26,7 @@ from utils.quantization_utils import half_ste, quantize, dequantize
 from utils.gpcc_utils import encode_xyz, decode_xyz
 from encoders import create_gaussian_encoder, get_encoder_output_dims
 import tinycudann as tcnn
-
+from utils.general_utils import is_verbose
 
 def _to_np_fp16(t: torch.Tensor):
     """Detach tensor to CPU and store as float16 for lossless downstream reload."""
@@ -542,7 +542,8 @@ class GaussianModel:
         The cached attributes will be used by update_attributes() automatically.
         """
         if self._encoder_variant == '3dgs':
-            print("[Precompute] 3DGS mode: no encoder decoding needed")
+            if is_verbose():
+                print("[Precompute] 3DGS mode: no encoder decoding needed")
             return
         
         # Force compute all attributes
@@ -559,7 +560,8 @@ class GaussianModel:
             self._precomputed_cache['features_rest'] = self._features_rest.detach().clone()
         
         n_points = self._xyz.shape[0]
-        print(f"[Precompute] Cached {n_points:,} Gaussian attributes for fast rendering")
+        if is_verbose():
+            print(f"[Precompute] Cached {n_points:,} Gaussian attributes for fast rendering")
         self._debug_scale_stats(tag="after_precompute", tensor=self._scaling_base, iteration=None, force=True)
     
     def _debug_scale_enabled(self):
@@ -1255,7 +1257,10 @@ class GaussianModel:
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means = torch.zeros((stds.size(0), 3), device="cuda")
         samples = torch.normal(mean=means, std=stds)
-        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
+        rot_src = self._rotation
+        if rot_src is None or (isinstance(rot_src, torch.Tensor) and rot_src.numel() == 0):
+            rot_src = self._rotation_init.expand(self.get_xyz.shape[0], -1).to(device=self._xyz.device, dtype=self._xyz.dtype)
+        rots = build_rotation(rot_src[selected_pts_mask]).repeat(N,1,1)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         # Safe log-scale path (GlowGS-only safety)

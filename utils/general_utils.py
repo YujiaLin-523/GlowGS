@@ -14,6 +14,7 @@ import sys
 from datetime import datetime
 import numpy as np
 import random
+import os
 
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
@@ -77,6 +78,32 @@ def strip_symmetric(sym):
 
 def build_rotation(r):
     norm = torch.sqrt(r[:,0]*r[:,0] + r[:,1]*r[:,1] + r[:,2]*r[:,2] + r[:,3]*r[:,3])
+
+
+def is_verbose(opt=None) -> bool:
+    """Unified verbosity predicate controlled by env or CLI opts."""
+    env_verbose = str(os.getenv("GLOWGS_VERBOSE", "")).lower() in ("1", "true", "yes", "on")
+    flag_verbose = False
+    if opt is not None:
+        flag_verbose = bool(getattr(opt, "verbose", getattr(opt, "verbose_loader", False)))
+    return env_verbose or flag_verbose
+
+
+def get_dir_size_bytes(path: str) -> int:
+    """Recursively sum file sizes; returns -1 if path is missing."""
+    if not os.path.isdir(path):
+        return -1
+    total = 0
+    for dirpath, _, filenames in os.walk(path):
+        for fname in filenames:
+            fpath = os.path.join(dirpath, fname)
+            if not os.path.isfile(fpath):
+                continue
+            try:
+                total += os.path.getsize(fpath)
+            except OSError:
+                continue
+    return total
 
     q = r / norm[:, None]
 

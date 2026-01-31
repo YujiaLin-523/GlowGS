@@ -18,7 +18,7 @@ from utils.loss_utils import l1_loss, ssim, ssim_raw, compute_edge_loss
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
-from utils.general_utils import safe_state
+from utils.general_utils import safe_state, is_verbose, get_dir_size_bytes
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -26,6 +26,7 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import subprocess
 import shutil
+import re
 
 
 def _is_true_env(var_name: str) -> bool:
@@ -51,6 +52,22 @@ def _summarize_param_groups(optimizer) -> list:
             "weight_decay": wd,
         })
     return rows
+
+def get_directory_size_bytes(root: str, verbose: bool = False):
+    """Sum file sizes under a directory; ignores missing paths and errors."""
+    if not os.path.isdir(root):
+        if verbose:
+            print(f"[WARN] compression directory missing: {root}")
+        return None
+    total = 0
+    for dirpath, _, filenames in os.walk(root):
+        for fname in filenames:
+            fpath = os.path.join(dirpath, fname)
+            try:
+                total += os.path.getsize(fpath)
+            except OSError:
+                continue
+    return total
 
 # Enable TF32 tensor cores for faster matmul on Ampere+ GPUs
 try:
@@ -161,7 +178,8 @@ def save_ablation_config(output_dir, dataset, opt, pipe):
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
     print(f"[Config] Saved ablation configuration to: {config_path}\n")
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, measure_fps=True):
+    verbose_flag = is_verbose(opt)
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     # Debug flag for full ablation gap diagnostics (read-only logging)
@@ -792,53 +810,34 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             avg_ssim = sum(final_ssims) / len(final_ssims)
             avg_lpips = sum(final_lpipss) / len(final_lpipss)
             
-            # FPS measurement via external script (fps_test.py)
-            print("Measuring FPS via fps_test.py...")
-            fps = 0.0
-            try:
-                fps_cmd = [sys.executable, "fps_test.py", "-m", dataset.model_path, "--iteration", str(opt.iterations), "--quiet", "--skip_train", "--skip_test"]
-                result = subprocess.run(fps_cmd, capture_output=True, text=True, cwd=os.getcwd())
-                if result.returncode != 0:
-                     print(f"fps_test.py failed with return code {result.returncode}")
-                     print(result.stderr)
-                else:
-                    import re
-                    match = re.search(r"Average FPS\s*:\s*([\d\.]+)", result.stdout)
+            fps = None
+            if measure_fps:
+                print("[FPS] Measuring...")
+                try:
+                    fps_cmd = [sys.executable, "fps_test.py", "-m", dataset.model_path, "-s", dataset.source_path, "--iteration", str(opt.iterations)]
+                    result = subprocess.run(fps_cmd, capture_output=True, text=True, cwd=os.getcwd(), timeout=900)
+                    output_text = (result.stdout or "") + "\n" + (result.stderr or "")
+                    match = re.search(r"(?:FPS|fps)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)", output_text)
+                    if not match:
+                        match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(?:FPS|fps)", output_text)
                     if match:
                         fps = float(match.group(1))
-                        print(f"  Parsed FPS: {fps}")
+                        print(f"[FPS] FPS: {fps:.2f}")
                     else:
-                        print("  Could not parse FPS from output.")
-                        print(result.stdout)
-            except Exception as e:
-                print(f"Error running fps_test.py: {e}")
+                        msg = f"[FPS] FPS: N/A (parse failed, rc={result.returncode})"
+                        if verbose_flag:
+                            snippet = output_text.strip().splitlines()[-30:]
+                            snippet = " | ".join(snippet)
+                            print(msg + f" output: {snippet[:400]}")
+                        else:
+                            print(msg + " (use --verbose for details)")
+                except Exception as e:
+                    print(f"[FPS] FPS: N/A (error: {e})")
             
-            # Model size calculation (GPCC compressed)
-            print("Computing compressed model size (GPCC)...")
-            from utils.gpcc_utils import encode_xyz
-            
-            size_mb = 0.0
-            try:
-                temp_dir = os.path.join(dataset.model_path, "gpcc_temp")
-                os.makedirs(temp_dir, exist_ok=True)
-                
-                xyz = gaussians.get_xyz.detach().cpu().numpy()
-                encode_xyz(xyz, temp_dir, show=False)
-                
-                bin_path = os.path.join(temp_dir, "xyz.bin")
-                if os.path.exists(bin_path):
-                    size_mb = os.path.getsize(bin_path) / (1024 * 1024)
-                    print(f"  Compressed Size: {size_mb:.2f} MB")
-                else:
-                    print("  Compression output xyz.bin not found.")
-                
-                shutil.rmtree(temp_dir)
-            except Exception as e:
-                print(f"Error computing compressed size: {e}")
-                # Fallback to PLY size if compression fails
-                ply_path = os.path.join(dataset.model_path, "point_cloud", f"iteration_{opt.iterations}", "point_cloud.ply")
-                if os.path.exists(ply_path):
-                    size_mb = os.path.getsize(ply_path) / (1024 * 1024)
+            # Model size calculation: sum of compression directory
+            compression_dir = os.path.join(dataset.model_path, "compression")
+            total_bytes = get_dir_size_bytes(compression_dir)
+            size_mb = None if total_bytes < 0 else total_bytes / (1024 * 1024)
             
             # Extract scene name from source_path
             scene_name = os.path.basename(dataset.source_path.rstrip('/'))
@@ -862,8 +861,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 "psnr": round(avg_psnr, 4),
                 "ssim": round(avg_ssim, 4),
                 "lpips": round(avg_lpips, 4),
-                "size_mb": round(size_mb, 2),
-                "fps": round(fps, 1),
+                "compression_size_bytes": total_bytes if total_bytes >= 0 else None,
+                "compression_size_mb": round(size_mb, 2) if size_mb is not None else None,
+                "size_mb": round(size_mb, 2) if size_mb is not None else None,
+                "fps": round(fps, 1) if fps is not None else None,
                 "num_gaussians": gaussians.get_xyz.shape[0],
                 "config": {
                     "feature_mod_type": feature_mod_type,
@@ -880,7 +881,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print(f"\n  Scene: {scene_name}")
             print(f"  Method: {method_name}")
             print(f"  PSNR: {avg_psnr:.4f}  |  SSIM: {avg_ssim:.4f}  |  LPIPS: {avg_lpips:.4f}")
-            print(f"  Size: {size_mb:.2f} MB  |  FPS: {fps:.1f}")
+            size_str = f"{size_mb:.2f} MB" if size_mb is not None else "N/A"
+            fps_str = f"{fps:.2f}" if fps is not None else "N/A"
+            print(f"  Size: {size_str}  |  FPS: {fps_str}")
             print(f"  Gaussians: {gaussians.get_xyz.shape[0]:,}")
             print(f"\n  Stats saved to: {stats_path}")
         else:
@@ -960,6 +963,9 @@ if __name__ == "__main__":
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[30_000])
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--verbose", action="store_true", default=False, help="Verbose logs (camera/config/precompute)")
+    parser.add_argument("--verbose_loader", action="store_true", dest="verbose", help="Alias for --verbose")
+    parser.add_argument("--disable_fps", action="store_true", default=False, help="Disable FPS measurement at the end of training (default: enabled)")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
@@ -968,13 +974,16 @@ if __name__ == "__main__":
     print("Optimizing " + args.model_path)
     sys.stderr.write(f"Loading scene for training: {args.model_path}...\n")
 
+    if args.verbose:
+        os.environ["GLOWGS_VERBOSE"] = "1"
+
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
     # Start GUI server, configure and run training
     # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, measure_fps=not args.disable_fps)
 
     # All done
     print("\nTraining complete.")
