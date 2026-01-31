@@ -1254,13 +1254,22 @@ class GaussianModel:
         selected_pts_mask = torch.logical_and(selected_pts_mask, is_large_ws)
         selected_pts_mask = torch.logical_and(selected_pts_mask, is_large_ss)
 
+        num_sel = int(selected_pts_mask.sum().item())
+        if num_sel == 0:
+            return
+
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means = torch.zeros((stds.size(0), 3), device="cuda")
         samples = torch.normal(mean=means, std=stds)
         rot_src = self._rotation
         if rot_src is None or (isinstance(rot_src, torch.Tensor) and rot_src.numel() == 0):
+            if is_verbose():
+                print("[densify_and_split] rotation buffer empty, using identity quaternions")
             rot_src = self._rotation_init.expand(self.get_xyz.shape[0], -1).to(device=self._xyz.device, dtype=self._xyz.dtype)
-        rots = build_rotation(rot_src[selected_pts_mask]).repeat(N,1,1)
+        rot_selected = rot_src[selected_pts_mask]
+        if rot_selected.numel() == 0:
+            return
+        rots = build_rotation(rot_selected).repeat(N,1,1)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         # Safe log-scale path (GlowGS-only safety)
