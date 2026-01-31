@@ -12,6 +12,7 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
+import json
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
 import os
@@ -201,6 +202,8 @@ class GaussianModel:
         self.optimizer_i = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        # Debug scale flag (env controlled, default off)
+        self._debug_scale = os.getenv("DEBUG_SCALE", "0").lower() in ("1", "true", "yes")
         # Precomputed attribute cache for fast inference (populated by precompute_attributes)
         self._precomputed_cache = None
         self.setup_functions()
@@ -358,7 +361,7 @@ class GaussianModel:
         
         print(f"[INFO] Restored {N} Gaussians for evaluation (lightweight mode)")
 
-    def update_attributes(self, force_update=False):
+    def update_attributes(self, force_update=False, iteration=None):
         """
         Update implicit Gaussian attributes from encoder output.
         
@@ -494,9 +497,8 @@ class GaussianModel:
             self._opacity = torch.cat(opacity_chunks, dim=0)
             self._scaling = torch.cat(scaling_chunks, dim=0)
             self._rotation = torch.cat(rotation_chunks, dim=0)
-            if self.max_sh_degree > 0:
+            if self.max_sh_degree > 0 and features_rest_chunks is not None:
                 self._features_rest = torch.cat(features_rest_chunks, dim=0)
-            
             # Update cache hash after successful computation
             self._cached_attributes_hash = (self._xyz.data_ptr(), N, self._xyz.requires_grad)
         else:
@@ -522,7 +524,7 @@ class GaussianModel:
             self._opacity = torch.cat(opacity_chunks, dim=0)
             self._scaling = torch.cat(scaling_chunks, dim=0)
             self._rotation = torch.cat(rotation_chunks, dim=0)
-            if self.max_sh_degree > 0:
+            if self.max_sh_degree > 0 and features_rest_chunks is not None:
                 self._features_rest = torch.cat(features_rest_chunks, dim=0)
             
             # Update cache hash after successful computation
@@ -530,7 +532,8 @@ class GaussianModel:
         
         # NOTE: Removed torch.cuda.empty_cache() here for real-time performance
         # empty_cache() is expensive (~1-2ms) and should only be called when necessary
-    
+        self._debug_scale_stats(tag="after_update_attributes", tensor=self._scaling_base, iteration=iteration, force=False)
+
     def precompute_attributes(self):
         """
         Precompute and cache all Gaussian attributes for fast inference.
@@ -557,7 +560,108 @@ class GaussianModel:
         
         n_points = self._xyz.shape[0]
         print(f"[Precompute] Cached {n_points:,} Gaussian attributes for fast rendering")
+        self._debug_scale_stats(tag="after_precompute", tensor=self._scaling_base, iteration=None, force=True)
     
+    def _debug_scale_enabled(self):
+        # Env flag takes precedence; attribute can be toggled by caller
+        if os.getenv("DEBUG_SCALE", "0").lower() in ("1", "true", "yes"):
+            return True
+        return bool(getattr(self, "_debug_scale", False))
+
+    def _sample_scale_stats(self, tensor: torch.Tensor, sample: int = 8192):
+        if tensor is None or tensor.numel() == 0:
+            return None
+        N = tensor.shape[0]
+        s = min(sample, N)
+        if s <= 0:
+            return None
+        idx = torch.randint(0, N, (s,), device=tensor.device)
+        flat = tensor[idx].reshape(-1).float()
+        finite = torch.isfinite(flat)
+        nan_count = torch.isnan(flat).sum().item()
+        inf_count = torch.isinf(flat).sum().item()
+        safe = flat[finite]
+        if safe.numel() == 0:
+            return None
+        quantiles = torch.quantile(
+            safe, torch.tensor([0.05, 0.5, 0.95, 0.99], device=safe.device)
+        )
+        stats = {
+            "min": float(safe.min().item()),
+            "max": float(safe.max().item()),
+            "p5": float(quantiles[0].item()),
+            "p50": float(quantiles[1].item()),
+            "p95": float(quantiles[2].item()),
+            "p99": float(quantiles[3].item()),
+            "mean": float(safe.mean().item()),
+            "std": float(safe.std(unbiased=False).item()),
+            "nan": int(nan_count),
+            "inf": int(inf_count),
+            "gt_3_ratio": float((flat > 3).float().mean().item()),
+            "gt_6_ratio": float((flat > 6).float().mean().item()),
+            "gt_10_ratio": float((flat > 10).float().mean().item()),
+        }
+        return stats
+
+    def _debug_scale_stats(self, tag: str, tensor: torch.Tensor, iteration=None, force: bool = False, check_assert: bool = False, sample: int = 8192):
+        """
+        Debug-only scale statistics; prints single-line JSON when DEBUG_SCALE=1.
+        """
+        if not self._debug_scale_enabled():
+            return None
+        if (iteration is not None) and (not force) and (iteration % 500 != 0):
+            return None
+        base_stats = self._sample_scale_stats(tensor, sample=sample)
+        lin_stats = None
+        if tensor is not None:
+            lin_tensor = torch.exp(torch.clamp(tensor, -15.0, 10.0))
+            lin_stats = self._sample_scale_stats(lin_tensor, sample=sample)
+        radii_stats = None
+        if hasattr(self, "max_radii2D") and isinstance(self.max_radii2D, torch.Tensor) and self.max_radii2D.numel() > 0:
+            radii_stats = self._sample_scale_stats(self.max_radii2D, sample=sample)
+        payload = {"tag": tag, "iter": iteration}
+        if base_stats:
+            payload.update({
+                "log_scale_p50": base_stats.get("p50"),
+                "log_scale_p95": base_stats.get("p95"),
+                "log_scale_p99": base_stats.get("p99"),
+            })
+        if lin_stats:
+            payload.update({
+                "scale_p50": lin_stats.get("p50"),
+                "scale_p95": lin_stats.get("p95"),
+                "scale_p99": lin_stats.get("p99"),
+            })
+        if radii_stats:
+            payload.update({
+                "radii2d_p50": radii_stats.get("p50"),
+                "radii2d_p95": radii_stats.get("p95"),
+                "radii2d_p99": radii_stats.get("p99"),
+            })
+        print(json.dumps(payload, default=float))
+        if check_assert and base_stats and base_stats.get("p99") is not None and base_stats["p99"] > 6.0:
+            raise RuntimeError(f"[DEBUG_SCALE] stage={tag} iter={iteration} log_scale_p99={base_stats['p99']:.3f} > 6 (scene/gaussian_model.py)")
+        return payload
+
+    def _safe_log_scale_for_new_points(self, log_s: torch.Tensor, lo: float = -15.0, hi: float = 3.5) -> torch.Tensor:
+        """
+        Clamp log-scale for newly created Gaussians to prevent runaway propagation.
+        GlowGS-only safety layer; LocoGS keeps raw log-scales.
+        """
+        if log_s is None or log_s.numel() == 0:
+            return log_s
+        return torch.clamp(log_s, lo, hi)
+
+    def project_scaling_base_(self, lo: float = -15.0, hi: float = 4.0):
+        """
+        In-place projection to keep existing log-scales in a recoverable range.
+        GlowGS-only safety layer (LocoGS has no clamp in get_scaling_base).
+        """
+        if self._scaling_base is None or self._scaling_base.numel() == 0:
+            return
+        with torch.no_grad():
+            self._scaling_base.clamp_(lo, hi)
+
     def get_cache_stats(self):
         """Return cache hit/miss statistics for update_attributes."""
         hits = getattr(self, '_cache_hit_count', 0)
@@ -938,7 +1042,7 @@ class GaussianModel:
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
-    def prune_points(self, mask):
+    def prune_points(self, mask, iteration=None):
         """
         Prune Gaussians based on boolean mask.
         
@@ -1052,6 +1156,8 @@ class GaussianModel:
         if hasattr(self, '_cached_contracted_xyz'):
             delattr(self, '_cached_contracted_xyz')
 
+        self._debug_scale_stats(tag="after_prune_points", tensor=self._scaling_base, iteration=iteration, force=True, check_assert=True)
+
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -1074,7 +1180,8 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_scaling_base, new_mask, new_sh_mask, new_features_rest=None):
+    def densification_postfix(self, new_xyz, new_features_dc, new_scaling_base, new_mask, new_sh_mask, new_features_rest=None, iteration=None):
+        n_before = self._xyz.shape[0]
         d = {
             "xyz": new_xyz,
             "f_dc": new_features_dc,
@@ -1098,16 +1205,35 @@ class GaussianModel:
         if self._encoder_variant == '3dgs' and "f_rest" in optimizable_tensors:
             self._features_rest = optimizable_tensors["f_rest"]
 
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        n_after = self.get_xyz.shape[0]
+        self.xyz_gradient_accum = torch.zeros((n_after, 1), device="cuda")
+        self.denom = torch.zeros((n_after, 1), device="cuda")
+        self.max_radii2D = torch.zeros((n_after,), device="cuda")
         
         # Invalidate attribute caches; shapes changed
         self._cached_attributes_hash = None
         if hasattr(self, '_cached_contracted_key'):
             self._cached_contracted_key = None
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+        if self._debug_scale_enabled() and n_after > n_before:
+            added = n_after - n_before
+            new_slice = slice(n_after - added, n_after)
+            new_stats = self._sample_scale_stats(self._scaling_base[new_slice], sample=min(2048, added))
+            old_stats = self._sample_scale_stats(self._scaling_base[:n_before], sample=min(2048, n_before)) if n_before > 0 else None
+            payload = {
+                "stage": "after_densify_postfix",
+                "iter": iteration,
+                "added": int(added),
+                "scale_new": new_stats,
+                "scale_prev": old_stats,
+            }
+            print(json.dumps(payload, default=float))
+            if new_stats and old_stats and new_stats.get("p50") is not None and old_stats.get("p95") is not None:
+                if new_stats["p50"] > old_stats["p95"]:
+                    raise RuntimeError(f"[DEBUG_SCALE] iter={iteration} new_points scale_base p50 {new_stats['p50']:.3f} exceeds prev p95 {old_stats['p95']:.3f} (densification_postfix)")
+        self._debug_scale_stats(tag="after_densify_postfix", tensor=self._scaling_base, iteration=iteration, force=True, check_assert=True)
+
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, iteration=None):
         """
         Split large Gaussians with high gradient.
         Uses original 3DGS logic with FPS guard for screen-space size.
@@ -1132,7 +1258,13 @@ class GaussianModel:
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
-        new_scaling_base = self.scaling_base_inverse_activation(self.get_scaling_base[selected_pts_mask].repeat(N,1) / (0.8*N))
+        # Safe log-scale path (GlowGS-only safety)
+        safe_log = self._safe_log_scale_for_new_points(self._scaling_base.detach())
+        selected_log = safe_log[selected_pts_mask].repeat(N, 1)
+        selected_lin = torch.exp(selected_log)
+        shrunk_lin = selected_lin / (0.8 * N)
+        new_log = torch.log(shrunk_lin.clamp_min(1e-6))
+        new_scaling_base = self._safe_log_scale_for_new_points(new_log)
         new_mask = self._mask[selected_pts_mask].repeat(N,1)
         new_sh_mask = self._sh_mask[selected_pts_mask].repeat(N,1)
         
@@ -1140,12 +1272,13 @@ class GaussianModel:
         if self._encoder_variant == '3dgs' and isinstance(self._features_rest, nn.Parameter):
             new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_scaling_base, new_mask, new_sh_mask, new_features_rest)
+        self.densification_postfix(new_xyz, new_features_dc, new_scaling_base, new_mask, new_sh_mask, new_features_rest, iteration=iteration)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
-        self.prune_points(prune_filter)
+        self.prune_points(prune_filter, iteration=iteration)
+        self._debug_scale_stats(tag="after_densify_split", tensor=self._scaling_base, iteration=iteration, force=True, check_assert=True)
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent):
+    def densify_and_clone(self, grads, grad_threshold, scene_extent, iteration=None):
         """
         Clone small Gaussians with high gradient.
         Uses original 3DGS logic with FPS guard for screen-space size.
@@ -1163,7 +1296,8 @@ class GaussianModel:
         
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
-        new_scaling_base = self._scaling_base[selected_pts_mask]
+        safe_log = self._safe_log_scale_for_new_points(self._scaling_base.detach())
+        new_scaling_base = safe_log[selected_pts_mask]
         new_mask = self._mask[selected_pts_mask]
         new_sh_mask = self._sh_mask[selected_pts_mask]
         
@@ -1171,8 +1305,9 @@ class GaussianModel:
         if self._encoder_variant == '3dgs' and isinstance(self._features_rest, nn.Parameter):
             new_features_rest = self._features_rest[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_scaling_base, new_mask, new_sh_mask, new_features_rest)
-        self.update_attributes(force_update=True)
+        self.densification_postfix(new_xyz, new_features_dc, new_scaling_base, new_mask, new_sh_mask, new_features_rest, iteration=iteration)
+        self.update_attributes(force_update=True, iteration=iteration)
+        self._debug_scale_stats(tag="after_densify_clone", tensor=self._scaling_base, iteration=iteration, force=True, check_assert=True)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, iteration=0):
         """
@@ -1182,10 +1317,10 @@ class GaussianModel:
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        self.update_attributes(force_update=True)
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
-        self.update_attributes(force_update=True)
+        self.update_attributes(force_update=True, iteration=iteration)
+        self.densify_and_clone(grads, max_grad, extent, iteration=iteration)
+        self.densify_and_split(grads, max_grad, extent, iteration=iteration)
+        self.update_attributes(force_update=True, iteration=iteration)
         
         # === Pruning: Size-Aware Opacity Thresholds with Ramp ===
         opacity = self.get_opacity.squeeze()
@@ -1221,7 +1356,8 @@ class GaussianModel:
             is_artifact = torch.logical_and(is_huge_screen, is_transparent)
             prune_mask = torch.logical_or(prune_mask, is_artifact)
         
-        self.prune_points(prune_mask)
+        self.prune_points(prune_mask, iteration=iteration)
+        self._debug_scale_stats(tag="after_prune", tensor=self._scaling_base, iteration=iteration, force=True, check_assert=True)
         torch.cuda.empty_cache()
 
     @staticmethod
@@ -1281,17 +1417,17 @@ class GaussianModel:
         elif iteration >= densify_until:
             # Post-densification phase: periodic mask pruning only
             if iteration % prune_interval == 0:
-                self.mask_prune(mask_threshold=mask_prune_threshold)
+                self.mask_prune(mask_threshold=mask_prune_threshold, iteration=iteration)
         else:
             # At or over capacity: skip densification, still allow pruning
             if iteration % prune_interval == 0:
-                self.mask_prune(mask_threshold=mask_prune_threshold)
+                self.mask_prune(mask_threshold=mask_prune_threshold, iteration=iteration)
                 print(f"[CAPACITY] At limit ({num_points}>={max_points}), densify skipped, prune only")
 
-    def mask_prune(self, mask_threshold=0.01):
+    def mask_prune(self, mask_threshold=0.01, iteration=None):
         # Pruning: points with mask <= threshold are removed (LocoGS: 0.01)
         prune_mask = (self.get_mask <= mask_threshold).squeeze()
-        self.prune_points(prune_mask)
+        self.prune_points(prune_mask, iteration=iteration)
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter, opacity=None, radii=None, iteration=0):
