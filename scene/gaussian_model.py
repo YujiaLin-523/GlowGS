@@ -174,6 +174,8 @@ class GaussianModel:
         self._feature_mod_type = feature_mod_type  # 'film' or 'concat' for ECCV ablation
         # Mass-aware gradient weighting scale (xi): higher = stronger pruning, lower = softer
         self._mass_aware_scale = mass_aware_scale
+        # Alert threshold for large prune events (fraction of points removed in one call)
+        self._prune_alert_thresh = 0.20
         # Store GeoEncoder parameters for serialization/deserialization
         self._geo_resolution = geo_resolution
         self._geo_rank = geo_rank
@@ -215,6 +217,8 @@ class GaussianModel:
         self.setup_functions()
         self.setup_configs(hash_size, width, depth)
         self.setup_params()
+        # Compact densify/prune telemetry (reset each summary)
+        self._init_dp_stats()
 
 
     def capture(self):
@@ -802,6 +806,267 @@ class GaussianModel:
             payload["age"] = age_stats
         print(json.dumps(payload, default=float))
 
+    # ------------------------------------------------------------------
+    # Densify/Prune telemetry (lightweight, reset at summary)
+    # ------------------------------------------------------------------
+    def _init_dp_stats(self):
+        self._dp_stats = {
+            "densify_calls": 0,
+            "clone_cand": 0,
+            "split_cand": 0,
+            "clone_sel": 0,
+            "clone_add": 0,
+            "split_sel": 0,
+            "split_add": 0,
+            "prune_total": 0,
+            "prune_low_op": 0,
+            "prune_size2d": 0,
+            "prune_size3d": 0,
+            "prune_mask": 0,
+            "prune_capacity": 0,
+            "sel_clone_stats": None,
+            "sel_split_stats": None,
+            "new_clone_stats": None,
+            "new_split_stats": None,
+            "prune_stats": None,
+            "last_prune_iter": None,
+            "last_prune_removed": None,
+            "last_prune_before": None,
+        }
+        self._pending_new_slices = []
+
+    def _clear_dp_deltas(self):
+        for key in [
+            "densify_calls",
+            "clone_cand",
+            "split_cand",
+            "clone_sel",
+            "clone_add",
+            "split_sel",
+            "split_add",
+            "prune_total",
+            "prune_low_op",
+            "prune_size2d",
+            "prune_size3d",
+            "prune_mask",
+            "prune_capacity",
+        ]:
+            self._dp_stats[key] = 0
+        for key in ["sel_clone_stats", "sel_split_stats", "new_clone_stats", "new_split_stats", "prune_stats"]:
+            self._dp_stats[key] = None
+        self._pending_new_slices = []
+
+    def _sample_indices(self, mask: torch.Tensor, k: int = 4096):
+        if mask is None or not isinstance(mask, torch.Tensor) or mask.numel() == 0:
+            return None
+        if mask.dtype == torch.bool:
+            idx = torch.nonzero(mask, as_tuple=False).flatten()
+        else:
+            idx = mask
+        if idx.numel() == 0:
+            return None
+        if idx.numel() > k:
+            perm = torch.randperm(idx.numel(), device=idx.device)[:k]
+            idx = idx[perm]
+        return idx
+
+    def _extract_sample(self, tensor: torch.Tensor, idx: torch.Tensor):
+        if tensor is None or not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+            return None
+        try:
+            sample = tensor[idx]
+        except Exception:
+            return None
+        sample = sample.reshape(-1).float()
+        if sample.numel() == 0:
+            return None
+        finite = sample[torch.isfinite(sample)]
+        if finite.numel() == 0:
+            return None
+        return finite
+
+    def _quantile_dict(self, prefix: str, values: torch.Tensor, qs=(0.5, 0.95)):
+        if values is None or values.numel() == 0:
+            return {}
+        probs = torch.tensor(qs, device=values.device)
+        quantiles = torch.quantile(values, probs)
+        stats = {}
+        for prob, val in zip(qs, quantiles):
+            stats[f"{prefix}_p{int(prob * 100):02d}"] = float(val.item())
+        return stats
+
+    def _gather_point_stats(self, mask: torch.Tensor, grad_values: torch.Tensor = None, include_radii: bool = False, max_sample: int = 4096):
+        with torch.no_grad():
+            idx = self._sample_indices(mask, k=max_sample)
+            if idx is None:
+                return None
+            stats = {}
+            if grad_values is not None and isinstance(grad_values, torch.Tensor) and grad_values.numel() > 0:
+                grad_tensor = grad_values
+                if grad_tensor.dim() > 1:
+                    grad_tensor = torch.norm(grad_tensor, dim=-1)
+                g_sample = self._extract_sample(grad_tensor, idx)
+                stats.update(self._quantile_dict("grad", g_sample, qs=(0.5, 0.95)))
+
+            op_source = self.get_opacity if hasattr(self, "get_opacity") else None
+            if isinstance(op_source, torch.Tensor) and op_source.numel() > 0:
+                op_sample = self._extract_sample(op_source.squeeze(), idx)
+                stats.update(self._quantile_dict("op", op_sample, qs=(0.5, 0.95)))
+
+            log_source = self._scaling_base if isinstance(self._scaling_base, torch.Tensor) else None
+            if log_source is not None and log_source.numel() > 0:
+                log_vals = torch.max(log_source, dim=1).values if log_source.dim() > 1 else log_source
+                log_sample = self._extract_sample(log_vals, idx)
+                stats.update(self._quantile_dict("logS", log_sample, qs=(0.5, 0.95)))
+                if log_sample is not None:
+                    lin_sample = torch.exp(torch.clamp(log_sample, -15.0, 10.0))
+                    stats.update(self._quantile_dict("scale_lin", lin_sample, qs=(0.5, 0.95)))
+
+            if include_radii and hasattr(self, "max_radii2D") and isinstance(self.max_radii2D, torch.Tensor):
+                r_sample = self._extract_sample(self.max_radii2D, idx)
+                stats.update(self._quantile_dict("r2d", r_sample, qs=(0.95, 0.99)))
+
+            return stats if stats else None
+
+    def _record_densify_selection(self, kind: str, selected_mask: torch.Tensor, grads: torch.Tensor = None, multiplier: int = 1):
+        if selected_mask is None or not isinstance(selected_mask, torch.Tensor):
+            return
+        count = int(selected_mask.sum().item()) if selected_mask.numel() > 0 else 0
+        if count <= 0:
+            return
+        if kind == "clone":
+            self._dp_stats["clone_sel"] += count
+            self._dp_stats["clone_add"] += count * multiplier
+            stats_key = "sel_clone_stats"
+        else:
+            self._dp_stats["split_sel"] += count
+            self._dp_stats["split_add"] += count * multiplier
+            stats_key = "sel_split_stats"
+
+        stats = self._gather_point_stats(selected_mask, grad_values=grads, include_radii=False)
+        self._dp_stats[stats_key] = stats
+
+    def _record_densify_candidates(self, kind: str, mask: torch.Tensor):
+        if mask is None or not isinstance(mask, torch.Tensor):
+            return
+        cand = int(mask.sum().item()) if mask.numel() > 0 else 0
+        if kind == "clone":
+            self._dp_stats["clone_cand"] += cand
+        else:
+            self._dp_stats["split_cand"] += cand
+
+    def _record_new_points_slice(self, kind: str, start: int, end: int):
+        if kind not in ("clone", "split"):
+            return
+        if start >= end:
+            return
+        self._pending_new_slices.append((kind, int(end - start)))  # store length only; start may shift after prune
+
+    def _finalize_new_point_stats(self):
+        if not self._pending_new_slices:
+            self._pending_new_slices = []
+            return
+        with torch.no_grad():
+            for kind, length in self._pending_new_slices:
+                if length <= 0:
+                    continue
+                end = self._xyz.shape[0]
+                start = max(0, end - length)
+                if start >= end:
+                    continue
+                idx = torch.arange(start, end, device=self._xyz.device, dtype=torch.long)
+                stats = self._gather_point_stats(idx, grad_values=None, include_radii=True)
+                if kind == "clone":
+                    self._dp_stats["new_clone_stats"] = stats
+                else:
+                    self._dp_stats["new_split_stats"] = stats
+        self._pending_new_slices = []
+
+    def _record_prune_event(self, prune_mask: torch.Tensor, reason_masks: dict, iteration: int, N_before: int):
+        if prune_mask is None or not isinstance(prune_mask, torch.Tensor):
+            return
+        removed = int(prune_mask.sum().item()) if prune_mask.numel() > 0 else 0
+        if removed <= 0:
+            return
+        # Reason counts are measured on the intersection with prune_mask; masks may overlap.
+        local_counts = {
+            "low_op": 0,
+            "size2d": 0,
+            "size3d": 0,
+            "mask": 0,
+            "capacity": 0,
+        }
+        if isinstance(reason_masks, dict):
+            for reason_key, target in [
+                ("low_opacity", "low_op"),
+                ("size2d", "size2d"),
+                ("size3d", "size3d"),
+                ("mask", "mask"),
+                ("capacity", "capacity"),
+            ]:
+                mask_val = reason_masks.get(reason_key)
+                if isinstance(mask_val, torch.Tensor) and mask_val.numel() == prune_mask.numel():
+                    local_counts[target] = int(torch.logical_and(prune_mask, mask_val).sum().item())
+
+        self._dp_stats["prune_total"] += removed
+        self._dp_stats["prune_low_op"] += local_counts["low_op"]
+        self._dp_stats["prune_size2d"] += local_counts["size2d"]
+        self._dp_stats["prune_size3d"] += local_counts["size3d"]
+        self._dp_stats["prune_mask"] += local_counts["mask"]
+        self._dp_stats["prune_capacity"] += local_counts["capacity"]
+
+        stats = self._gather_point_stats(prune_mask, grad_values=None, include_radii=True)
+        self._dp_stats["prune_stats"] = stats
+
+        self._dp_stats["last_prune_iter"] = int(iteration) if iteration is not None else None
+        self._dp_stats["last_prune_removed"] = removed
+        self._dp_stats["last_prune_before"] = int(N_before) if N_before is not None else None
+
+        before = max(1, int(N_before) if N_before is not None else prune_mask.shape[0])
+        ratio = removed / float(before)
+        if ratio >= self._prune_alert_thresh:
+            iter_val = int(iteration) if iteration is not None else 0
+            reason_str = (
+                f"low_op={local_counts['low_op']:,} "
+                f"size2d={local_counts['size2d']:,} "
+                f"size3d={local_counts['size3d']:,} "
+                f"mask={local_counts['mask']:,} "
+                f"cap={local_counts['capacity']:,}"
+            )
+            print(f"[ALERT] Large prune @iter={iter_val}: removed={removed:,} ({ratio * 100:.1f}%) | {reason_str}")
+
+    def consume_densify_prune_stats(self, reset: bool = True):
+        if not hasattr(self, "_dp_stats"):
+            return {}, {}
+        counters = {
+            k: self._dp_stats.get(k, 0)
+            for k in [
+                "densify_calls",
+                "clone_cand",
+                "split_cand",
+                "clone_sel",
+                "clone_add",
+                "split_sel",
+                "split_add",
+                "prune_total",
+                "prune_low_op",
+                "prune_size2d",
+                "prune_size3d",
+                "prune_mask",
+                "prune_capacity",
+            ]
+        }
+        stats = {
+            "sel_clone": self._dp_stats.get("sel_clone_stats"),
+            "sel_split": self._dp_stats.get("sel_split_stats"),
+            "new_clone": self._dp_stats.get("new_clone_stats"),
+            "new_split": self._dp_stats.get("new_split_stats"),
+            "prune": self._dp_stats.get("prune_stats"),
+        }
+        if reset:
+            self._clear_dp_deltas()
+        return counters, stats
+
     def _safe_log_scale_for_new_points(self, log_s: torch.Tensor, lo: float = -15.0, hi: float = 3.5) -> torch.Tensor:
         """
         Clamp log-scale for newly created Gaussians to prevent runaway propagation.
@@ -930,7 +1195,8 @@ class GaussianModel:
         features[:, :3, 0 ] = fused_color
         features[:, 3:, 1:] = 0.0
 
-        print("Number of points at initialisation : ", fused_point_cloud.shape[0])
+        if is_verbose():
+            print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None]
@@ -1353,7 +1619,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_scaling_base, new_mask, new_sh_mask, new_features_rest=None, iteration=None):
+    def densification_postfix(self, new_xyz, new_features_dc, new_scaling_base, new_mask, new_sh_mask, new_features_rest=None, iteration=None, kind: str = None):
         n_before = self._xyz.shape[0]
         d = {
             "xyz": new_xyz,
@@ -1380,6 +1646,8 @@ class GaussianModel:
 
         n_after = self.get_xyz.shape[0]
         added = n_after - n_before
+        if added > 0:
+            self._record_new_points_slice(kind=kind, start=n_after - added, end=n_after)
 
         if self._mass_debug_enabled():
             self._ensure_birth_iter(default_iter=0)
@@ -1425,20 +1693,20 @@ class GaussianModel:
         n_init_points = self.get_xyz.shape[0]
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
-        
-        selected_pts_mask = padded_grad >= grad_threshold
+        grad_mask = padded_grad >= grad_threshold
+        self._record_densify_candidates(kind="split", mask=grad_mask)
+
+        selected_pts_mask = grad_mask
         
         # World-space size constraint (original 3DGS)
         is_large_ws = torch.max(self.get_scaling, dim=1).values > self.percent_dense * scene_extent
-        # Screen-space size constraint (FPS optimization)
-        is_large_ss = self.max_radii2D > 3.0
-        
         selected_pts_mask = torch.logical_and(selected_pts_mask, is_large_ws)
-        selected_pts_mask = torch.logical_and(selected_pts_mask, is_large_ss)
 
         num_sel = int(selected_pts_mask.sum().item())
         if num_sel == 0:
             return
+        # Telemetry: split selection (adds N new points per source)
+        self._record_densify_selection(kind="split", selected_mask=selected_pts_mask, grads=padded_grad, multiplier=N)
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means = torch.zeros((stds.size(0), 3), device="cuda")
@@ -1468,7 +1736,7 @@ class GaussianModel:
         if self._encoder_variant == '3dgs' and isinstance(self._features_rest, nn.Parameter):
             new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_scaling_base, new_mask, new_sh_mask, new_features_rest, iteration=iteration)
+        self.densification_postfix(new_xyz, new_features_dc, new_scaling_base, new_mask, new_sh_mask, new_features_rest, iteration=iteration, kind="split")
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter, iteration=iteration)
@@ -1479,7 +1747,11 @@ class GaussianModel:
         Clone small Gaussians with high gradient.
         Uses original 3DGS logic with FPS guard for screen-space size.
         """
-        selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
+        grad_norm = torch.norm(grads, dim=-1)
+        grad_mask = torch.where(grad_norm >= grad_threshold, True, False)
+        self._record_densify_candidates(kind="clone", mask=grad_mask)
+
+        selected_pts_mask = grad_mask
         
         # World-space size constraint (original 3DGS)
         is_small_ws = torch.max(self.get_scaling, dim=1).values <= self.percent_dense * scene_extent
@@ -1489,6 +1761,12 @@ class GaussianModel:
         selected_pts_mask = torch.logical_and(selected_pts_mask, is_small_ws)
         selected_pts_mask = torch.logical_and(selected_pts_mask, is_visible_ss)
         selected_pts_mask = torch.logical_and(selected_pts_mask, is_visible_ss)
+
+        num_sel = int(selected_pts_mask.sum().item()) if selected_pts_mask.numel() > 0 else 0
+        if num_sel == 0:
+            return
+        # Telemetry: clone selection (adds one point per source)
+        self._record_densify_selection(kind="clone", selected_mask=selected_pts_mask, grads=grads, multiplier=1)
         
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
@@ -1501,15 +1779,16 @@ class GaussianModel:
         if self._encoder_variant == '3dgs' and isinstance(self._features_rest, nn.Parameter):
             new_features_rest = self._features_rest[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_scaling_base, new_mask, new_sh_mask, new_features_rest, iteration=iteration)
+        self.densification_postfix(new_xyz, new_features_dc, new_scaling_base, new_mask, new_sh_mask, new_features_rest, iteration=iteration, kind="clone")
         self.update_attributes(force_update=True, iteration=iteration)
         self._debug_scale_stats(tag="after_densify_clone", tensor=self._scaling_base, iteration=iteration, force=True, check_assert=True)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, iteration=0):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, iteration=0, mask_prune_threshold=0.01):
         """
         Core densification and pruning logic.
         Simplified to use original 3DGS approach with opacity-based pruning.
         """
+        self._dp_stats["densify_calls"] += 1
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
@@ -1517,6 +1796,8 @@ class GaussianModel:
         self.densify_and_clone(grads, max_grad, extent, iteration=iteration)
         self.densify_and_split(grads, max_grad, extent, iteration=iteration)
         self.update_attributes(force_update=True, iteration=iteration)
+        # After attributes refresh, gather new-point stats for the slices recorded during densification
+        self._finalize_new_point_stats()
         self._emit_densify_new_stats(iteration=iteration)
         
         # === Pruning: Size-Aware Opacity Thresholds with Ramp ===
@@ -1526,8 +1807,13 @@ class GaussianModel:
         # Base pruning: extremely low opacity (original 3DGS)
         opacity_mask = (opacity < min_opacity)
         prune_mask = opacity_mask
+        # Early mask prune (match LocoGS behavior): remove points with very low mask values
+        mask_mask = (self.get_mask <= mask_prune_threshold).squeeze()
+        prune_mask = torch.logical_or(prune_mask, mask_mask)
 
         # Removed size-ramp and max_screen_size pruning to isolate opacity/mask-only behavior.
+        size2d_mask = None
+        size3d_mask = None
 
         if self._mass_debug_enabled():
             reason_counts = {
@@ -1537,6 +1823,19 @@ class GaussianModel:
                 "capacity": 0,
             }
             self._log_prune_breakdown(iteration, prune_mask, reason_counts, N_before=N_before)
+        # Telemetry: record prune event (reason masks may overlap; counts are per-mask intersections)
+            self._record_prune_event(
+            prune_mask=prune_mask,
+            reason_masks={
+                "low_opacity": opacity_mask,
+                "size2d": size2d_mask,
+                "size3d": size3d_mask,
+                "mask": mask_mask,
+                "capacity": None,
+            },
+            iteration=iteration,
+            N_before=N_before,
+        )
         
         self.prune_points(prune_mask, iteration=iteration)
         self._debug_scale_stats(tag="after_prune", tensor=self._scaling_base, iteration=iteration, force=True, check_assert=True)
@@ -1591,7 +1890,7 @@ class GaussianModel:
         
         # Densify only if under capacity and within schedule
         if iteration < densify_until and num_points < max_points:
-            self.densify_and_prune(adaptive_grad, min_opacity, extent, max_screen_size, iteration=iteration)
+            self.densify_and_prune(adaptive_grad, min_opacity, extent, max_screen_size, iteration=iteration, mask_prune_threshold=mask_prune_threshold)
             new_count = self.get_xyz.shape[0]
             # Log capacity warning if approaching limit
             if new_count >= max_points * 0.9:
@@ -1609,8 +1908,8 @@ class GaussianModel:
     def mask_prune(self, mask_threshold=0.01, iteration=None):
         # Pruning: points with mask <= threshold are removed (LocoGS: 0.01)
         prune_mask = (self.get_mask <= mask_threshold).squeeze()
+        N_before = self.get_xyz.shape[0]
         if self._mass_debug_enabled():
-            N_before = self.get_xyz.shape[0]
             reason_counts = {
                 "opacity": 0,
                 "size": 0,
@@ -1618,6 +1917,19 @@ class GaussianModel:
                 "capacity": 0,
             }
             self._log_prune_breakdown(iteration, prune_mask, reason_counts, N_before=N_before)
+        # Telemetry: mask-based prune (reason masks may overlap; counts are per-mask intersections)
+        self._record_prune_event(
+            prune_mask=prune_mask,
+            reason_masks={
+                "low_opacity": None,
+                "size2d": None,
+                "size3d": None,
+                "mask": prune_mask,
+                "capacity": None,
+            },
+            iteration=iteration,
+            N_before=N_before,
+        )
         self.prune_points(prune_mask, iteration=iteration)
         torch.cuda.empty_cache()
 

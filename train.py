@@ -681,6 +681,58 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # Capacity info
                 max_cap = gaussians.gaussian_capacity_config["max_point_count"]
                 cap_pct = gaussian_count / max_cap * 100
+                # Densify/Prune telemetry (since last summary)
+                try:
+                    dp_counters, dp_stats = gaussians.consume_densify_prune_stats(reset=True)
+                except Exception:
+                    dp_counters, dp_stats = {}, {}
+                verbose_mode = is_verbose(opt)
+                dp_verbose = True  # Always emit densify/prune detail without requiring flags
+                def _fmt_count(val):
+                    if val is None:
+                        return "N/A"
+                    try:
+                        return f"{int(val):,}"
+                    except Exception:
+                        return "N/A"
+                def _fmt_stat(val):
+                    if val is None:
+                        return "N/A"
+                    try:
+                        return f"{float(val):.4f}"
+                    except Exception:
+                        return "N/A"
+                def _stat_pair(stats_dict, prefix):
+                    if not isinstance(stats_dict, dict):
+                        return ("N/A", "N/A")
+                    return (
+                        _fmt_stat(stats_dict.get(f"{prefix}_p50")),
+                        _fmt_stat(stats_dict.get(f"{prefix}_p95")),
+                    )
+                def _stat_pair_ext(stats_dict, prefix_high):
+                    if not isinstance(stats_dict, dict):
+                        return ("N/A", "N/A")
+                    return (
+                        _fmt_stat(stats_dict.get(f"{prefix_high}_p95")),
+                        _fmt_stat(stats_dict.get(f"{prefix_high}_p99")),
+                    )
+                added_total = (dp_counters.get("clone_add", 0) or 0) + (dp_counters.get("split_add", 0) or 0)
+                densify_line = (
+                    f"  Densify Δ: calls={_fmt_count(dp_counters.get('densify_calls'))} | "
+                    f"clone sel={_fmt_count(dp_counters.get('clone_sel'))}/{_fmt_count(dp_counters.get('clone_cand'))} "
+                    f"add={_fmt_count(dp_counters.get('clone_add'))} | "
+                    f"split sel={_fmt_count(dp_counters.get('split_sel'))}/{_fmt_count(dp_counters.get('split_cand'))} "
+                    f"add={_fmt_count(dp_counters.get('split_add'))} | "
+                    f"add_total={_fmt_count(added_total)}"
+                )
+                prune_line = (
+                    f"  Prune  Δ: total={_fmt_count(dp_counters.get('prune_total'))} | "
+                    f"low_op={_fmt_count(dp_counters.get('prune_low_op'))} "
+                    f"size2d={_fmt_count(dp_counters.get('prune_size2d'))} "
+                    f"size3d={_fmt_count(dp_counters.get('prune_size3d'))} "
+                    f"mask={_fmt_count(dp_counters.get('prune_mask'))} "
+                    f"cap={_fmt_count(dp_counters.get('prune_capacity'))}"
+                )
                 
                 # Formatted output
                 print("\n" + "=" * 90)
@@ -688,6 +740,35 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("-" * 90)
                 print(f"  Gaussians   │  N = {gaussian_count:,}  │  Capacity = {cap_pct:.1f}%  │  SH Degree = {current_sh_degree}")
                 print(f"  Opacity     │  p5 = {opacity_p5:.3f}  │  p50 = {opacity_p50:.3f}  │  p95 = {opacity_p95:.3f}")
+                print(densify_line)
+                print(prune_line)
+                if dp_verbose:
+                    clone_stats = dp_stats.get("sel_clone") if isinstance(dp_stats, dict) else None
+                    split_stats = dp_stats.get("sel_split") if isinstance(dp_stats, dict) else None
+                    new_clone_stats = dp_stats.get("new_clone") if isinstance(dp_stats, dict) else None
+                    new_split_stats = dp_stats.get("new_split") if isinstance(dp_stats, dict) else None
+                    prune_stats = dp_stats.get("prune") if isinstance(dp_stats, dict) else None
+                    cg50, cg95 = _stat_pair(clone_stats, "grad")
+                    co50, co95 = _stat_pair(clone_stats, "op")
+                    cs50, cs95 = _stat_pair(clone_stats, "logS")
+                    sg50, sg95 = _stat_pair(split_stats, "grad")
+                    so50, so95 = _stat_pair(split_stats, "op")
+                    ss50, ss95 = _stat_pair(split_stats, "logS")
+                    nco50, nco95 = _stat_pair(new_clone_stats, "op")
+                    ncs50, ncs95 = _stat_pair(new_clone_stats, "logS")
+                    ncr95, ncr99 = _stat_pair_ext(new_clone_stats, "r2d")
+                    nso50, nso95 = _stat_pair(new_split_stats, "op")
+                    nss50, nss95 = _stat_pair(new_split_stats, "logS")
+                    nsr95, nsr99 = _stat_pair_ext(new_split_stats, "r2d")
+                    po50, po95 = _stat_pair(prune_stats, "op")
+                    ps50, ps95 = _stat_pair(prune_stats, "logS")
+                    pr95 = _fmt_stat(prune_stats.get("r2d_p95") if isinstance(prune_stats, dict) else None)
+                    pr99 = _fmt_stat(prune_stats.get("r2d_p99") if isinstance(prune_stats, dict) else None)
+                    print(f"  Densify(sel/clone): grad p50={cg50} p95={cg95} | op p50={co50} p95={co95} | logS p50={cs50} p95={cs95}")
+                    print(f"  Densify(sel/split): grad p50={sg50} p95={sg95} | op p50={so50} p95={so95} | logS p50={ss50} p95={ss95}")
+                    print(f"  Densify(new/clone): op p50={nco50} p95={nco95} | logS p50={ncs50} p95={ncs95} | r2d p95={ncr95} p99={ncr99}")
+                    print(f"  Densify(new/split): op p50={nso50} p95={nso95} | logS p50={nss50} p95={nss95} | r2d p95={nsr95} p99={nsr99}")
+                    print(f"  Prune(pruned): op p50={po50} p95={po95} | logS p50={ps50} p95={ps95} | r2d p95={pr95} p99={pr99}")
                 
                 print("-" * 90)
                 print(f"  Loss Total  │  {loss_total_val:.6f}")
