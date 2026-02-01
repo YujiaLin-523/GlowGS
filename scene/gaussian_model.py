@@ -204,6 +204,12 @@ class GaussianModel:
         self.spatial_lr_scale = 0
         # Debug scale flag (env controlled, default off)
         self._debug_scale = os.getenv("DEBUG_SCALE", "0").lower() in ("1", "true", "yes")
+        # Mass-aware debug flag (env controlled, default off)
+        self._debug_mass = os.getenv("DEBUG_MASS", "0").lower() in ("1", "true", "yes")
+        # Optional birth iteration tracker (only allocated when DEBUG_MASS=1)
+        self._birth_iter = None
+        # Pending densify slices (start, end, iter) for deferred stat logging
+        self._pending_densify_slices = []
         # Precomputed attribute cache for fast inference (populated by precompute_attributes)
         self._precomputed_cache = None
         self.setup_functions()
@@ -645,6 +651,157 @@ class GaussianModel:
             raise RuntimeError(f"[DEBUG_SCALE] stage={tag} iter={iteration} log_scale_p99={base_stats['p99']:.3f} > 6 (scene/gaussian_model.py)")
         return payload
 
+    # ------------------------------------------------------------------
+    # Mass-debug helpers (gated by DEBUG_MASS env flag)
+    # ------------------------------------------------------------------
+    def _mass_debug_enabled(self) -> bool:
+        return bool(self._debug_mass)
+
+    def _ensure_birth_iter(self, default_iter: int = 0):
+        """Allocate birth-iteration buffer when DEBUG_MASS=1."""
+        if not self._mass_debug_enabled():
+            return
+        N = self._xyz.shape[0] if isinstance(self._xyz, torch.Tensor) else 0
+        device = self._xyz.device if isinstance(self._xyz, torch.Tensor) and self._xyz.numel() > 0 else "cuda"
+        if self._birth_iter is None or self._birth_iter.shape[0] != N:
+            self._birth_iter = torch.full((N,), int(default_iter), device=device, dtype=torch.int32)
+
+    def _assert_birth_align(self):
+        if not self._mass_debug_enabled():
+            return
+        if self._birth_iter is None:
+            return
+        if self._birth_iter.shape[0] != self._xyz.shape[0]:
+            raise RuntimeError(f"[DEBUG_MASS] birth_iter mismatch: birth {self._birth_iter.shape[0]} vs xyz {self._xyz.shape[0]}")
+
+    def _sample_percentiles(self, tensor: torch.Tensor, sample: int = 8192, quantiles=(0.5, 0.9, 0.95, 0.99)):
+        if tensor is None or not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+            return None
+        N = tensor.shape[0]
+        s = min(sample, N)
+        if s <= 0:
+            return None
+        idx = torch.randint(0, N, (s,), device=tensor.device)
+        flat = tensor[idx].reshape(-1).float()
+        finite = torch.isfinite(flat)
+        if finite.sum() == 0:
+            return None
+        flat = flat[finite]
+        q_tensor = torch.quantile(flat, torch.tensor(list(quantiles), device=flat.device))
+        names = {0.5: "p50", 0.9: "p90", 0.95: "p95", 0.99: "p99"}
+        stats = {names[q]: float(q_tensor[i].item()) for i, q in enumerate(quantiles)}
+        stats["min"] = float(flat.min().item())
+        stats["max"] = float(flat.max().item())
+        stats["mean"] = float(flat.mean().item())
+        return stats
+
+    def _collect_point_stats(self, mask: torch.Tensor = None, sample: int = 8192):
+        """Collect opacity/log_scale/scale/radii2D quantiles from mask or full set."""
+        if not self._mass_debug_enabled():
+            return None
+        N = self._xyz.shape[0] if isinstance(self._xyz, torch.Tensor) else 0
+        if N == 0:
+            return None
+        if mask is not None:
+            if mask.dtype == torch.bool:
+                if mask.shape[0] != N or mask.sum() == 0:
+                    return None
+                idx = torch.nonzero(mask, as_tuple=False).reshape(-1)
+                if idx.numel() == 0:
+                    return None
+            else:
+                idx = mask
+                if idx.numel() == 0:
+                    return None
+                idx = idx.to(device=self._xyz.device, dtype=torch.long)
+            s = min(sample, idx.shape[0])
+            perm = torch.randperm(idx.shape[0], device=idx.device)[:s]
+            idx = idx[perm]
+        else:
+            s = min(sample, N)
+            idx = torch.randint(0, N, (s,), device=self._xyz.device)
+
+        opacity = self.get_opacity.squeeze()[idx] if hasattr(self, "get_opacity") else None
+        log_scale = torch.clamp(self._scaling_base[idx], -15.0, 10.0) if isinstance(self._scaling_base, torch.Tensor) and self._scaling_base.numel() > 0 else None
+        scale = torch.exp(log_scale) if log_scale is not None else None
+        radii = self.max_radii2D[idx] if isinstance(self.max_radii2D, torch.Tensor) and self.max_radii2D.numel() > 0 else None
+
+        return {
+            "opacity": self._sample_percentiles(opacity, sample=opacity.numel() if opacity is not None else 0) if opacity is not None else None,
+            "log_scale": self._sample_percentiles(log_scale, sample=log_scale.numel() if log_scale is not None else 0) if log_scale is not None else None,
+            "scale": self._sample_percentiles(scale, sample=scale.numel() if scale is not None else 0) if scale is not None else None,
+            "radii2D": self._sample_percentiles(radii, sample=radii.numel() if radii is not None else 0) if radii is not None else None,
+        }
+
+    def _record_densify_slice(self, start: int, end: int, iteration: int):
+        if not self._mass_debug_enabled():
+            return
+        self._pending_densify_slices.append((int(start), int(end), int(iteration) if iteration is not None else 0))
+
+    def _emit_densify_new_stats(self, iteration: int):
+        if not self._mass_debug_enabled():
+            self._pending_densify_slices = []
+            return
+        if not self._pending_densify_slices:
+            return
+        all_stats = self._collect_point_stats(mask=None, sample=8192)
+        for start, end, it in self._pending_densify_slices:
+            new_count = max(0, end - start)
+            if new_count <= 0:
+                continue
+            idx = torch.arange(start, end, device=self._xyz.device)
+            new_stats = self._collect_point_stats(mask=idx, sample=min(8192, new_count))
+            payload = {
+                "tag": "densify_new_points",
+                "iter": int(iteration),
+                "new_count": int(new_count),
+                "new_stats": new_stats,
+                "all_stats": all_stats,
+            }
+            print(json.dumps(payload, default=float))
+        self._pending_densify_slices = []
+
+    def _safe_corr(self, a: torch.Tensor, b: torch.Tensor):
+        if a is None or b is None or a.numel() < 2 or b.numel() < 2:
+            return None
+        a = a.float()
+        b = b.float()
+        a = a - a.mean()
+        b = b - b.mean()
+        denom = (a.std(unbiased=False) * b.std(unbiased=False)) + 1e-8
+        if torch.any(denom == 0):
+            return None
+        return float((a * b).mean().item() / denom.mean().item())
+
+    def _log_prune_breakdown(self, iteration: int, prune_mask: torch.Tensor, reason_counts: dict, N_before: int):
+        if not self._mass_debug_enabled():
+            return
+        if prune_mask is None or prune_mask.numel() == 0:
+            return
+        iter_val = int(iteration) if iteration is not None else 0
+        union = int(prune_mask.sum().item())
+        payload = {
+            "tag": "prune_breakdown",
+            "iter": iter_val,
+            "N_before": int(N_before),
+            "N_after": int(N_before - union),
+            "reason": {k: int(v) for k, v in reason_counts.items()},
+            "N_union": int(union),
+        }
+        all_stats = self._collect_point_stats(mask=None, sample=8192)
+        pruned_stats = None
+        age_stats = None
+        if union > 0:
+            pruned_stats = self._collect_point_stats(mask=prune_mask, sample=min(8192, union))
+            if self._birth_iter is not None and self._birth_iter.shape[0] == prune_mask.shape[0]:
+                ages = (iter_val - self._birth_iter[prune_mask].int()).float()
+                if ages.numel() > 0:
+                    age_stats = self._sample_percentiles(ages, sample=min(8192, ages.numel()), quantiles=(0.5, 0.9, 0.99))
+        payload["stats"] = {"all": all_stats, "pruned": pruned_stats}
+        if age_stats is not None:
+            payload["age"] = age_stats
+        print(json.dumps(payload, default=float))
+
     def _safe_log_scale_for_new_points(self, log_s: torch.Tensor, lo: float = -15.0, hi: float = 3.5) -> torch.Tensor:
         """
         Clamp log-scale for newly created Gaussians to prevent runaway propagation.
@@ -798,11 +955,16 @@ class GaussianModel:
             self._features_rest = torch.empty(0)
 
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self._ensure_birth_iter(default_iter=0)
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        # Store densify schedule for debug gating
+        self._densify_from_iter = getattr(training_args, 'densify_from_iter', 0)
+        self._densification_interval = getattr(training_args, 'densification_interval', 100)
+        self._ensure_birth_iter(default_iter=0)
         
         # Update capacity config from training_args (allow CLI override)
         max_gaussians = getattr(training_args, 'max_gaussians', 6_000_000)
@@ -1154,6 +1316,15 @@ class GaussianModel:
             self.denom = self.denom[valid_points_mask]
             self.max_radii2D = self.max_radii2D[valid_points_mask]
         
+        if self._mass_debug_enabled() and isinstance(self._birth_iter, torch.Tensor) and self._birth_iter.numel() > 0:
+            if self._birth_iter.shape[0] == valid_points_mask.shape[0]:
+                self._birth_iter = self._birth_iter[valid_points_mask]
+            else:
+                # Shape drift shouldn't happen; realign defensively
+                self._ensure_birth_iter(default_iter=0)
+                if self._birth_iter.shape[0] == valid_points_mask.shape[0]:
+                    self._birth_iter = self._birth_iter[valid_points_mask]
+
         # Clear cached contracted_xyz since xyz changed
         if hasattr(self, '_cached_contracted_xyz'):
             delattr(self, '_cached_contracted_xyz')
@@ -1208,6 +1379,17 @@ class GaussianModel:
             self._features_rest = optimizable_tensors["f_rest"]
 
         n_after = self.get_xyz.shape[0]
+        added = n_after - n_before
+
+        if self._mass_debug_enabled():
+            self._ensure_birth_iter(default_iter=0)
+            if added > 0:
+                birth_val = int(iteration) if iteration is not None else 0
+                new_birth = torch.full((added,), birth_val, device=self._xyz.device, dtype=torch.int32)
+                self._birth_iter = torch.cat((self._birth_iter, new_birth), dim=0)
+                self._assert_birth_align()
+                self._record_densify_slice(n_before, n_after, birth_val)
+
         self.xyz_gradient_accum = torch.zeros((n_after, 1), device="cuda")
         self.denom = torch.zeros((n_after, 1), device="cuda")
         self.max_radii2D = torch.zeros((n_after,), device="cuda")
@@ -1335,40 +1517,26 @@ class GaussianModel:
         self.densify_and_clone(grads, max_grad, extent, iteration=iteration)
         self.densify_and_split(grads, max_grad, extent, iteration=iteration)
         self.update_attributes(force_update=True, iteration=iteration)
+        self._emit_densify_new_stats(iteration=iteration)
         
         # === Pruning: Size-Aware Opacity Thresholds with Ramp ===
+        N_before = self.get_xyz.shape[0]
         opacity = self.get_opacity.squeeze()
         
         # Base pruning: extremely low opacity (original 3DGS)
-        prune_mask = (opacity < min_opacity)
-        
-        # FIX: Size-aware pruning with smooth ramp (4k-6k iterations)
-        # Use continuous threshold transition to avoid step discontinuity
-        size_prune_start = getattr(self, 'size_prune_start_iter', 4000)
-        size_prune_end = getattr(self, 'size_prune_end_iter', 6000)
-        
-        # Ramp weight: 0 at start, 1 at end (linear transition)
-        ramp_w = max(0.0, min(1.0, (iteration - size_prune_start) / max(1, size_prune_end - size_prune_start)))
-        
-        # Smooth radius threshold transition: 1e9 (never trigger) -> 50.0 (original threshold)
-        # This ensures w=0 behaves as "disabled", w=1 as "fully enabled"
-        radius_threshold = (1.0 - ramp_w) * 1e9 + ramp_w * 50.0
-        
-        # Size-Aware Pruning: penalize large semi-transparent volumes (now always applied with smooth threshold)
-        # - Small radius (<50px): details/spokes/background, keep even if semi-transparent
-        # - Large radius (>50px): must be solid (>0.005) or get pruned
-        # TUNED: Relaxed from (20px, 0.05) to (50px, 0.005) to preserve background/sky
-        large_radius_mask = self.max_radii2D > radius_threshold
-        semi_transparent_mask = opacity < 0.005
-        volumetric_bloat = torch.logical_and(large_radius_mask, semi_transparent_mask)
-        prune_mask = torch.logical_or(prune_mask, volumetric_bloat)
-        
-        # Additional artifact cleanup for extremely large points
-        if max_screen_size:
-            is_huge_screen = self.max_radii2D > max_screen_size
-            is_transparent = opacity < 0.5
-            is_artifact = torch.logical_and(is_huge_screen, is_transparent)
-            prune_mask = torch.logical_or(prune_mask, is_artifact)
+        opacity_mask = (opacity < min_opacity)
+        prune_mask = opacity_mask
+
+        # Removed size-ramp and max_screen_size pruning to isolate opacity/mask-only behavior.
+
+        if self._mass_debug_enabled():
+            reason_counts = {
+                "opacity": int(opacity_mask.sum().item()),
+                "size": 0,
+                "mask": 0,
+                "capacity": 0,
+            }
+            self._log_prune_breakdown(iteration, prune_mask, reason_counts, N_before=N_before)
         
         self.prune_points(prune_mask, iteration=iteration)
         self._debug_scale_stats(tag="after_prune", tensor=self._scaling_base, iteration=iteration, force=True, check_assert=True)
@@ -1441,6 +1609,15 @@ class GaussianModel:
     def mask_prune(self, mask_threshold=0.01, iteration=None):
         # Pruning: points with mask <= threshold are removed (LocoGS: 0.01)
         prune_mask = (self.get_mask <= mask_threshold).squeeze()
+        if self._mass_debug_enabled():
+            N_before = self.get_xyz.shape[0]
+            reason_counts = {
+                "opacity": 0,
+                "size": 0,
+                "mask": int(prune_mask.sum().item()),
+                "capacity": 0,
+            }
+            self._log_prune_breakdown(iteration, prune_mask, reason_counts, N_before=N_before)
         self.prune_points(prune_mask, iteration=iteration)
         torch.cuda.empty_cache()
 
@@ -1470,6 +1647,7 @@ class GaussianModel:
         
         # Only apply Mass-Aware weighting when densify_strategy is 'feature_weighted'
         use_mass_aware = (self._densify_strategy == 'feature_weighted')
+        weight = None
         
         # FIX: Mass-aware with smooth ramp (3k-5k iterations)
         # Prevents abrupt gradient distribution change at 5k iteration
@@ -1503,11 +1681,60 @@ class GaussianModel:
         elif opacity is not None and use_mass_aware:
             # Fallback: simple opacity weighting (backward compatible)
             opacity_weight = opacity[update_filter].clamp(0.0, 1.0)
+            weight = opacity_weight
             grad_norm = grad_norm * opacity_weight
         # else: Standard 3DGS densification - no weighting applied
         
         self.xyz_gradient_accum[update_filter] += grad_norm
         self.denom[update_filter] += 1
+
+        # ------------------ DEBUG: Mass-aware diagnostics ------------------
+        if self._mass_debug_enabled() and weight is not None:
+            interval = max(1, getattr(self, "_densification_interval", 100))
+            start_iter = getattr(self, "_densify_from_iter", 0)
+            should_log = (iteration >= start_iter) and (iteration % interval == 0)
+            if should_log:
+                w_flat = weight.detach().reshape(-1)
+                sample = min(8192, w_flat.numel())
+                if sample > 0:
+                    idx = torch.randperm(w_flat.numel(), device=w_flat.device)[:sample]
+                    w_s = w_flat[idx]
+                    radii_s = radii[update_filter].float()[idx] if radii is not None else None
+                    log_scale_full = torch.clamp(self._scaling_base, -15.0, 10.0) if isinstance(self._scaling_base, torch.Tensor) and self._scaling_base.numel() > 0 else None
+                    log_scale_s = log_scale_full[update_filter][idx] if log_scale_full is not None else None
+                    opacity_s = opacity[update_filter].float()[idx] if opacity is not None else None
+
+                    w_stats = self._sample_percentiles(w_s, sample=sample)
+                    corr = {
+                        "w_radii2D": self._safe_corr(w_s, radii_s),
+                        "w_log_scale": self._safe_corr(w_s, log_scale_s),
+                        "w_opacity": self._safe_corr(w_s, opacity_s),
+                    }
+                    bins = {}
+                    if radii_s is not None and radii_s.numel() >= 3:
+                        q = torch.quantile(radii_s, torch.tensor([0.33, 0.66], device=radii_s.device))
+                        small = radii_s <= q[0]
+                        medium = torch.logical_and(radii_s > q[0], radii_s <= q[1])
+                        large = radii_s > q[1]
+                        def _bin(mask, label):
+                            if mask.sum() == 0:
+                                return None
+                            return {"n": int(mask.sum().item()), "w_mean": float(w_s[mask].mean().item())}
+                        bins = {
+                            "q33": float(q[0].item()),
+                            "q66": float(q[1].item()),
+                            "small": _bin(small, "small"),
+                            "medium": _bin(medium, "medium"),
+                            "large": _bin(large, "large"),
+                        }
+                    payload = {
+                        "tag": "mass_aware",
+                        "iter": int(iteration),
+                        "w": w_stats,
+                        "corr": corr,
+                        "bins": bins,
+                    }
+                    print(json.dumps(payload, default=float))
 
     def sort_attributes(self):
         xyz = self.get_xyz.float().detach().cpu().numpy()
