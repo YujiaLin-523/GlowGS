@@ -221,6 +221,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         densify_strategy=densify_strategy,
         feature_mod_type=feature_mod_type,
         mass_aware_scale=getattr(opt, 'mass_aware_scale', 0.1),
+        enable_mass_gate=getattr(opt, 'enable_mass_gate', True),
+        mass_gate_opacity_threshold=getattr(opt, 'mass_gate_opacity_threshold', 0.3),
+        mass_gate_radius_percentile=getattr(opt, 'mass_gate_radius_percentile', 80.0),
     )
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)

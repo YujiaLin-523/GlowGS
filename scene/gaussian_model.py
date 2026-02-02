@@ -164,7 +164,10 @@ class GaussianModel:
     def __init__(self, sh_degree: int, hash_size=19, width=64, depth=2, feature_role_split=True,
                  geo_resolution=48, geo_rank=6, geo_channels=8, encoder_variant="hybrid",
                  densify_strategy="feature_weighted", feature_mod_type="film",
-                 mass_aware_scale: float = 0.1):
+                 mass_aware_scale: float = 0.1,
+                 enable_mass_gate: bool = True,
+                 mass_gate_opacity_threshold: float = 0.3,
+                 mass_gate_radius_percentile: float = 80.0):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree
         # Store encoder variant and densification strategy for ablation studies
@@ -174,6 +177,10 @@ class GaussianModel:
         self._feature_mod_type = feature_mod_type  # 'film' or 'concat' for ECCV ablation
         # Mass-aware gradient weighting scale (xi): higher = stronger pruning, lower = softer
         self._mass_aware_scale = mass_aware_scale
+        # Mass Gate parameters (GlowGS innovation: block large & transparent from clone/split)
+        self._enable_mass_gate = enable_mass_gate
+        self._mass_gate_opacity_threshold = mass_gate_opacity_threshold
+        self._mass_gate_radius_percentile = mass_gate_radius_percentile
         # Alert threshold for large prune events (fraction of points removed in one call)
         self._prune_alert_thresh = 0.20
         # Store GeoEncoder parameters for serialization/deserialization
@@ -1702,6 +1709,26 @@ class GaussianModel:
         is_large_ws = torch.max(self.get_scaling, dim=1).values > self.percent_dense * scene_extent
         selected_pts_mask = torch.logical_and(selected_pts_mask, is_large_ws)
 
+        # Mass Gate: block (large && transparent) Gaussians from splitting
+        # Prevents "garbage duplication" that occludes fine details
+        # Only affects split selection, NOT pruning (safe: cannot cause point collapse)
+        enable_mass_gate = getattr(self, '_enable_mass_gate', True)
+        if enable_mass_gate:
+            opacity = self.get_opacity.squeeze()
+            opacity_thresh = getattr(self, '_mass_gate_opacity_threshold', 0.3)
+            radius_pct = getattr(self, '_mass_gate_radius_percentile', 80.0)
+            
+            is_transparent = opacity < opacity_thresh
+            radii_valid = self.max_radii2D > 0
+            if radii_valid.sum() > 0:
+                radius_thresh = torch.quantile(
+                    self.max_radii2D[radii_valid].float(), 
+                    radius_pct / 100.0
+                )
+                is_large_radii = self.max_radii2D > radius_thresh
+                mass_gate_reject = torch.logical_and(is_large_radii, is_transparent)
+                selected_pts_mask = torch.logical_and(selected_pts_mask, ~mass_gate_reject)
+
         num_sel = int(selected_pts_mask.sum().item())
         if num_sel == 0:
             return
@@ -1762,6 +1789,26 @@ class GaussianModel:
         # Reason: This filter blocked sub-pixel Gaussians from cloning, preventing
         # high-frequency texture recovery. Inria 3DGS has no such constraint.
 
+        # Mass Gate: block (large && transparent) Gaussians from cloning
+        # Prevents "garbage duplication" that occludes fine details
+        # Only affects clone selection, NOT pruning (safe: cannot cause point collapse)
+        enable_mass_gate = getattr(self, '_enable_mass_gate', True)
+        if enable_mass_gate:
+            opacity = self.get_opacity.squeeze()
+            opacity_thresh = getattr(self, '_mass_gate_opacity_threshold', 0.3)
+            radius_pct = getattr(self, '_mass_gate_radius_percentile', 80.0)
+            
+            is_transparent = opacity < opacity_thresh
+            radii_valid = self.max_radii2D > 0
+            if radii_valid.sum() > 0:
+                radius_thresh = torch.quantile(
+                    self.max_radii2D[radii_valid].float(), 
+                    radius_pct / 100.0
+                )
+                is_large = self.max_radii2D > radius_thresh
+                mass_gate_reject = torch.logical_and(is_large, is_transparent)
+                selected_pts_mask = torch.logical_and(selected_pts_mask, ~mass_gate_reject)
+
         num_sel = int(selected_pts_mask.sum().item()) if selected_pts_mask.numel() > 0 else 0
         if num_sel == 0:
             return
@@ -1794,6 +1841,9 @@ class GaussianModel:
 
         self.update_attributes(force_update=True, iteration=iteration)
         self.densify_and_clone(grads, max_grad, extent, iteration=iteration)
+        # Refresh attributes after clone (match LocoGS call sequence)
+        # Ensures newly cloned points have correct encoder outputs before split decision
+        self.update_attributes(force_update=True, iteration=iteration)
         self.densify_and_split(grads, max_grad, extent, iteration=iteration)
         self.update_attributes(force_update=True, iteration=iteration)
         # After attributes refresh, gather new-point stats for the slices recorded during densification
@@ -1947,118 +1997,25 @@ class GaussianModel:
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter, opacity=None, radii=None, iteration=0):
         """
-        Accumulate gradients for densification decision using Mass-Aware Gradient Weighting.
+        Accumulate RAW gradients for densification decision.
         
-        Theory (for paper):
-        We decompose gradient confidence into two orthogonal factors:
-        1. Visibility Boost (sqrt(alpha)): Non-linear rescaling to compensate for 
-           sub-pixel structures that appear semi-transparent due to rasterization averaging.
-           This prevents fine details (bike spokes) from being ignored.
-        2. Mass Regularization (1/(1 + alpha*r/tau)): Penalizes large, solid regions 
-           where high gradients often indicate lighting variation rather than geometric 
-           deficiency. This prevents over-densification on smooth surfaces (roads).
+        Per copilot-instructions.md:
+        "Mass-aware is a resource allocation signal for Gaussian budget management 
+        (gate/rank/prune), while densify trigger stats must stay RAW (unweighted)."
         
-        Formula: weight = sqrt(alpha) / (1 + alpha * radius / tau)
+        Mass-Aware Gate is applied in densify_and_clone/split, NOT here.
         
         Args:
             viewspace_point_tensor: Tensor with .grad containing screen-space gradients
             update_filter: Boolean mask for visible points
-            opacity: Optional opacity tensor [N, 1]. If provided, used for weighting.
-            radii: Optional screen-space radii tensor [N]. If provided, used for mass regularization.
-            iteration: Current training iteration (for warmup schedule)
+            opacity: Unused (kept for API compatibility)
+            radii: Unused (kept for API compatibility)
+            iteration: Unused (kept for API compatibility)
         """
+        # RAW gradient accumulation (LocoGS / 3DGS standard behavior)
         grad_norm = torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
-        
-        # Only apply Mass-Aware weighting when densify_strategy is 'feature_weighted'
-        use_mass_aware = (self._densify_strategy == 'feature_weighted')
-        weight = None
-        
-        # FIX: Mass-aware with smooth ramp (3k-5k iterations)
-        # Prevents abrupt gradient distribution change at 5k iteration
-        mass_start = getattr(self, 'mass_aware_start_iter', 3000)
-        mass_end = getattr(self, 'mass_aware_end_iter', 5000)
-        
-        # Compute ramp weight: 0->1 over [start, end]
-        ramp_w = self._compute_ramp_weight(iteration, mass_start, mass_end)
-        
-        if use_mass_aware and opacity is not None and radii is not None:
-            # Mass-Aware Gradient Weighting (GlowGS innovation)
-            alpha = opacity[update_filter].clamp(0.01, 1.0)  # [N_visible, 1]
-            r = radii[update_filter].float().unsqueeze(-1).clamp(min=1.0)  # [N_visible, 1]
-            
-            tau = 100.0
-            
-            # Visibility boost: sqrt(alpha) - helps small/thin structures with low opacity
-            visibility_boost = torch.sqrt(alpha)
-            
-            # Mass penalty: computed but smoothly ramped in
-            mass = alpha * r
-            mass_penalty = 1.0 / (1.0 + self._mass_aware_scale * (mass / tau))
-            
-            # Smooth interpolation: w=0 -> weight=visibility_boost (no penalty)
-            #                       w=1 -> weight=visibility_boost*mass_penalty (full penalty)
-            # Equivalent to: weight = visibility_boost * (1 + w * (mass_penalty - 1))
-            weight = visibility_boost * (1.0 + ramp_w * (mass_penalty - 1.0))
-            
-            grad_norm = grad_norm * weight
-            
-        elif opacity is not None and use_mass_aware:
-            # Fallback: simple opacity weighting (backward compatible)
-            opacity_weight = opacity[update_filter].clamp(0.0, 1.0)
-            weight = opacity_weight
-            grad_norm = grad_norm * opacity_weight
-        # else: Standard 3DGS densification - no weighting applied
-        
         self.xyz_gradient_accum[update_filter] += grad_norm
         self.denom[update_filter] += 1
-
-        # ------------------ DEBUG: Mass-aware diagnostics ------------------
-        if self._mass_debug_enabled() and weight is not None:
-            interval = max(1, getattr(self, "_densification_interval", 100))
-            start_iter = getattr(self, "_densify_from_iter", 0)
-            should_log = (iteration >= start_iter) and (iteration % interval == 0)
-            if should_log:
-                w_flat = weight.detach().reshape(-1)
-                sample = min(8192, w_flat.numel())
-                if sample > 0:
-                    idx = torch.randperm(w_flat.numel(), device=w_flat.device)[:sample]
-                    w_s = w_flat[idx]
-                    radii_s = radii[update_filter].float()[idx] if radii is not None else None
-                    log_scale_full = torch.clamp(self._scaling_base, -15.0, 10.0) if isinstance(self._scaling_base, torch.Tensor) and self._scaling_base.numel() > 0 else None
-                    log_scale_s = log_scale_full[update_filter][idx] if log_scale_full is not None else None
-                    opacity_s = opacity[update_filter].float()[idx] if opacity is not None else None
-
-                    w_stats = self._sample_percentiles(w_s, sample=sample)
-                    corr = {
-                        "w_radii2D": self._safe_corr(w_s, radii_s),
-                        "w_log_scale": self._safe_corr(w_s, log_scale_s),
-                        "w_opacity": self._safe_corr(w_s, opacity_s),
-                    }
-                    bins = {}
-                    if radii_s is not None and radii_s.numel() >= 3:
-                        q = torch.quantile(radii_s, torch.tensor([0.33, 0.66], device=radii_s.device))
-                        small = radii_s <= q[0]
-                        medium = torch.logical_and(radii_s > q[0], radii_s <= q[1])
-                        large = radii_s > q[1]
-                        def _bin(mask, label):
-                            if mask.sum() == 0:
-                                return None
-                            return {"n": int(mask.sum().item()), "w_mean": float(w_s[mask].mean().item())}
-                        bins = {
-                            "q33": float(q[0].item()),
-                            "q66": float(q[1].item()),
-                            "small": _bin(small, "small"),
-                            "medium": _bin(medium, "medium"),
-                            "large": _bin(large, "large"),
-                        }
-                    payload = {
-                        "tag": "mass_aware",
-                        "iter": int(iteration),
-                        "w": w_stats,
-                        "corr": corr,
-                        "bins": bins,
-                    }
-                    print(json.dumps(payload, default=float))
 
     def sort_attributes(self):
         xyz = self.get_xyz.float().detach().cpu().numpy()
