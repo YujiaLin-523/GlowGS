@@ -172,6 +172,13 @@ class OptimizationParams(ParamGroup):
         # Mass-aware densification strength (xi). Larger = stronger pruning.
         self.mass_aware_scale = 0.1
         
+        # Mass-Aware Gate (GlowGS innovation: block large & transparent from clone/split)
+        # This prevents "garbage duplication" - copying volumetric blobs that occlude fine details
+        # Gate only affects clone/split selection, NOT pruning (safe: cannot cause point collapse)
+        self.enable_mass_gate = True              # Master switch for Mass Gate in clone/split
+        self.mass_gate_opacity_threshold = 0.3    # Opacity below this = transparent (candidate for blocking)
+        self.mass_gate_radius_percentile = 80.0   # Radius above this percentile = large (candidate for blocking)
+        
         # densify_grad_threshold: gradient magnitude to trigger clone/split
         # LocoGS original: 0.0002
         self.densify_grad_threshold = 0.0002
