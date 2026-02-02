@@ -190,8 +190,8 @@ class OptimizationParams(ParamGroup):
         self.enable_edge_loss = True        # master switch for unified edge-aware gradient loss
         self.edge_loss_start_iter = 5000    # edge loss ramp start (begin transition)
         self.edge_loss_end_iter = 7000      # edge loss ramp end (full strength)
-        self.lambda_grad = 0.1              # edge loss weight (0.02~0.1 typical; 0.05 balanced)
-        self.edge_flat_weight = 0.5         # flat region penalty weight (alpha in paper; 0.5 = equal)
+        self.lambda_grad = 0.02             # edge loss weight (reduced from 0.1 for texture preservation)
+        self.edge_flat_weight = 0.3         # flat region penalty weight (reduced from 0.5 to avoid mid-freq suppression)
         
         # Warmup/Ramp configuration for step-free training (avoid 5k iteration discontinuity)
         self.mass_aware_start_iter = 3000   # mass-aware gradient weighting ramp start

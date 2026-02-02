@@ -1753,14 +1753,14 @@ class GaussianModel:
 
         selected_pts_mask = grad_mask
         
-        # World-space size constraint (original 3DGS)
+        # World-space size constraint (original 3DGS / LocoGS)
+        # Clone only small Gaussians (large ones should split instead)
         is_small_ws = torch.max(self.get_scaling, dim=1).values <= self.percent_dense * scene_extent
-        # Screen-space size constraint (FPS optimization)
-        is_visible_ss = self.max_radii2D > 2.0
-        
         selected_pts_mask = torch.logical_and(selected_pts_mask, is_small_ws)
-        selected_pts_mask = torch.logical_and(selected_pts_mask, is_visible_ss)
-        selected_pts_mask = torch.logical_and(selected_pts_mask, is_visible_ss)
+        
+        # [REMOVED] Screen-space size constraint (max_radii2D > 2.0)
+        # Reason: This filter blocked sub-pixel Gaussians from cloning, preventing
+        # high-frequency texture recovery. Inria 3DGS has no such constraint.
 
         num_sel = int(selected_pts_mask.sum().item()) if selected_pts_mask.numel() > 0 else 0
         if num_sel == 0:
@@ -1800,7 +1800,7 @@ class GaussianModel:
         self._finalize_new_point_stats()
         self._emit_densify_new_stats(iteration=iteration)
         
-        # === Pruning: Size-Aware Opacity Thresholds with Ramp ===
+        # === Pruning: Opacity + Mask + Size ===
         N_before = self.get_xyz.shape[0]
         opacity = self.get_opacity.squeeze()
         
@@ -1811,9 +1811,21 @@ class GaussianModel:
         mask_mask = (self.get_mask <= mask_prune_threshold).squeeze()
         prune_mask = torch.logical_or(prune_mask, mask_mask)
 
-        # Removed size-ramp and max_screen_size pruning to isolate opacity/mask-only behavior.
+        # [RESTORED] Size-based pruning (original 3DGS / LocoGS)
+        # Reference: LocoGS/scene/gaussian_model.py:553-558
+        # Prune Gaussians that are too large in screen-space or world-space
+        # This prevents "blob" accumulation that occludes fine details
         size2d_mask = None
         size3d_mask = None
+        if max_screen_size is not None:
+            # Screen-space size pruning: remove Gaussians > max_screen_size pixels
+            size2d_mask = self.max_radii2D > max_screen_size
+            prune_mask = torch.logical_or(prune_mask, size2d_mask)
+            
+            # World-space size pruning: remove Gaussians > 0.1 * scene_extent
+            # This catches large Gaussians that might not be visible in current view
+            size3d_mask = self.get_scaling.max(dim=1).values > 0.1 * extent
+            prune_mask = torch.logical_or(prune_mask, size3d_mask)
 
         if self._mass_debug_enabled():
             reason_counts = {
