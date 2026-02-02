@@ -5,13 +5,13 @@ from plyfile import PlyData
 import matplotlib.font_manager as fm
 
 # === 1. 强制顶刊样式 ===
-COLOR_BASE = "#D6404E"  # 稍微加深一点的红色 (Nature Red)
-COLOR_OURS = "#4A7EBB"  # 稍微加深一点的蓝色 (Nature Blue)
+COLOR_BASE = "#D62728"  # 稍微加深一点的红色 (Nature Red)
+COLOR_OURS = "#1F77B4"  # 稍微加深一点的蓝色 (Nature Blue)
 
 plt.rcParams.update({
     "font.family": "sans-serif",
     "font.sans-serif": ["Arial"], # 强制 Arial
-    "font.size": 14,              # 字号加大，防止留白过多显得字小
+    "font.size": 16,              # 字号加大，防止留白过多显得字小
     "axes.linewidth": 1.2,
     "axes.edgecolor": "#333333",
     "xtick.major.pad": 6,         # 增加刻度文字距离
@@ -62,7 +62,7 @@ def plot_fig5_layout_fix(op_base, op_ours):
     ax1.grid(True, axis='y', linestyle='--', alpha=0.3, zorder=0)
     
     # 图例放在图内上方，无边框
-    ax1.legend(frameon=False, loc='upper center', bbox_to_anchor=(0.5, 1.0), ncol=2, fontsize=12)
+    ax1.legend(frameon=False, loc='upper center', bbox_to_anchor=(0.5, 1.0), ncol=2, fontsize=14)
 
     # --- 右图：Tail Mass ---
     thresholds = [0.1, 0.05]
@@ -80,7 +80,7 @@ def plot_fig5_layout_fix(op_base, op_ours):
         height = rect.get_height()
         if height > 0.001:
             ax2.text(rect.get_x() + rect.get_width()/2., height + 0.01,
-                     f'{height*100:.1f}%', ha='center', va='bottom', fontsize=11, color='black')
+                     f'{height*100:.1f}%', ha='center', va='bottom', fontsize=14, color='black')
 
     ax2.set_xticks(x)
     # 使用 LaTeX 格式让 α 看起来更专业
