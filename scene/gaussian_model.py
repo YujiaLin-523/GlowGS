@@ -1839,12 +1839,30 @@ class GaussianModel:
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
+        warmup_iter = 3000
+        tau = 0.5  # FIXED: Increased from 0.1 to reduce over-suppression (safe baseline)
+
+        if iteration < warmup_iter:
+            clone_grads = grads
+            split_grads = grads
+        else:
+            # Post-warmup: apply size-decay weight to clone, keep split raw
+            # CRITICAL FIX: Use world-space scaling, NOT screen-space max_radii2D
+            world_scale = self.get_scaling.max(dim=1).values  # [N] World-space Gaussian radius
+            extent_safe = max(extent, 1e-6)
+            decay = (world_scale / (tau * extent_safe)) ** 2
+            weight = 1.0 / (1.0 + decay)  # [N] Size-decay weight (0.0~1.0)
+            
+            raw_grad = grads.squeeze(-1)  # [N]
+            clone_grads = (raw_grad * weight).unsqueeze(1)
+            split_grads = raw_grad.unsqueeze(1)
+
         self.update_attributes(force_update=True, iteration=iteration)
-        self.densify_and_clone(grads, max_grad, extent, iteration=iteration)
+        self.densify_and_clone(clone_grads, max_grad, extent, iteration=iteration)
         # Refresh attributes after clone (match LocoGS call sequence)
         # Ensures newly cloned points have correct encoder outputs before split decision
         self.update_attributes(force_update=True, iteration=iteration)
-        self.densify_and_split(grads, max_grad, extent, iteration=iteration)
+        self.densify_and_split(split_grads, max_grad, extent, iteration=iteration)
         self.update_attributes(force_update=True, iteration=iteration)
         # After attributes refresh, gather new-point stats for the slices recorded during densification
         self._finalize_new_point_stats()
