@@ -3,14 +3,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 from plyfile import PlyData
 
-# === 配置 ===
-COLOR_BASE = "#D6404E"
-COLOR_OURS = "#4A7EBB"
+# === 配置 (ECCV/CVPR Style) ===
+COLOR_3DGS = "#1F77B4"       # 蓝色 - 3DGS Main
+COLOR_OURS = "#D62728"       # 红色 - Ours Main
+COLOR_3DGS_TAIL = "#1F77B4"  # 蓝色 - 3DGS Tail
+COLOR_OURS_TAIL = "#2CA02C"  # 绿色 - Ours Tail
 
 plt.rcParams.update({
     "font.family": "sans-serif",
     "font.sans-serif": ["Arial"],
-    "font.size": 12,
+    "font.size": 13,           # 单栏论文适配
     "axes.linewidth": 1.2,
     "axes.edgecolor": "#333333",
     "pdf.fonttype": 42,
@@ -18,7 +20,7 @@ plt.rcParams.update({
 })
 
 PATH_BASELINE = "/home/ubuntu/lyj/Project/gaussian-splatting/output/bicycle/point_cloud/iteration_30000/point_cloud.ply"
-PATH_OURS = "/home/ubuntu/lyj/Project/GlowGS/output/bicycle/point_cloud/iteration_30000/point_cloud.ply"
+PATH_OURS = "/home/ubuntu/lyj/Project/GlowGS/output/legacy_output/bicycle/point_cloud/iteration_30000/point_cloud.ply"
 OUTPUT_DIR = "./paper_experiments/03_scale_histogram"
 
 def load_data(path):
@@ -134,15 +136,15 @@ def main():
         # 只画前 10cm
         mask_b = res_b_plot[0] < 0.1
         mask_o = res_o_plot[0] < 0.1
-        ax1.plot(res_b_plot[0][mask_b], res_b_plot[1][mask_b], color=COLOR_BASE, lw=2.5, label='3DGS')
-        ax1.plot(res_o_plot[0][mask_o], res_o_plot[1][mask_o], color=COLOR_OURS, lw=2.5, label='GlowGS')
+        ax1.plot(res_b_plot[0][mask_b], res_b_plot[1][mask_b], color=COLOR_3DGS, lw=2.5, label='3DGS')
+        ax1.plot(res_o_plot[0][mask_o], res_o_plot[1][mask_o], color=COLOR_OURS, lw=2.5, label='Ours')
     
-    ax1.set_xlabel("Depth along ray (m)", fontweight='bold')
-    ax1.set_ylabel("Accumulated Opacity", fontweight='bold')
+    ax1.set_xlabel("Depth along ray (m)", fontweight='bold', fontsize=12)
+    ax1.set_ylabel("Accumulated Opacity", fontweight='bold', fontsize=12)
     ax1.set_ylim(0, 1.05)
     ax1.spines['top'].set_visible(False)
     ax1.spines['right'].set_visible(False)
-    ax1.legend(frameon=False)
+    ax1.legend(frameon=False, fontsize=11)
     ax1.grid(True, linestyle='--', alpha=0.3)
 
     # === 2. 统计箱型图 (现在带进度条，不会卡死) ===
@@ -189,29 +191,48 @@ def main():
     thick_b_tail = [t * 2.5 + rng.uniform(0, 0.1) for t in thick_b] 
     thick_o_tail = [t * 1.2 + rng.uniform(0, 0.01) for t in thick_o]
 
-    # --- 右图：箱型图 ---
+    # --- 右图：小提琴图 (Violin Plot) ---
     data = [thick_b, thick_o, thick_b_tail, thick_o_tail]
-    labels = ["3DGS", "GlowGS", "3DGS\nTail", "GlowGS\nTail"]
+    labels = ["3DGS", "Ours", "3DGS\nTail", "Ours\nTail"]
+    positions = [1, 2, 3.5, 4.5]  # 增加间距，更清晰
+    colors = ["#FF7F0E", "#D62728", "#9467BD", "#1F77B4"]  # 橙、红、紫、蓝
     
-    # Tufte Style Boxplot
-    bp = ax2.boxplot(data, widths=0.5, patch_artist=True, showfliers=False, labels=labels)
+    # 绘制小提琴图
+    parts = ax2.violinplot(data, positions=positions, widths=0.7, 
+                           showmeans=False, showmedians=False, showextrema=False)
     
-    colors = [COLOR_BASE, COLOR_OURS, COLOR_BASE, COLOR_OURS]
+    # 自定义小提琴图样式
+    for i, (pc, color) in enumerate(zip(parts['bodies'], colors)):
+        # 设置填充色（半透明 + 渐变效果）
+        pc.set_facecolor(color)
+        pc.set_alpha(0.6)
+        pc.set_edgecolor(color)
+        pc.set_linewidth(1.5)
     
-    for patch, color in zip(bp['boxes'], colors):
-        patch.set_facecolor('white') # 空心
-        patch.set_edgecolor(color)
-        patch.set_linewidth(2.0)
+    # 添加箱型图元素（四分位数 + 中位数）
+    for i, (dat, pos, color) in enumerate(zip(data, positions, colors)):
+        q1, median, q3 = np.percentile(dat, [25, 50, 75])
+        whisker_min, whisker_max = np.percentile(dat, [5, 95])
         
-    for element in ['whiskers', 'caps', 'medians']:
-        plt.setp(bp[element], color='#333333', linewidth=1.5)
-
-    ax2.set_ylabel(r"Thickness $\Delta z$ (m)", fontweight='bold')
+        # 中位数横线（加粗白色，更醒目）
+        ax2.hlines(median, pos - 0.25, pos + 0.25, color='white', linewidth=2.5, zorder=100)
+        ax2.hlines(median, pos - 0.25, pos + 0.25, color=color, linewidth=1.8, zorder=101)
+        
+        # 四分位数箱（半透明）
+        ax2.vlines(pos, q1, q3, color=color, linewidth=3, alpha=0.8, zorder=99)
+        
+        # Whiskers（5% - 95%）
+        ax2.vlines(pos, whisker_min, q1, color=color, linewidth=1, linestyle='--', alpha=0.5)
+        ax2.vlines(pos, q3, whisker_max, color=color, linewidth=1, linestyle='--', alpha=0.5)
+    
+    # 设置标签和样式
+    ax2.set_xticks(positions)
+    ax2.set_xticklabels(labels, fontsize=11)
+    ax2.set_ylabel(r"Thickness $\Delta z$ (m)", fontweight='bold', fontsize=12)
     ax2.spines['top'].set_visible(False)
     ax2.spines['right'].set_visible(False)
     ax2.yaxis.grid(True, linestyle='--', alpha=0.3)
-    # 限制 Y 轴范围，去掉那些离谱的极值
-    ax2.set_ylim(0, 0.4) 
+    ax2.set_ylim(0, 0.5) 
 
     # 保存
     os.makedirs(OUTPUT_DIR, exist_ok=True)

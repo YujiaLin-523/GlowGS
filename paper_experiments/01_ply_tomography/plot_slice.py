@@ -16,7 +16,7 @@ from plyfile import PlyData
 # Data locations
 # -----------------------------------------------------------------------------
 BASELINE_PLY = "/home/ubuntu/lyj/Project/gaussian-splatting/output/bicycle/point_cloud/iteration_30000/point_cloud.ply"
-OURS_PLY = "/home/ubuntu/lyj/Project/GlowGS/output/bicycle/point_cloud/iteration_30000/point_cloud.ply"
+OURS_PLY = "/home/ubuntu/lyj/Project/GlowGS/output/legacy_output/bicycle/point_cloud/iteration_30000/point_cloud.ply"
 OUTPUT_DIR = "./paper_experiments/01_ply_tomography/"
 
 # ----------------------------------------------------------------------------- 
@@ -144,7 +144,7 @@ def main() -> None:
     fig, axes = plt.subplots(1, 2, figsize=(8, 3.2), sharey=True)
     plt.subplots_adjust(wspace=0.02, left=0.08, right=0.98, top=0.95, bottom=0.15)
 
-    datasets = [("3DGS", H_base), ("GlowGS (Ours)", H_ours)]
+    datasets = [("3DGS", H_base), ("Ours", H_ours)]
 
     for i, (ax, (name, hist)) in enumerate(zip(axes, datasets)):
         im = ax.imshow(
@@ -158,7 +158,7 @@ def main() -> None:
         # --- 修复标签遮挡问题 ---
         # 加上 bbox (半透明白底)，防止文字看不清
         txt = ax.text(0.04, 0.90, name, transform=ax.transAxes, 
-                fontsize=14, fontweight='bold', color='black', ha='left', va='top')
+                fontsize=12, fontweight='bold', color='black', ha='left', va='top')
         txt.set_bbox(dict(facecolor='white', alpha=0.8, edgecolor='none', pad=2))
 
         ax.set_xlabel("Depth (Z, m)", fontsize=11, fontweight='bold')
@@ -170,10 +170,11 @@ def main() -> None:
             ax.spines['left'].set_visible(False) 
             
             # --- 悬浮 Colorbar ---
-            axins = inset_axes(ax, width="4%", height="35%", loc='lower right', borderpad=1)
+            axins = inset_axes(ax, width="4%", height="35%", loc='upper right', 
+                             bbox_to_anchor=(0, 0.1, 1, 1), bbox_transform=ax.transAxes, borderpad=3)
             cbar = fig.colorbar(im, cax=axins, orientation="vertical")
             cbar.set_ticks([vmin, vmax])
-            cbar.set_ticklabels(["Low", "High"]) 
+            cbar.set_ticklabels(["Sparse", "Dense"]) 
             cbar.ax.tick_params(labelsize=9, color='white', labelcolor='black', length=0)
             cbar.outline.set_edgecolor('white')
             cbar.outline.set_linewidth(1)

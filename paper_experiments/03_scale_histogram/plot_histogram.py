@@ -5,13 +5,13 @@ from plyfile import PlyData
 import matplotlib.font_manager as fm
 
 # === 1. 强制顶刊样式 ===
-COLOR_BASE = "#D62728"  # 稍微加深一点的红色 (Nature Red)
-COLOR_OURS = "#1F77B4"  # 稍微加深一点的蓝色 (Nature Blue)
+COLOR_BASE = "#1F77B4"  # 蓝色 (3DGS)
+COLOR_OURS = "#D62728"  # 红色 (Ours)
 
 plt.rcParams.update({
     "font.family": "sans-serif",
     "font.sans-serif": ["Arial"], # 强制 Arial
-    "font.size": 16,              # 字号加大，防止留白过多显得字小
+    "font.size": 13,              # 与geo_analysis保持一致
     "axes.linewidth": 1.2,
     "axes.edgecolor": "#333333",
     "xtick.major.pad": 6,         # 增加刻度文字距离
@@ -21,7 +21,7 @@ plt.rcParams.update({
 })
 
 PATH_BASELINE = "/home/ubuntu/lyj/Project/gaussian-splatting/output/bicycle/point_cloud/iteration_30000/point_cloud.ply"
-PATH_OURS = "/home/ubuntu/lyj/Project/GlowGS/output/bicycle/point_cloud/iteration_30000/point_cloud.ply"
+PATH_OURS = "/home/ubuntu/lyj/Project/GlowGS/output/legacy_output/bicycle/point_cloud/iteration_30000/point_cloud.ply"
 OUTPUT_DIR = "./paper_experiments/03_scale_histogram"
 
 def load_data(path):
@@ -45,7 +45,7 @@ def plot_fig5_layout_fix(op_base, op_ours):
     bins = np.linspace(0, 1.0, 50)
     # 线条加粗，颜色加深
     ax1.hist(op_base, bins=bins, color=COLOR_BASE, histtype="step", lw=2.5, zorder=2, label="3DGS")
-    ax1.hist(op_ours, bins=bins, color=COLOR_OURS, histtype="step", lw=3.0, zorder=3, label="GlowGS")
+    ax1.hist(op_ours, bins=bins, color=COLOR_OURS, histtype="step", lw=3.0, zorder=3, label="Ours")
     # 填充极淡的颜色增加层次
     ax1.hist(op_base, bins=bins, color=COLOR_BASE, alpha=0.1, histtype="stepfilled", zorder=1)
     ax1.hist(op_ours, bins=bins, color=COLOR_OURS, alpha=0.1, histtype="stepfilled", zorder=1)
@@ -62,7 +62,7 @@ def plot_fig5_layout_fix(op_base, op_ours):
     ax1.grid(True, axis='y', linestyle='--', alpha=0.3, zorder=0)
     
     # 图例放在图内上方，无边框
-    ax1.legend(frameon=False, loc='upper center', bbox_to_anchor=(0.5, 1.0), ncol=2, fontsize=14)
+    ax1.legend(frameon=False, loc='upper center', bbox_to_anchor=(0.5, 1.0), ncol=2, fontsize=11)
 
     # --- 右图：Tail Mass ---
     thresholds = [0.1, 0.05]
@@ -73,14 +73,14 @@ def plot_fig5_layout_fix(op_base, op_ours):
     width = 0.35
     
     bars_b = ax2.bar(x - width/2, vals_b, width, color=COLOR_BASE, alpha=0.9, label='3DGS')
-    bars_o = ax2.bar(x + width/2, vals_o, width, color=COLOR_OURS, alpha=0.9, label='GlowGS')
+    bars_o = ax2.bar(x + width/2, vals_o, width, color=COLOR_OURS, alpha=0.9, label='Ours')
 
     # 标数值
     for rect in bars_b + bars_o:
         height = rect.get_height()
         if height > 0.001:
             ax2.text(rect.get_x() + rect.get_width()/2., height + 0.01,
-                     f'{height*100:.1f}%', ha='center', va='bottom', fontsize=14, color='black')
+                     f'{height*100:.1f}%', ha='center', va='bottom', fontsize=11, color='black')
 
     ax2.set_xticks(x)
     # 使用 LaTeX 格式让 α 看起来更专业

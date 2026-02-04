@@ -15,7 +15,7 @@ CONFIG = {
 
 # 顶刊配色 (保持不变)
 COLORS = {
-    "GlowGS":   "#D62728",
+    "Ours":     "#D62728",
     "3DGS":     "#FF7F0E",
     "Scaffold": "#1F77B4",
     "Mip":      "#9467BD",
@@ -51,7 +51,7 @@ DATA = [
     [235, 26.91, 53.9,  COLORS["Light"],    "LightGaussian"],
     
     # Ours
-    [196, 28.92, 10.5,  COLORS["GlowGS"],   "GlowGS"],
+    [196, 28.92, 10.5,  COLORS["Ours"],   "Ours"],
 ]
 
 # =====================
@@ -65,7 +65,7 @@ LABEL_POS = {
     "Compact3DGS":    (-30, -0.1, 'left', 'top'),
     "HAC":            (8, -0.1, 'right', 'top'),
     "LightGaussian":  (0, 0.15, 'center', 'bottom'),
-    "GlowGS":  (0, -0.1, 'center', 'top'),
+    "Ours":  (0, -0.1, 'center', 'top'),
 }
 
 def size_to_area(size_mb):
@@ -78,7 +78,7 @@ def main():
     DATA.sort(key=lambda x: x[2], reverse=True)
 
     for fps, psnr, size, color, name in DATA:
-        is_ours = "GlowGS" in name
+        is_ours = "Ours" in name
         
         # 样式逻辑
         marker = 'o'
