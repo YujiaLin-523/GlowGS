@@ -13,6 +13,7 @@ import os
 import torch
 import torchvision
 import yaml
+import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim, ssim_raw, compute_edge_loss
 from gaussian_renderer import render, network_gui
@@ -68,6 +69,43 @@ def get_directory_size_bytes(root: str, verbose: bool = False):
             except OSError:
                 continue
     return total
+
+
+def _validate_encoder_artifacts(model_path: str, encoder_variant: str, iteration: int | None = None):
+    compression_dir = os.path.join(model_path, "compression")
+    vm_planes = os.path.join(compression_dir, "vm_planes_fp16.npz")
+    if not os.path.isdir(compression_dir):
+        return
+
+    # Prefer explicit iteration config if available
+    config_paths = []
+    if iteration is not None and iteration >= 0:
+        config_paths.append(os.path.join(compression_dir, f"iteration_{iteration}", "config.npz"))
+    else:
+        # Fall back to latest iteration_* folder if present
+        iter_dirs = [d for d in os.listdir(compression_dir) if d.startswith("iteration_")]
+        if iter_dirs:
+            try:
+                latest_iter = max(int(d.split("iteration_")[1]) for d in iter_dirs if d.split("iteration_")[-1].isdigit())
+                config_paths.append(os.path.join(compression_dir, f"iteration_{latest_iter}", "config.npz"))
+            except ValueError:
+                pass
+
+    for cfg_path in config_paths:
+        if os.path.isfile(cfg_path):
+            cfg = np.load(cfg_path)
+            saved_variant = cfg['encoder_variant'] if 'encoder_variant' in cfg else 'hybrid'
+            if saved_variant != encoder_variant:
+                raise RuntimeError(
+                    f"encoder_variant mismatch: artifacts={saved_variant}, requested={encoder_variant}, cfg_path={cfg_path}"
+                )
+            break
+
+    has_vm = os.path.isfile(vm_planes)
+    if encoder_variant == "hash_only" and has_vm:
+        raise RuntimeError(f"encoder_variant=hash_only but VM planes found at {vm_planes}; use hybrid or clean artifacts")
+    if encoder_variant == "hybrid" and not has_vm:
+        raise RuntimeError(f"encoder_variant=hybrid but VM planes missing at {vm_planes}; ensure run matches variant")
 
 # Enable TF32 tensor cores for faster matmul on Ampere+ GPUs
 try:
@@ -162,6 +200,7 @@ def save_ablation_config(output_dir, dataset, opt, pipe):
             'width': dataset.width,
             'depth': dataset.depth,
             'feature_role_split': dataset.feature_role_split,
+            'encoder_variant': getattr(dataset, 'encoder_variant', 'hybrid'),
             'geo_resolution': dataset.geo_resolution,
             'geo_rank': dataset.geo_rank,
             'geo_channels': dataset.geo_channels,
@@ -196,14 +235,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     densification_mode = getattr(dataset, 'densification_mode', 'mass_aware')  # 'standard' or 'mass_aware'
     use_edge_loss = getattr(dataset, 'use_edge_loss', True)
     
-    # Always use hybrid encoder (GlowGS core architecture)
-    encoder_variant = 'hybrid'
+    encoder_variant = getattr(dataset, 'encoder_variant', 'hybrid')
     
     # Map edge loss setting
     edge_loss_mode = 'cosine_edge' if use_edge_loss else 'none'
     
     # Map densification mode to internal strategy name
     densify_strategy = 'feature_weighted' if densification_mode == 'mass_aware' else 'original_3dgs'
+
+    _validate_encoder_artifacts(dataset.model_path, encoder_variant)
     
     # Store feature_mod_type in dataset for encoder to use
     dataset.feature_mod_type = feature_mod_type
@@ -828,6 +868,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in saving_iterations):
                 print(f"\n[ITER {iteration}] Saving Gaussians")
                 scene.save(iteration)
+                # TODO(stage1-smoke): ensure compression artifacts exist at tested iteration so validation is actually exercised
 
             # Optimizer step with AMP gradient scaling
             if iteration < opt.iterations:
@@ -1057,6 +1098,10 @@ if __name__ == "__main__":
     print("Optimizing " + args.model_path)
     sys.stderr.write(f"Loading scene for training: {args.model_path}...\n")
 
+    # TODO(stage1-task4): keep train/render/convert/fps consistent on encoder_variant for fair ablation
+    args.encoder_variant_source = "cli" if "--encoder_variant" in sys.argv else "default"
+    print(f"[INFO] encoder_variant={args.encoder_variant} (source={args.encoder_variant_source}) | model_dir={args.model_path} | iterations={args.iterations}")
+
     if args.verbose:
         os.environ["GLOWGS_VERBOSE"] = "1"
 
@@ -1066,7 +1111,9 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, measure_fps=not args.disable_fps)
+    dataset = lp.extract(args)
+    dataset.encoder_variant_source = args.encoder_variant_source
+    training(dataset, op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, measure_fps=not args.disable_fps)
 
     # All done
     print("\nTraining complete.")

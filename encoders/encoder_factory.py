@@ -10,6 +10,7 @@ import torch.nn as nn
 import tinycudann as tcnn
 from .geo_encoder import GeoEncoder
 from .geometry_appearance_encoder import GeometryAppearanceEncoder
+from .hash_only_encoder import HashOnlyEncoder
 
 
 def create_gaussian_encoder(
@@ -57,6 +58,27 @@ def create_gaussian_encoder(
             feature_role_split=True,  # Enable disentanglement
             use_film=use_film,        # FiLM vs concat mode
         )
+        # TODO(stage1-task3): assert hash_only out_dim == hybrid out_dim under current fusion/role-split settings
+        if encoder.n_output_dims != hash_encoder.n_output_dims:
+            raise ValueError(
+                f"Hybrid encoder dim mismatch: out_dim={encoder.n_output_dims} vs hash_dim={hash_encoder.n_output_dims}"
+            )
+        print(f"[Encoder] variant=hybrid mode={'film' if use_film else 'concat'} hash_dim={hash_encoder.n_output_dims} geo_dim={getattr(encoder, 'geo_dim', None)} out_dim={encoder.n_output_dims}")
+        return encoder
+
+    elif variant == "hash_only":
+        # Hash-only ablation: reuse hash grid without VM planes or gates
+        # TODO(stage1-task3): encoder_factory must be single source of truth for encoder_variant
+        hash_encoder = tcnn.Encoding(n_input_dims=3, encoding_config=encoding_config)
+        encoder = HashOnlyEncoder(
+            hash_encoder=hash_encoder,
+            feature_role_split=True,
+        )
+        if encoder.n_output_dims != hash_encoder.n_output_dims:
+            raise ValueError(
+                f"Hash-only encoder dim mismatch: out_dim={encoder.n_output_dims} vs hash_dim={hash_encoder.n_output_dims}"
+            )
+        print(f"[Encoder] variant=hash_only hash_dim={hash_encoder.n_output_dims} out_dim={encoder.n_output_dims}")
         return encoder
     
     elif variant == "3dgs":
@@ -90,7 +112,7 @@ def create_gaussian_encoder(
     else:
         raise ValueError(
             f"Unknown encoder_variant: {variant}. "
-            f"Expected 'hybrid' or '3dgs'"
+            f"Expected 'hybrid', 'hash_only' or '3dgs'"
         )
 
 
@@ -113,6 +135,8 @@ def get_encoder_output_dims(encoder, variant: str):
         else:
             # Fallback if role split disabled
             return base_dim, base_dim, base_dim
+    elif variant == "hash_only":
+        return base_dim, base_dim, base_dim
     elif variant == "3dgs":
         # 3DGS mode: encoder is dummy, dimensions don't matter
         # (explicit SH parameters are used instead)
