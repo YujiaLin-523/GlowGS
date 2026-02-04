@@ -59,6 +59,13 @@ def ssim(img1, img2, window_size=11, size_average=True):
 _sobel_kernel_x = None
 _sobel_kernel_y = None
 
+# -----------------------------------------------------------------------------
+# GT Gradient Cache (avoid redundant Sobel on static GT images)
+# Key: (image_id, H, W) tuple to uniquely identify each GT image
+# Value: precomputed Sobel gradients [2, H, W] tensor on GPU
+# -----------------------------------------------------------------------------
+_gt_gradient_cache = {}
+
 def _get_sobel_kernels(device, dtype):
     """
     Return cached 3x3 Sobel kernels (X and Y).
@@ -109,6 +116,54 @@ def _compute_sobel_gradients(gray_img, kx, ky):
     return torch.cat((gx, gy), dim=1)
 
 
+def _get_or_compute_gt_gradients(gt_rgb, image_id=None):
+    """
+    Get cached GT gradients or compute and cache them.
+    
+    Args:
+        gt_rgb: Ground truth image [C, H, W] or [B, C, H, W]
+        image_id: Optional unique identifier (e.g., camera uid)
+    
+    Returns:
+        gt_grad: [B, 2, H, W] Sobel gradients (gx, gy)
+    """
+    global _gt_gradient_cache
+    
+    # Ensure 4D: [B, C, H, W]
+    if gt_rgb.dim() == 3:
+        gt_rgb = gt_rgb.unsqueeze(0)
+    
+    B, C, H, W = gt_rgb.shape
+    
+    # Create cache key: use image_id if provided, else tensor data pointer
+    if image_id is not None:
+        cache_key = (image_id, H, W)
+    else:
+        # Fallback: use tensor data pointer (works if same tensor reused)
+        cache_key = (gt_rgb.data_ptr(), H, W)
+    
+    # Check cache
+    if cache_key in _gt_gradient_cache:
+        cached_grad = _gt_gradient_cache[cache_key]
+        # Verify device match (in case of device migration)
+        if cached_grad.device == gt_rgb.device:
+            return cached_grad
+        else:
+            # Re-cache on new device
+            _gt_gradient_cache[cache_key] = cached_grad.to(gt_rgb.device)
+            return _gt_gradient_cache[cache_key]
+    
+    # Cache miss: compute gradients
+    kx, ky = _get_sobel_kernels(gt_rgb.device, gt_rgb.dtype)
+    gt_gray = _rgb_to_grayscale(gt_rgb)
+    gt_grad = _compute_sobel_gradients(gt_gray, kx, ky)
+    
+    # Store in cache (detach to avoid retaining graph)
+    _gt_gradient_cache[cache_key] = gt_grad.detach()
+    
+    return gt_grad
+
+
 def compute_pixel_importance(gt_rgb, pred_rgb, power_edge=1.2, power_error=1.0):
     """
     Compute per-pixel importance for feature-weighted densification (GlowGS innovation #3).
@@ -140,9 +195,10 @@ def compute_pixel_importance(gt_rgb, pred_rgb, power_edge=1.2, power_error=1.0):
         pred_rgb = pred_rgb.unsqueeze(0)
     
     # ---- Edge strength from GT Sobel ----
-    kx, ky = _get_sobel_kernels(gt_rgb.device, gt_rgb.dtype)
-    gt_gray = _rgb_to_grayscale(gt_rgb)
-    G_gt = _compute_sobel_magnitude(gt_gray, kx, ky)  # [B, 1, H, W]
+    # OPTIMIZATION: Reuse cached GT gradients instead of recomputing
+    gt_grad = _get_or_compute_gt_gradients(gt_rgb, image_id=None)  # [B, 2, H, W]
+    # Compute magnitude from cached gradients
+    G_gt = torch.sqrt(gt_grad[:, 0:1, :, :] ** 2 + gt_grad[:, 1:2, :, :] ** 2 + 1e-6)  # [B, 1, H, W]
     
     # Robust percentile-based normalization (more stable than mean+std for skewed distributions)
     g_p10 = torch.quantile(G_gt, 0.10).clamp(min=1e-6)
@@ -178,8 +234,8 @@ def compute_pixel_importance(gt_rgb, pred_rgb, power_edge=1.2, power_error=1.0):
     return pixel_importance.detach()  # Detach to avoid graph retention
 
 
-def compute_edge_loss(pred_rgb, gt_rgb, mode: str = "sobel_weighted", lambda_edge: float = 0.05, 
-                      flat_weight: float = 0.5, return_components: bool = False):
+def compute_edge_loss(pred_rgb, gt_rgb=None, gt_grad_cached=None, gt_image_id=None, mode: str = "sobel_weighted", 
+                      lambda_edge: float = 0.05, flat_weight: float = 0.5, return_components: bool = False):
     """
     Edge loss interface for ablation studies.
     
@@ -189,9 +245,11 @@ def compute_edge_loss(pred_rgb, gt_rgb, mode: str = "sobel_weighted", lambda_edg
     - "cosine_edge": Orientation-only Sobel loss (new default) using cosine similarity
     
     Args:
-        pred_rgb: Predicted image
-        gt_rgb: Ground truth image
-        mode: Edge loss variant ("none" or "sobel_weighted")
+        pred_rgb: Predicted image [3, H, W] or [B, 3, H, W]
+        gt_rgb: Ground truth image (optional if gt_grad_cached provided)
+        gt_grad_cached: Precomputed GT Sobel gradients [2, H, W] - PERFORMANCE BOOST
+        gt_image_id: Unique identifier for automatic GT gradient caching (e.g., camera uid)
+        mode: Edge loss variant ("none", "sobel_weighted", or "cosine_edge")
         lambda_edge: Loss weight (applied internally)
         flat_weight: Weight for flat region term (used in sobel_weighted)
         return_components: Whether to return (loss, edge_term, flat_term)
@@ -207,15 +265,20 @@ def compute_edge_loss(pred_rgb, gt_rgb, mode: str = "sobel_weighted", lambda_edg
         return zero_loss
     
     elif mode == "cosine_edge":
-        loss, edge_term, flat_term = hybrid_edge_loss(pred_rgb, gt_rgb, flat_weight=flat_weight, return_components=True)
+        loss, edge_term, flat_term = hybrid_edge_loss(
+            pred_rgb, gt_rgb=gt_rgb, gt_grad_cached=gt_grad_cached, gt_image_id=gt_image_id,
+            flat_weight=flat_weight, return_components=True
+        )
         if return_components:
             return lambda_edge * loss, edge_term, flat_term
         return lambda_edge * loss
 
     elif mode == "sobel_weighted" or mode == "laplacian_weighted":
         # GlowGS unified edge-aware loss (Now using Sobel internally)
-        loss = gradient_loss(pred_rgb, gt_rgb, valid_mask=None, flat_weight=flat_weight, 
-                            return_components=return_components)
+        loss = gradient_loss(
+            pred_rgb, gt_rgb=gt_rgb, gt_grad_cached=gt_grad_cached, gt_image_id=gt_image_id,
+            valid_mask=None, flat_weight=flat_weight, return_components=return_components
+        )
         if return_components:
             base_loss, edge_term, flat_term = loss
             return lambda_edge * base_loss, edge_term, flat_term
@@ -228,24 +291,45 @@ def compute_edge_loss(pred_rgb, gt_rgb, mode: str = "sobel_weighted", lambda_edg
         )
 
 
-def hybrid_edge_loss(pred_rgb, gt_rgb, flat_weight: float = 0.5, eps: float = 1e-6, return_components: bool = False):
+def hybrid_edge_loss(pred_rgb, gt_rgb=None, gt_grad_cached=None, gt_image_id=None, flat_weight: float = 0.5, eps: float = 1e-6, return_components: bool = False):
     """
     Hybrid edge loss: cosine alignment on edge mask M, L1 magnitude suppression on flat regions.
 
     L_edge = M * (1 - cos) + lambda_flat * (1 - M) * ||∇I_pred||_1
+    
+    Args:
+        pred_rgb: Predicted RGB image [3, H, W] or [B, 3, H, W]
+        gt_rgb: Ground truth RGB (optional if gt_grad_cached provided)
+        gt_grad_cached: Precomputed GT gradients [2, H, W] (gx, gy) - PERFORMANCE OPTIMIZATION
+        gt_image_id: Unique identifier for automatic caching (e.g., camera uid)
+        flat_weight: Weight for flat region regularization
+        eps: Numerical stability epsilon
+        return_components: Return (loss, edge_term, flat_term) if True
     """
     # Ensure 4D tensors
     if pred_rgb.dim() == 3:
         pred_rgb = pred_rgb.unsqueeze(0)
-    if gt_rgb.dim() == 3:
-        gt_rgb = gt_rgb.unsqueeze(0)
 
     kx, ky = _get_sobel_kernels(pred_rgb.device, pred_rgb.dtype)
     pred_gray = _rgb_to_grayscale(pred_rgb)
-    gt_gray = _rgb_to_grayscale(gt_rgb)
-
     pred_grad = _compute_sobel_gradients(pred_gray, kx, ky)  # [B, 2, H, W]
-    gt_grad = _compute_sobel_gradients(gt_gray, kx, ky)      # [B, 2, H, W]
+    
+    # Use cached GT gradients if available (50% speedup)
+    if gt_grad_cached is not None:
+        # Explicitly provided cached gradients (highest priority)
+        # gt_grad_cached is [2, H, W], expand to [1, 2, H, W]
+        gt_grad = gt_grad_cached.unsqueeze(0)
+    elif gt_image_id is not None and gt_rgb is not None:
+        # Automatic caching using image_id (e.g., camera uid)
+        gt_grad = _get_or_compute_gt_gradients(gt_rgb, image_id=gt_image_id)
+    else:
+        # Fallback: compute on-the-fly (backward compatibility)
+        if gt_rgb is None:
+            raise ValueError("Either gt_rgb or gt_grad_cached must be provided")
+        if gt_rgb.dim() == 3:
+            gt_rgb = gt_rgb.unsqueeze(0)
+        gt_gray = _rgb_to_grayscale(gt_rgb)
+        gt_grad = _compute_sobel_gradients(gt_gray, kx, ky)  # [B, 2, H, W]
 
     pred_norm = torch.linalg.norm(pred_grad, dim=1, keepdim=True).clamp_min(eps)
     gt_norm = torch.linalg.norm(gt_grad, dim=1, keepdim=True).clamp_min(eps)
@@ -276,7 +360,7 @@ def hybrid_edge_loss(pred_rgb, gt_rgb, flat_weight: float = 0.5, eps: float = 1e
     return loss
 
 
-def gradient_loss(pred_rgb, gt_rgb, valid_mask=None, flat_weight=0.5, return_components=False):
+def gradient_loss(pred_rgb, gt_rgb=None, gt_grad_cached=None, gt_image_id=None, valid_mask=None, flat_weight=0.5, return_components=False):
     """
     Unified edge-aware gradient loss (GlowGS innovation #2).
     
@@ -293,7 +377,9 @@ def gradient_loss(pred_rgb, gt_rgb, valid_mask=None, flat_weight=0.5, return_com
     
     Args:
         pred_rgb: Predicted image [C, H, W] or [B, C, H, W]
-        gt_rgb: Ground truth image [C, H, W] or [B, C, H, W]
+        gt_rgb: Ground truth image [C, H, W] or [B, C, H, W] (optional if gt_grad_cached provided)
+        gt_grad_cached: Precomputed GT Sobel gradients [2, H, W] for performance
+        gt_image_id: Unique identifier for automatic caching (e.g., camera uid)
         valid_mask: Optional binary mask [H, W] or [B, 1, H, W] for valid regions
         flat_weight: Weight for flat region regularization term (alpha in paper)
         return_components: If True, also return (edge_term, flat_term) for logging
@@ -305,19 +391,35 @@ def gradient_loss(pred_rgb, gt_rgb, valid_mask=None, flat_weight=0.5, return_com
     # Ensure 4D input: [B, C, H, W]
     if pred_rgb.dim() == 3:
         pred_rgb = pred_rgb.unsqueeze(0)
-    if gt_rgb.dim() == 3:
-        gt_rgb = gt_rgb.unsqueeze(0)
     
     # Get cached Sobel kernels
     kx, ky = _get_sobel_kernels(pred_rgb.device, pred_rgb.dtype)
     
     # Convert to grayscale for gradient computation
     pred_gray = _rgb_to_grayscale(pred_rgb)
-    gt_gray = _rgb_to_grayscale(gt_rgb)
     
-    # Compute Sobel magnitudes
+    # Compute prediction Sobel magnitude
     G_pred = _compute_sobel_magnitude(pred_gray, kx, ky)
-    G_gt = _compute_sobel_magnitude(gt_gray, kx, ky)
+    
+    # OPTIMIZATION: Use cached GT gradients if available
+    if gt_grad_cached is not None:
+        # Compute magnitude from cached gradients [2, H, W] -> [1, 1, H, W]
+        gt_grad_expanded = gt_grad_cached.unsqueeze(0)  # [1, 2, H, W]
+        G_gt = torch.sqrt(gt_grad_expanded[:, 0:1, :, :] ** 2 + gt_grad_expanded[:, 1:2, :, :] ** 2 + 1e-6)
+    elif gt_image_id is not None and gt_rgb is not None:
+        # Automatic caching using image_id
+        if gt_rgb.dim() == 3:
+            gt_rgb = gt_rgb.unsqueeze(0)
+        gt_grad = _get_or_compute_gt_gradients(gt_rgb, image_id=gt_image_id)
+        G_gt = torch.sqrt(gt_grad[:, 0:1, :, :] ** 2 + gt_grad[:, 1:2, :, :] ** 2 + 1e-6)
+    else:
+        # Fallback: compute on-the-fly
+        if gt_rgb is None:
+            raise ValueError("Either gt_rgb or gt_grad_cached must be provided")
+        if gt_rgb.dim() == 3:
+            gt_rgb = gt_rgb.unsqueeze(0)
+        gt_gray = _rgb_to_grayscale(gt_rgb)
+        G_gt = _compute_sobel_magnitude(gt_gray, kx, ky)
     
     # Normalize gradients to [0, 1] range for stable loss magnitude
     # Sobel max response on [0,1] image is ~4.0; use 4.0 as normalizer

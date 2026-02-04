@@ -644,8 +644,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             
             # Always compute edge loss, but scale by ramp weight
             if edge_ramp_w > 0.0:
+                # OPTIMIZATION: Pass camera uid for GT gradient caching (50% Sobel overhead reduction)
+                # Cache key uses (uid, H, W) so each unique GT image is computed only once
+                gt_image_id = viewpoint_cam.uid if hasattr(viewpoint_cam, 'uid') else None
                 Lgrad, Lgrad_edge, Lgrad_flat = compute_edge_loss(
                     image, gt_image, 
+                    gt_image_id=gt_image_id,
                     mode=edge_loss_mode,
                     lambda_edge=lambda_grad * edge_ramp_w,  # Smooth ramp: 0 -> lambda_grad
                     flat_weight=flat_weight,
