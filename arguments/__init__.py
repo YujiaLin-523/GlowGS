@@ -85,8 +85,8 @@ class ModelParams(ParamGroup):
         self.width = 64              # MLP hidden width
         self.depth = 2               # MLP depth
         # GeoEncoder (tri-plane) parameters - tuned for size/quality balance
-        # TUNED: Increased resolution (48→96) and rank (6→12) for better spatial guidance
-        self.geo_resolution = 96     # Tri-plane resolution (96x96, ~2MB VRAM)
+        # OPTIMIZED: Increased resolution to 128x128 for finer geometric details (Mip-NeRF360/DB/TnT)
+        self.geo_resolution = 128    # Tri-plane resolution (128x128, ~2.6MB VRAM, 1.78x spatial precision)
         self.geo_rank = 12           # Low-rank factorization rank (improved capacity)
         self.geo_channels = 8        # Output feature channels
         self.feature_role_split = True  # Enable geometry/appearance feature disentanglement
@@ -194,11 +194,12 @@ class OptimizationParams(ParamGroup):
         self.random_background = False
 
         # Edge-aware loss configuration (GlowGS innovation #2)
+        # SAFE VERSION: Enabled with flat_term removed (only edge alignment, no suppression)
         self.enable_edge_loss = True        # master switch for unified edge-aware gradient loss
         self.edge_loss_start_iter = 5000    # edge loss ramp start (begin transition)
         self.edge_loss_end_iter = 7000      # edge loss ramp end (full strength)
-        self.lambda_grad = 0.02             # edge loss weight (reduced from 0.1 for texture preservation)
-        self.edge_flat_weight = 0.3         # flat region penalty weight (reduced from 0.5 to avoid mid-freq suppression)
+        self.lambda_grad = 0.03             # edge loss weight (increased from 0.02 for safe version)
+        self.edge_flat_weight = 0.0         # flat region penalty weight (DISABLED: removed flat_term suppression)
         
         # Warmup/Ramp configuration for step-free training (avoid 5k iteration discontinuity)
         self.mass_aware_start_iter = 3000   # mass-aware gradient weighting ramp start

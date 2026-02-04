@@ -278,26 +278,27 @@ def gradient_loss(pred_rgb, gt_rgb, valid_mask=None, flat_weight=0.5, return_com
     # Edge alignment term: match pred gradient to GT gradient at edge locations
     edge_term = torch.abs(G_pred_norm - G_gt_norm) * edge_confidence
     
-    # Flat regularization term: suppress pred gradient where GT is flat
-    flat_confidence = 1.0 - edge_confidence
-    flat_term = G_pred_norm * flat_confidence
+    # SAFE VERSION: Removed flat regularization term (flat_term)
+    # Original implementation suppressed gradients in non-edge regions, causing texture over-smoothing
+    # Now we only enforce edge alignment without suppressing mid-frequency details
     
     # Apply valid mask if provided
     if valid_mask is not None:
         if valid_mask.dim() == 2:
             valid_mask = valid_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
         edge_term = edge_term * valid_mask
-        flat_term = flat_term * valid_mask
         # Compute mean only over valid pixels
         num_valid = valid_mask.sum().clamp(min=1.0)
         edge_term_mean = edge_term.sum() / num_valid
-        flat_term_mean = flat_term.sum() / num_valid
+        # Dummy values for backward compatibility with return_components
+        flat_term_mean = torch.tensor(0.0, device=edge_term.device)
     else:
         edge_term_mean = edge_term.mean()
-        flat_term_mean = flat_term.mean()
+        # Dummy values for backward compatibility with return_components
+        flat_term_mean = torch.tensor(0.0, device=edge_term.device)
     
-    # Combined loss: edge alignment + weighted flat regularization
-    loss = edge_term_mean + flat_weight * flat_term_mean
+    # Safe loss: only edge alignment, no suppression
+    loss = edge_term_mean
     
     if return_components:
         return loss, edge_term_mean.detach(), flat_term_mean.detach()

@@ -621,9 +621,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration > opt.densify_until_iter:
                 for degree in range(1, gaussians.active_sh_degree + 1):
                     lambda_degree = (2 * degree + 1) / ((gaussians.max_sh_degree + 1) ** 2 - 1)
-                    # 改进：对高阶SH项使用更小的权重，避免过度抑制view-dependent效果
-                    weight = 1.0 if degree <= 2 else 0.3  # 3阶及以上权重降低
-                    sh_mask_loss += weight * lambda_degree * torch.mean(gaussians.get_sh_mask[..., degree - 1])
+                    # Standard LocoGS formulation: no additional weighting
+                    sh_mask_loss += lambda_degree * torch.mean(gaussians.get_sh_mask[..., degree - 1])
 
             loss = pixel_loss + opt.lambda_mask * mask_loss + opt.lambda_sh_mask * sh_mask_loss
             # Add edge loss (already weighted by lambda_grad in compute_edge_loss)
