@@ -23,7 +23,8 @@ class ParamGroup:
         # String choice parameters for ECCV ablation study (A→B→C→D)
         choice_params = {
             'feature_mod_type': ['concat', 'film'],
-            'densification_mode': ['standard', 'mass_aware']
+            'densification_mode': ['standard', 'mass_aware'],
+            'encoder_variant': ['hybrid', 'hash_only', '3dgs'],
         }
         # Boolean parameters that need explicit True/False parsing (not just presence)
         explicit_bool_params = {'use_edge_loss'}
@@ -89,6 +90,8 @@ class ModelParams(ParamGroup):
         self.geo_rank = 32           # Increased rank to match spatial bandwidth
         self.geo_channels = 8        # Output feature channels
         self.feature_role_split = True  # Enable geometry/appearance feature disentanglement
+        self.encoder_variant = "hybrid"  # Encoder architecture variant
+        # TODO(stage1-task2): encoder_variant must round-trip via cfg_args for render/convert/fps consistency
         
         # Ablation Controls (A→B→C→D additive study)
         # A: Concat (baseline) → B: +FiLM → C: +MassAware → D: +EdgeLoss (full GlowGS)
@@ -197,8 +200,8 @@ class OptimizationParams(ParamGroup):
         self.enable_edge_loss = True        # master switch for unified edge-aware gradient loss
         self.edge_loss_start_iter = 5000    # edge loss ramp start (begin transition)
         self.edge_loss_end_iter = 7000      # edge loss ramp end (full strength)
-        self.lambda_grad = 0.03             # edge loss weight (increased from 0.02 for safe version)
-        self.edge_flat_weight = 0.0         # flat region penalty weight (DISABLED: removed flat_term suppression)
+        self.lambda_grad = 0.05             # edge loss weight (cosine term is small; keep strong enough)
+        self.edge_flat_weight = 0.5         # flat region penalty weight (restores background denoising)
         
         # Warmup/Ramp configuration for step-free training (avoid 5k iteration discontinuity)
         self.mass_aware_start_iter = 3000   # mass-aware gradient weighting ramp start
@@ -258,6 +261,7 @@ def get_combined_args(parser : ArgumentParser):
         # Only override values that were explicitly set on the command line.
         # This keeps cfg_args (saved during training) authoritative for
         # ablation switches and architecture hyperparameters.
+        # TODO(stage1-task2): add explicit test for CLI override precedence over cfg
         if v != getattr(default_args, k):
             merged_dict[k] = v
     
@@ -279,5 +283,23 @@ def get_combined_args(parser : ArgumentParser):
         if key not in merged_dict:
             merged_dict[key] = default_val
             print(f"[INFO] Using default {key}={default_val}")
-    
+
+    # Encoder variant backward compatibility + provenance for logging
+    default_variant = getattr(default_args, "encoder_variant", "hybrid")
+    encoder_variant_source = "default"
+    cfg_has_encoder_variant = hasattr(args_cfgfile, "encoder_variant")
+    cli_has_encoder_variant = args_cmdline.encoder_variant != getattr(default_args, "encoder_variant", None)
+
+    if cfg_has_encoder_variant:
+        encoder_variant_source = "cfg"
+    if cli_has_encoder_variant:
+        encoder_variant_source = "cli"
+
+    if "encoder_variant" not in merged_dict or merged_dict.get("encoder_variant") is None:
+        if not cfg_has_encoder_variant and not cli_has_encoder_variant:
+            print("[WARN] encoder_variant missing in cfg_args; defaulting to 'hybrid' for backward compatibility")
+        merged_dict["encoder_variant"] = default_variant
+
+    merged_dict["encoder_variant_source"] = encoder_variant_source
+
     return Namespace(**merged_dict)

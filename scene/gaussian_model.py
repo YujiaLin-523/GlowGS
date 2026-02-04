@@ -141,6 +141,13 @@ class GaussianModel:
         # Map geometry_latent/appearance_latent (C_shared + C_role) to head input dim (C_shared)
         # Only used when encoder variant supports role split (hybrid with feature_role_split=True)
         base_dim, geometry_dim, appearance_dim = get_encoder_output_dims(self._grid, self._encoder_variant)
+        print(f"[EncoderDims] variant={self._encoder_variant} role_split={self._feature_role_split} base_dim={base_dim} geometry_dim={geometry_dim} appearance_dim={appearance_dim}")
+        # TODO(stage1-task3): if feature_role_split enabled, print (geometry_dim, appearance_dim, fused_dim) and assert downstream expectations
+        if self._feature_role_split:
+            if geometry_dim != base_dim or appearance_dim != base_dim:
+                raise ValueError(
+                    f"Role-split dims mismatch: base_dim={base_dim}, geometry_dim={geometry_dim}, appearance_dim={appearance_dim}"
+                )
         
         if geometry_dim != base_dim:  # Role split is active
             # Projection for geometry heads (scale, rotation, opacity)
@@ -457,6 +464,7 @@ class GaussianModel:
         chunk_size = min(131072, N) if N > 65536 else N  # Process all at once if < 65k, else use 128k chunks
 
         if self._use_role_split:
+            # TODO(stage1-task3): grep all encoder output usages; ensure hash_only uses identical tensors where consumed
             # Collect outputs to avoid in-place writes that may invalidate autograd versions
             opacity_chunks = []
             scaling_chunks = []
@@ -2043,8 +2051,10 @@ class GaussianModel:
             'geo_rank': self._geo_rank,
             'geo_channels': self._geo_channels,
             'max_sh_degree': self.max_sh_degree,
+            'encoder_variant': self._encoder_variant,
         }
         np.savez(os.path.join(path, "config.npz"), **config)
+        # TODO(stage1-task4): store encoder_variant in checkpoint meta and validate on load; avoid vm_planes-only checks
         
         # Save the complete GeometryAppearanceEncoder state_dict
         # This includes hash_encoder, geo_encoder, and fusion_layer parameters
@@ -2176,6 +2186,11 @@ class GaussianModel:
             saved_feature_role_split = bool(config['feature_role_split'])
             if saved_feature_role_split != self._feature_role_split:
                 print(f"[WARNING] Model feature_role_split mismatch: saved={saved_feature_role_split}, current={self._feature_role_split}")
+            saved_variant = config['encoder_variant'] if 'encoder_variant' in config else 'hybrid'
+            if saved_variant != self._encoder_variant:
+                raise RuntimeError(
+                    f"encoder_variant mismatch between artifacts and args: saved={saved_variant}, requested={self._encoder_variant}"
+                )
             # Support both old 'glf_*' and new 'geo_*' config key names
             if 'geo_resolution' in config:
                 saved_geo_resolution = int(config['geo_resolution'])
@@ -2332,6 +2347,7 @@ class GaussianModel:
             _strict_assign(self._sh_mask, _np_to_torch(sm_npz['data'], device='cuda', dtype=torch.float16), "sh_mask", sh_mask_logits_fp16_path)
         vm_planes_fp16_path = os.path.join(path, 'vm_planes_fp16.npz')
         if os.path.exists(vm_planes_fp16_path) and hasattr(self._grid, 'plane_xy'):
+            # TODO(stage1-task4): ensure compression/export pipeline supports hash_only without vm_planes artifacts
             vm_npz = _load_npz(vm_planes_fp16_path)
             _strict_assign(self._grid.plane_xy, _np_to_torch(vm_npz['plane_xy'], device='cuda', dtype=torch.float16), "plane_xy", vm_planes_fp16_path)
             _strict_assign(self._grid.plane_xz, _np_to_torch(vm_npz['plane_xz'], device='cuda', dtype=torch.float16), "plane_xz", vm_planes_fp16_path)

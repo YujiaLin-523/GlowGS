@@ -207,11 +207,8 @@ def compute_edge_loss(pred_rgb, gt_rgb, mode: str = "sobel_weighted", lambda_edg
         return zero_loss
     
     elif mode == "cosine_edge":
-        loss = cosine_similarity_edge_loss(pred_rgb, gt_rgb)
+        loss, edge_term, flat_term = hybrid_edge_loss(pred_rgb, gt_rgb, flat_weight=flat_weight, return_components=True)
         if return_components:
-            # edge_term logs alignment error; flat_term kept for API compatibility
-            edge_term = loss.detach()
-            flat_term = torch.tensor(0.0, device=pred_rgb.device)
             return lambda_edge * loss, edge_term, flat_term
         return lambda_edge * loss
 
@@ -231,13 +228,11 @@ def compute_edge_loss(pred_rgb, gt_rgb, mode: str = "sobel_weighted", lambda_edg
         )
 
 
-def cosine_similarity_edge_loss(pred_rgb, gt_rgb, eps: float = 1e-6):
+def hybrid_edge_loss(pred_rgb, gt_rgb, flat_weight: float = 0.5, eps: float = 1e-6, return_components: bool = False):
     """
-    Orientation-focused edge loss via cosine similarity of Sobel gradients.
+    Hybrid edge loss: cosine alignment on edge mask M, L1 magnitude suppression on flat regions.
 
-    Rationale: Penalizes gradient direction mismatch while being lenient to
-    magnitude differences, allowing high-frequency texture to survive when
-    structural alignment is correct.
+    L_edge = M * (1 - cos) + lambda_flat * (1 - M) * ||∇I_pred||_1
     """
     # Ensure 4D tensors
     if pred_rgb.dim() == 3:
@@ -252,18 +247,32 @@ def cosine_similarity_edge_loss(pred_rgb, gt_rgb, eps: float = 1e-6):
     pred_grad = _compute_sobel_gradients(pred_gray, kx, ky)  # [B, 2, H, W]
     gt_grad = _compute_sobel_gradients(gt_gray, kx, ky)      # [B, 2, H, W]
 
-    # Compute cosine similarity per pixel
     pred_norm = torch.linalg.norm(pred_grad, dim=1, keepdim=True).clamp_min(eps)
     gt_norm = torch.linalg.norm(gt_grad, dim=1, keepdim=True).clamp_min(eps)
+
+    # Cosine similarity
     denom = pred_norm * gt_norm + eps
     cos_sim = (pred_grad * gt_grad).sum(dim=1, keepdim=True) / denom
     cos_sim = torch.clamp(cos_sim, -1.0, 1.0)
 
-    # Weight by GT edge strength to down-weight flat regions while keeping
-    # gradients alive (no explicit suppression term).
-    weight = gt_norm.detach()
-    weighted_error = (1.0 - cos_sim) * weight
-    loss = weighted_error.sum() / weight.sum().clamp_min(1.0)
+    # Edge mask M from GT gradient percentile scaling
+    gt_detached = gt_norm.detach()
+    g_p95 = torch.quantile(gt_detached[..., ::4, ::4], 0.95).clamp(min=eps)
+    grad_scale = g_p95 / 0.7 + eps
+    mask = torch.clamp(gt_detached / grad_scale, 0.0, 1.0)
+
+    mask_sum = mask.sum().clamp_min(1.0)
+    flat_mask = 1.0 - mask
+    flat_sum = flat_mask.sum().clamp_min(1.0)
+
+    loss_cos = (mask * (1.0 - cos_sim)).sum() / mask_sum
+    loss_flat = flat_weight * (flat_mask * pred_norm).sum() / flat_sum
+    loss = loss_cos + loss_flat
+
+    if return_components:
+        edge_term = (mask * (1.0 - cos_sim)).mean().detach()
+        flat_term = (flat_mask * pred_norm).mean().detach()
+        return loss, edge_term, flat_term
     return loss
 
 
