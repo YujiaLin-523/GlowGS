@@ -84,10 +84,9 @@ class ModelParams(ParamGroup):
         self.hash_size = 19          # log2_hashmap_size: 19 → 512K entries (balance of size/quality)
         self.width = 64              # MLP hidden width
         self.depth = 2               # MLP depth
-        # GeoEncoder (tri-plane) parameters - tuned for size/quality balance
-        # OPTIMIZED: Increased resolution to 128x128 for finer geometric details (Mip-NeRF360/DB/TnT)
-        self.geo_resolution = 128    # Tri-plane resolution (128x128, ~2.6MB VRAM, 1.78x spatial precision)
-        self.geo_rank = 12           # Low-rank factorization rank (improved capacity)
+        # GeoEncoder (tri-plane) parameters - bandwidth-expanded for structural fidelity
+        self.geo_resolution = 160    # Higher VM resolution to reduce aliasing on fine structures
+        self.geo_rank = 32           # Increased rank to match spatial bandwidth
         self.geo_channels = 8        # Output feature channels
         self.feature_role_split = True  # Enable geometry/appearance feature disentanglement
         
@@ -271,8 +270,8 @@ def get_combined_args(parser : ArgumentParser):
     # Ensure GeoEncoder parameters have defaults for backward compatibility
     # with models trained before these parameters were added
     geo_defaults = {
-        'geo_resolution': 48,
-        'geo_rank': 6,
+        'geo_resolution': 160,
+        'geo_rank': 32,
         'geo_channels': 8,
         'feature_role_split': True
     }

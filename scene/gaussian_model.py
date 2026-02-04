@@ -162,7 +162,7 @@ class GaussianModel:
         self._opacity_init = torch.tensor([[np.log(0.1 / (1 - 0.1))]], dtype=torch.float, device='cuda')
 
     def __init__(self, sh_degree: int, hash_size=19, width=64, depth=2, feature_role_split=True,
-                 geo_resolution=48, geo_rank=6, geo_channels=8, encoder_variant="hybrid",
+                 geo_resolution=160, geo_rank=32, geo_channels=8, encoder_variant="hybrid",
                  densify_strategy="feature_weighted", feature_mod_type="film",
                  mass_aware_scale: float = 0.1,
                  enable_mass_gate: bool = True,
@@ -1708,26 +1708,6 @@ class GaussianModel:
         # World-space size constraint (original 3DGS)
         is_large_ws = torch.max(self.get_scaling, dim=1).values > self.percent_dense * scene_extent
         selected_pts_mask = torch.logical_and(selected_pts_mask, is_large_ws)
-
-        # Mass Gate: block (large && transparent) Gaussians from splitting
-        # Prevents "garbage duplication" that occludes fine details
-        # Only affects split selection, NOT pruning (safe: cannot cause point collapse)
-        enable_mass_gate = getattr(self, '_enable_mass_gate', True)
-        if enable_mass_gate:
-            opacity = self.get_opacity.squeeze()
-            opacity_thresh = getattr(self, '_mass_gate_opacity_threshold', 0.3)
-            radius_pct = getattr(self, '_mass_gate_radius_percentile', 80.0)
-            
-            is_transparent = opacity < opacity_thresh
-            radii_valid = self.max_radii2D > 0
-            if radii_valid.sum() > 0:
-                radius_thresh = torch.quantile(
-                    self.max_radii2D[radii_valid].float(), 
-                    radius_pct / 100.0
-                )
-                is_large_radii = self.max_radii2D > radius_thresh
-                mass_gate_reject = torch.logical_and(is_large_radii, is_transparent)
-                selected_pts_mask = torch.logical_and(selected_pts_mask, ~mass_gate_reject)
 
         num_sel = int(selected_pts_mask.sum().item())
         if num_sel == 0:

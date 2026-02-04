@@ -200,7 +200,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     encoder_variant = 'hybrid'
     
     # Map edge loss setting
-    edge_loss_mode = 'sobel_weighted' if use_edge_loss else 'none'
+    edge_loss_mode = 'cosine_edge' if use_edge_loss else 'none'
     
     # Map densification mode to internal strategy name
     densify_strategy = 'feature_weighted' if densification_mode == 'mass_aware' else 'original_3dgs'
@@ -587,8 +587,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             pixel_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss_weighted
             
             # Edge loss: unified interface for ablation studies
-            # Mode can be "none" | "sobel_basic" | "laplacian_weighted" (paper default)
-            edge_loss_mode = getattr(opt, 'edge_loss_mode', 'laplacian_weighted')
+            # Mode can be "none" | "sobel_weighted" | "cosine_edge" (default)
+            edge_loss_mode = getattr(opt, 'edge_loss_mode', 'cosine_edge')
             edge_loss_start_iter = getattr(opt, 'edge_loss_start_iter', 0)
             edge_loss_end_iter = getattr(opt, 'edge_loss_end_iter', edge_loss_start_iter + 2000)
             lambda_grad = getattr(opt, 'lambda_grad', 0.05)
@@ -657,7 +657,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 flat_term_value = Lgrad_flat.item() if isinstance(Lgrad_flat, torch.Tensor) else 0.0
                 
                 # Edge loss weight
-                edge_loss_mode = getattr(opt, 'edge_loss_mode', 'laplacian_weighted')
+                edge_loss_mode = getattr(opt, 'edge_loss_mode', 'cosine_edge')
                 edge_loss_weight = lambda_grad if edge_loss_mode != "none" else 0.0
                 
                 # Gaussian statistics

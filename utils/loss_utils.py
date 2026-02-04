@@ -102,6 +102,13 @@ def _compute_sobel_magnitude(gray_img, kx, ky):
     return magnitude
 
 
+def _compute_sobel_gradients(gray_img, kx, ky):
+    """Return stacked Sobel gradients [B, 2, H, W] (gx, gy)."""
+    gx = F.conv2d(gray_img, kx, padding=1)
+    gy = F.conv2d(gray_img, ky, padding=1)
+    return torch.cat((gx, gy), dim=1)
+
+
 def compute_pixel_importance(gt_rgb, pred_rgb, power_edge=1.2, power_error=1.0):
     """
     Compute per-pixel importance for feature-weighted densification (GlowGS innovation #3).
@@ -176,9 +183,10 @@ def compute_edge_loss(pred_rgb, gt_rgb, mode: str = "sobel_weighted", lambda_edg
     """
     Edge loss interface for ablation studies.
     
-    Supports two modes:
+    Supports:
     - "none": No edge supervision (returns zero, no computation)
-    - "sobel_weighted": Adaptive edge-aware loss with flat regularization (GlowGS default)
+    - "sobel_weighted": Adaptive edge-aware loss with flat regularization (legacy/default)
+    - "cosine_edge": Orientation-only Sobel loss (new default) using cosine similarity
     
     Args:
         pred_rgb: Predicted image
@@ -198,6 +206,15 @@ def compute_edge_loss(pred_rgb, gt_rgb, mode: str = "sobel_weighted", lambda_edg
             return zero_loss, zero_loss, zero_loss
         return zero_loss
     
+    elif mode == "cosine_edge":
+        loss = cosine_similarity_edge_loss(pred_rgb, gt_rgb)
+        if return_components:
+            # edge_term logs alignment error; flat_term kept for API compatibility
+            edge_term = loss.detach()
+            flat_term = torch.tensor(0.0, device=pred_rgb.device)
+            return lambda_edge * loss, edge_term, flat_term
+        return lambda_edge * loss
+
     elif mode == "sobel_weighted" or mode == "laplacian_weighted":
         # GlowGS unified edge-aware loss (Now using Sobel internally)
         loss = gradient_loss(pred_rgb, gt_rgb, valid_mask=None, flat_weight=flat_weight, 
@@ -210,8 +227,44 @@ def compute_edge_loss(pred_rgb, gt_rgb, mode: str = "sobel_weighted", lambda_edg
     else:
         raise ValueError(
             f"Unknown edge_loss_mode: {mode}. "
-            f"Expected 'none' or 'sobel_weighted'"
+            f"Expected 'none', 'sobel_weighted', or 'cosine_edge'"
         )
+
+
+def cosine_similarity_edge_loss(pred_rgb, gt_rgb, eps: float = 1e-6):
+    """
+    Orientation-focused edge loss via cosine similarity of Sobel gradients.
+
+    Rationale: Penalizes gradient direction mismatch while being lenient to
+    magnitude differences, allowing high-frequency texture to survive when
+    structural alignment is correct.
+    """
+    # Ensure 4D tensors
+    if pred_rgb.dim() == 3:
+        pred_rgb = pred_rgb.unsqueeze(0)
+    if gt_rgb.dim() == 3:
+        gt_rgb = gt_rgb.unsqueeze(0)
+
+    kx, ky = _get_sobel_kernels(pred_rgb.device, pred_rgb.dtype)
+    pred_gray = _rgb_to_grayscale(pred_rgb)
+    gt_gray = _rgb_to_grayscale(gt_rgb)
+
+    pred_grad = _compute_sobel_gradients(pred_gray, kx, ky)  # [B, 2, H, W]
+    gt_grad = _compute_sobel_gradients(gt_gray, kx, ky)      # [B, 2, H, W]
+
+    # Compute cosine similarity per pixel
+    pred_norm = torch.linalg.norm(pred_grad, dim=1, keepdim=True).clamp_min(eps)
+    gt_norm = torch.linalg.norm(gt_grad, dim=1, keepdim=True).clamp_min(eps)
+    denom = pred_norm * gt_norm + eps
+    cos_sim = (pred_grad * gt_grad).sum(dim=1, keepdim=True) / denom
+    cos_sim = torch.clamp(cos_sim, -1.0, 1.0)
+
+    # Weight by GT edge strength to down-weight flat regions while keeping
+    # gradients alive (no explicit suppression term).
+    weight = gt_norm.detach()
+    weighted_error = (1.0 - cos_sim) * weight
+    loss = weighted_error.sum() / weight.sum().clamp_min(1.0)
+    return loss
 
 
 def gradient_loss(pred_rgb, gt_rgb, valid_mask=None, flat_weight=0.5, return_components=False):
