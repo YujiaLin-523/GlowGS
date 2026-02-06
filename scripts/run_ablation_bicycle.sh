@@ -59,11 +59,12 @@ done
 # ==============================================================================
 # Define ablation configurations (3 ablations only)
 # ==============================================================================
-# Format: config_name|output_dir|encoder_variant|feature_mod_type|densification_mode|use_edge_loss
+# Format: config_name|output_dir|enable_vm|enable_mass_aware|enable_edge_loss
+# Values use True/False for the simplified bool flag pattern
 declare -A ABLATION_CONFIGS
-ABLATION_CONFIGS["wo_vm"]="bicycle_wo_vm|hash_only|film|mass_aware|True"
-ABLATION_CONFIGS["wo_mass"]="bicycle_wo_mass|hybrid|film|standard|True"
-ABLATION_CONFIGS["wo_edge"]="bicycle_wo_edge|hybrid|film|mass_aware|False"
+ABLATION_CONFIGS["wo_vm"]="bicycle_wo_vm|False|True|True"
+ABLATION_CONFIGS["wo_mass"]="bicycle_wo_mass|True|False|True"
+ABLATION_CONFIGS["wo_edge"]="bicycle_wo_edge|True|True|False"
 
 # Ordered list
 CONFIG_ORDER=("wo_vm" "wo_mass" "wo_edge")
@@ -88,9 +89,9 @@ echo "========================================================================"
 echo ""
 echo "  Configurations to run:"
 for cfg in "${CONFIG_ORDER[@]}"; do
-    IFS='|' read -r out_dir encoder mod_type densify edge <<< "${ABLATION_CONFIGS[$cfg]}"
-    printf "    %-12s → output/%-20s [encoder=%s, mod=%s, densify=%s, edge=%s]\n" \
-           "$cfg" "$out_dir" "$encoder" "$mod_type" "$densify" "$edge"
+    IFS='|' read -r out_dir vm ma el <<< "${ABLATION_CONFIGS[$cfg]}"
+    printf "    %-12s → output/%-20s [vm=%s, mass=%s, edge=%s]\n" \
+           "$cfg" "$out_dir" "$vm" "$ma" "$el"
 done
 echo ""
 echo "  Iterations: $ITERATIONS"
@@ -109,7 +110,7 @@ run_training() {
     local config_name="$1"
     local config_str="${ABLATION_CONFIGS[$config_name]}"
     
-    IFS='|' read -r out_dir encoder mod_type densify edge <<< "$config_str"
+    IFS='|' read -r out_dir vm ma el <<< "$config_str"
     
     local model_path="output/$out_dir"
     
@@ -121,10 +122,9 @@ run_training() {
     local cmd="python train.py \
         -s $DATA_PATH \
         -m $model_path \
-        --encoder_variant $encoder \
-        --feature_mod_type $mod_type \
-        --densification_mode $densify \
-        --use_edge_loss $edge \
+        --enable_vm $vm \
+        --enable_mass_aware $ma \
+        --enable_edge_loss $el \
         --iterations $ITERATIONS \
         --save_iterations $SAVE_ITERATIONS \
         --test_iterations $TEST_ITERATIONS \

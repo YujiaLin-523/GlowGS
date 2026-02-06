@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 
 # ==============================================================================
-# GlowGS ECCV Ablation Study - Mip-NeRF 360 Dataset
+# GlowGS Ablation Study - Mip-NeRF 360 Dataset
 # ==============================================================================
-# Runs the complete additive ablation study (A→B→C→D) across 7 Mip-NeRF 360 scenes.
+# Runs the complete ablation study across 7 Mip-NeRF 360 scenes.
 #
-# Ablation Models (Additive - "Trinity" of contributions):
-#   A (Naive):    Hybrid Encoder (Concat mode), Standard Densification, No Edge Loss
-#   B (+FiLM):    Hybrid Encoder (FiLM mode),   Standard Densification, No Edge Loss
-#   C (+Mass):    Hybrid Encoder (FiLM mode),   Mass-Aware Densification, No Edge Loss
-#   D (Full):     Hybrid Encoder (FiLM mode),   Mass-Aware Densification, Edge Loss
+# Ablation Models (3 switches: enable_vm, enable_mass_aware, enable_edge_loss):
+#   Baseline:  --enable_vm False --enable_mass_aware False --enable_edge_loss False
+#   +VM:       --enable_vm True  --enable_mass_aware False --enable_edge_loss False
+#   +Mass:     --enable_vm True  --enable_mass_aware True  --enable_edge_loss False
+#   Full:      --enable_vm True  --enable_mass_aware True  --enable_edge_loss True
 #
 # Output:
 #   - Models: output/ablation_study/<scene>_<model>/
@@ -103,15 +103,15 @@ mkdir -p "$LOG_DIR"
 # ==============================================================================
 # Define ablation configurations
 # ==============================================================================
-# Format: MODEL_NAME:feature_mod_type:densification_mode:use_edge_loss
+# Format: MODEL_NAME:enable_vm:enable_mass_aware:enable_edge_loss
 declare -A CONFIGS
-CONFIGS["A_Concat"]="concat:standard:False"
-CONFIGS["B_FiLM"]="film:standard:False"
-CONFIGS["C_MassAware"]="film:mass_aware:False"
-CONFIGS["D_Full"]="film:mass_aware:True"
+CONFIGS["Baseline"]="False:False:False"
+CONFIGS["VM_Only"]="True:False:False"
+CONFIGS["VM_Mass"]="True:True:False"
+CONFIGS["Full"]="True:True:True"
 
 # Ordered list for iteration
-CONFIG_ORDER=("A_Concat" "B_FiLM" "C_MassAware" "D_Full")
+CONFIG_ORDER=("Baseline" "VM_Only" "VM_Mass" "Full")
 
 # ==============================================================================
 # Print experiment plan
@@ -124,10 +124,10 @@ echo ""
 echo "  Scenes (${#SCENES[@]}): ${SCENES[*]}"
 echo ""
 echo "  Ablation Models:"
-echo "    A_Concat:    Hybrid (Concat), Standard Densify, No Edge Loss"
-echo "    B_FiLM:      Hybrid (FiLM),   Standard Densify, No Edge Loss"
-echo "    C_MassAware: Hybrid (FiLM),   Mass-Aware Densify, No Edge Loss"
-echo "    D_Full:      Hybrid (FiLM),   Mass-Aware Densify, Edge Loss"
+echo "    Baseline:  --enable_vm False --enable_mass_aware False --enable_edge_loss False"
+echo "    VM_Only:   --enable_vm True  --enable_mass_aware False --enable_edge_loss False"
+echo "    VM_Mass:   --enable_vm True  --enable_mass_aware True  --enable_edge_loss False"
+echo "    Full:      --enable_vm True  --enable_mass_aware True  --enable_edge_loss True"
 echo ""
 echo "  Training Config:"
 echo "    Iterations: $ITERATIONS"
@@ -154,7 +154,7 @@ run_experiment() {
     local config=$3
     
     # Parse config string
-    IFS=':' read -r mod_type densify_mode edge_loss <<< "$config"
+    IFS=':' read -r vm ma el <<< "$config"
     
     local scene_path="$DATA_ROOT/$scene"
     local output_dir="$OUTPUT_BASE/${scene}_${model}"
@@ -171,13 +171,13 @@ run_experiment() {
     echo "──────────────────────────────────────────────────────────────────────"
     echo "  Running: $scene / $model"
     echo "──────────────────────────────────────────────────────────────────────"
-    echo "  Config: mod_type=$mod_type, densify=$densify_mode, edge_loss=$edge_loss"
+    echo "  Config: enable_vm=$vm enable_mass_aware=$ma enable_edge_loss=$el"
     echo "  Output: $output_dir"
     echo "  Log: $log_file"
     echo ""
     
     if [ "$DRY_RUN" = true ]; then
-        echo "[DRY RUN] python -u train.py -s $scene_path -m $output_dir --iterations $ITERATIONS --eval --feature_mod_type $mod_type --densification_mode $densify_mode --use_edge_loss $edge_loss --test_iterations $TEST_ITERATIONS --save_iterations $SAVE_ITERATIONS $pcd_arg"
+        echo "[DRY RUN] python -u train.py -s $scene_path -m $output_dir --iterations $ITERATIONS --eval --enable_vm $vm --enable_mass_aware $ma --enable_edge_loss $el --test_iterations $TEST_ITERATIONS --save_iterations $SAVE_ITERATIONS $pcd_arg"
         echo ""
         return 0
     fi
@@ -194,9 +194,9 @@ run_experiment() {
         -m "$output_dir" \
         --iterations $ITERATIONS \
         --eval \
-        --feature_mod_type $mod_type \
-        --densification_mode $densify_mode \
-        --use_edge_loss $edge_loss \
+        --enable_vm $vm \
+        --enable_mass_aware $ma \
+        --enable_edge_loss $el \
         --test_iterations $TEST_ITERATIONS \
         --save_iterations $SAVE_ITERATIONS \
         $pcd_arg 2>&1 | tee "$log_file"; then

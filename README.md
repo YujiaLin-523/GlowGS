@@ -112,59 +112,42 @@ GlowGS provides a unified interface for systematic ablation studies. See [ABLATI
 
 ### Ablation Parameters
 
-Control three key innovations via CLI parameters:
+Control three key innovations via CLI switches (all default **True**):
 
-| Parameter | Options | Default | Description |
+| Parameter | Disable | Default | Description |
 |-----------|---------|---------|-------------|
-| `--encoder_variant` | `hybrid`, `hash_only`, `vm_only`, `no_role_split` | `hybrid` | Encoder architecture variant |
-| `--edge_loss_mode` | `sobel_weighted`, `sobel_basic`, `none` | `sobel_weighted` | Edge-aware loss mode |
-| `--densify_strategy` | `feature_weighted`, `original`, `residual_only`, `edge_only` | `feature_weighted` | Densification strategy |
+| `--enable_vm` | `--enable_vm False` | True | VM tri-plane geometry branch in encoder |
+| `--enable_mass_aware` | `--enable_mass_aware False` | True | Mass-aware densification (gate + prune + budget) |
+| `--enable_edge_loss` | `--enable_edge_loss False` | True | Edge-aware gradient supervision |
 
 ### Examples
 
-**Test encoder variants:**
+**Disable individual components:**
 ```bash
-# Hash-only baseline (no VM)
-python train.py -s data/360_v2/bicycle -m output/bicycle_hash \
-                --encoder_variant hash_only
+# Without VM (hash-only encoding)
+python train.py -s data/360_v2/bicycle -m output/bicycle_wo_vm \
+                --enable_vm False
 
-# VM-only baseline (no hash grid)
-python train.py -s data/360_v2/bicycle -m output/bicycle_vm \
-                --encoder_variant vm_only
+# Without mass-aware densification
+python train.py -s data/360_v2/bicycle -m output/bicycle_wo_mass \
+                --enable_mass_aware False
 
-# Hybrid without role split (fused latent)
-python train.py -s data/360_v2/bicycle -m output/bicycle_norole \
-                --encoder_variant no_role_split
+# Without edge loss
+python train.py -s data/360_v2/bicycle -m output/bicycle_wo_edge \
+                --enable_edge_loss False
 ```
 
-**Test edge loss modes:**
-```bash
-# Disable edge loss
-python train.py -s data/360_v2/bicycle -m output/bicycle_noedge \
-                --edge_loss_mode none
-
-# Basic edge loss (simple gradient matching)
-python train.py -s data/360_v2/bicycle -m output/bicycle_basiced \
-                --edge_loss_mode sobel_basic
-```
-
-**Test densification strategies:**
-```bash
-# Original 3DGS densification
-python train.py -s data/360_v2/bicycle -m output/bicycle_origdens \
-                --densify_strategy original
-
-# Edge-only importance
-python train.py -s data/360_v2/bicycle -m output/bicycle_edgedens \
-                --densify_strategy edge_only
-```
-
-**Full ablation (all innovations disabled):**
+**Full ablation (all innovations disabled = baseline):**
 ```bash
 python train.py -s data/360_v2/bicycle -m output/bicycle_baseline \
-                --encoder_variant hash_only \
-                --edge_loss_mode none \
-                --densify_strategy original
+                --enable_vm False \
+                --enable_mass_aware False \
+                --enable_edge_loss False
+```
+
+**Full GlowGS (default, all enabled):**
+```bash
+python train.py -s data/360_v2/bicycle -m output/bicycle --eval
 ```
 
 ### Configuration Auto-Save
@@ -173,9 +156,9 @@ Every training run automatically saves `ablation_config.yaml` in the output dire
 
 ```yaml
 ablation_settings:
-  encoder_variant: hybrid
-  edge_loss_mode: sobel_weighted
-  densify_strategy: feature_weighted
+  enable_vm: true
+  enable_mass_aware: true
+  enable_edge_loss: true
 
 training_hyperparameters:
   iterations: 30000

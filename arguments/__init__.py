@@ -14,20 +14,25 @@ import sys
 import os
 from utils.general_utils import is_verbose
 
+# ── Three ablation switches (the ONLY user-facing switches) ─────────────
+# Registered with type=_bool_flag so that:
+#   --enable_vm True/False
+#   --enable_mass_aware True/False
+#   --enable_edge_loss True/False
+# Defaults are True (full GlowGS).
+def _bool_flag(v):
+    """Parse boolean CLI flags: True/False/1/0/yes/no."""
+    return str(v).lower() in ('true', '1', 'yes')
+
+ABLATION_SWITCHES = ('enable_vm', 'enable_mass_aware', 'enable_edge_loss')
+
+
 class GroupParams:
     pass
 
 class ParamGroup:
     def __init__(self, parser: ArgumentParser, name : str, fill_none = False):
         group = parser.add_argument_group(name)
-        # String choice parameters for ECCV ablation study (A→B→C→D)
-        choice_params = {
-            'feature_mod_type': ['concat', 'film'],
-            'densification_mode': ['standard', 'mass_aware'],
-            'encoder_variant': ['hybrid', 'hash_only', '3dgs'],
-        }
-        # Boolean parameters that need explicit True/False parsing (not just presence)
-        explicit_bool_params = {'use_edge_loss'}
         
         for key, value in vars(self).items():
             shorthand = False
@@ -38,28 +43,20 @@ class ParamGroup:
             value = value if not fill_none else None 
             if shorthand:
                 if t == bool:
-                    if key in explicit_bool_params:
-                        # Explicit True/False parsing for ablation switches
+                    if key in ABLATION_SWITCHES:
                         group.add_argument("--" + key, ("-" + key[0:1]), default=value,
-                                         type=lambda x: str(x).lower() in ('true', '1', 'yes'))
+                                         type=_bool_flag)
                     else:
                         group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
-                elif key in choice_params:
-                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, 
-                                     type=str, choices=choice_params[key])
                 else:
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, type=t)
             else:
                 if t == bool:
-                    if key in explicit_bool_params:
-                        # Explicit True/False parsing for ablation switches
+                    if key in ABLATION_SWITCHES:
                         group.add_argument("--" + key, default=value,
-                                         type=lambda x: str(x).lower() in ('true', '1', 'yes'))
+                                         type=_bool_flag)
                     else:
                         group.add_argument("--" + key, default=value, action="store_true")
-                elif key in choice_params:
-                    group.add_argument("--" + key, default=value, 
-                                     type=str, choices=choice_params[key])
                 else:
                     group.add_argument("--" + key, default=value, type=t)
 
@@ -90,14 +87,11 @@ class ModelParams(ParamGroup):
         self.geo_rank = 48           # VM rank (increased for sum aggregation)
         self.geo_channels = 32       # VM output feature channels
         self.feature_role_split = True  # Enable geometry/appearance feature disentanglement
-        self.encoder_variant = "hybrid"  # Encoder architecture variant
-        # TODO(stage1-task2): encoder_variant must round-trip via cfg_args for render/convert/fps consistency
         
-        # Ablation Controls (A→B→C→D additive study)
-        # A: Concat (baseline) → B: +FiLM → C: +MassAware → D: +EdgeLoss (full GlowGS)
-        self.feature_mod_type = "film"        # 'concat' (naive fusion) or 'film' (FiLM modulation)
-        self.densification_mode = "mass_aware"  # 'standard' (3DGS) or 'mass_aware' (GlowGS)
-        self.use_edge_loss = True             # Enable unified edge-aware gradient loss
+        # ── Three ablation switches (unified, --flag True/False) ──
+        self.enable_vm = True              # VM tri-plane branch in encoder
+        self.enable_mass_aware = True      # Mass-aware densification gating
+        self.enable_edge_loss = True       # Edge-aware gradient loss
         
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -196,8 +190,7 @@ class OptimizationParams(ParamGroup):
         self.random_background = False
 
         # Edge-aware loss configuration (GlowGS innovation #2)
-        # SAFE VERSION: Enabled with flat_term removed (only edge alignment, no suppression)
-        self.enable_edge_loss = True        # master switch for unified edge-aware gradient loss
+        # Controlled by --enable_edge_loss True/False in ModelParams; these are schedule params.
         self.edge_loss_start_iter = 5000    # edge loss ramp start (begin transition)
         self.edge_loss_end_iter = 7000      # edge loss ramp end (full strength)
         self.lambda_grad = 0.05             # edge loss weight (cosine term is small; keep strong enough)
@@ -284,22 +277,48 @@ def get_combined_args(parser : ArgumentParser):
             merged_dict[key] = default_val
             print(f"[INFO] Using default {key}={default_val}")
 
-    # Encoder variant backward compatibility + provenance for logging
-    default_variant = getattr(default_args, "encoder_variant", "hybrid")
-    encoder_variant_source = "default"
-    cfg_has_encoder_variant = hasattr(args_cfgfile, "encoder_variant")
-    cli_has_encoder_variant = args_cmdline.encoder_variant != getattr(default_args, "encoder_variant", None)
+    # ── Migration: old cfg_args → new 3-switch system ──────────────────
+    # Old configs may contain encoder_variant / feature_mod_type /
+    # densification_mode / use_edge_loss.  Map them once so render/eval
+    # always use the training-time intention.
+    # When BOTH old and new keys are present (transitional cfg_args),
+    # old keys take priority because they reflect actual training config.
+    # Also handle the intermediate-era keys: mass_aware, edge_loss (before this rename)
+    _has_old = any(k in merged_dict for k in ('encoder_variant', 'densification_mode', 'use_edge_loss', 'mass_aware', 'edge_loss'))
+    _migrated = False
+    if _has_old or 'enable_vm' not in merged_dict:
+        if 'encoder_variant' in merged_dict:
+            old_ev = merged_dict.pop('encoder_variant', 'hybrid')
+            merged_dict['enable_vm'] = (old_ev != 'hash_only')
+            _migrated = True
+        elif 'enable_vm' not in merged_dict:
+            merged_dict['enable_vm'] = True
+    if _has_old or 'enable_mass_aware' not in merged_dict:
+        if 'densification_mode' in merged_dict:
+            old_dm = merged_dict.pop('densification_mode', 'mass_aware')
+            merged_dict['enable_mass_aware'] = (old_dm == 'mass_aware')
+            _migrated = True
+        elif 'mass_aware' in merged_dict:
+            merged_dict['enable_mass_aware'] = bool(merged_dict.pop('mass_aware'))
+            _migrated = True
+        elif 'enable_mass_aware' not in merged_dict:
+            merged_dict['enable_mass_aware'] = True
+    if _has_old or 'enable_edge_loss' not in merged_dict:
+        if 'use_edge_loss' in merged_dict:
+            old_el = merged_dict.pop('use_edge_loss', True)
+            merged_dict['enable_edge_loss'] = bool(old_el)
+            _migrated = True
+        elif 'edge_loss' in merged_dict:
+            merged_dict['enable_edge_loss'] = bool(merged_dict.pop('edge_loss'))
+            _migrated = True
+        elif 'enable_edge_loss' not in merged_dict:
+            merged_dict['enable_edge_loss'] = True
+    if _migrated:
+        print(f"[CFG-MIGRATE] Mapped legacy config → enable_vm={merged_dict['enable_vm']} | enable_mass_aware={merged_dict['enable_mass_aware']} | enable_edge_loss={merged_dict['enable_edge_loss']}")
 
-    if cfg_has_encoder_variant:
-        encoder_variant_source = "cfg"
-    if cli_has_encoder_variant:
-        encoder_variant_source = "cli"
-
-    if "encoder_variant" not in merged_dict or merged_dict.get("encoder_variant") is None:
-        if not cfg_has_encoder_variant and not cli_has_encoder_variant:
-            print("[WARN] encoder_variant missing in cfg_args; defaulting to 'hybrid' for backward compatibility")
-        merged_dict["encoder_variant"] = default_variant
-
-    merged_dict["encoder_variant_source"] = encoder_variant_source
+    # Strip stale legacy keys that must not leak into the new Namespace
+    for stale in ('encoder_variant', 'encoder_variant_source', 'feature_mod_type',
+                  'densification_mode', 'use_edge_loss', 'mass_aware', 'edge_loss'):
+        merged_dict.pop(stale, None)
 
     return Namespace(**merged_dict)

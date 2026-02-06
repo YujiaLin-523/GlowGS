@@ -116,16 +116,14 @@ class GaussianModel:
             "prune_interval": 400,             # Periodic pruning interval
         }
         
-        # Create encoder using factory for ablation study support
-        # encoder_variant is set via __init__ from training args
+        # Create encoder using factory (always hybrid, VM bypassed if enable_vm=False)
         self._grid = create_gaussian_encoder(
-            variant=self._encoder_variant,
             encoding_config=self.encoding_config,
             network_config=self.network_config,
             geo_resolution=self._geo_resolution,
             geo_rank=self._geo_rank,
             geo_channels=self._geo_channels,
-            feature_mod_type=self._feature_mod_type,
+            enable_vm=self._enable_vm,
         )
         # Move encoder and its submodules to GPU
         self._grid = self._grid.cuda()
@@ -140,8 +138,8 @@ class GaussianModel:
         # Lightweight projection layers for feature_role_split path
         # Map geometry_latent/appearance_latent (C_shared + C_role) to head input dim (C_shared)
         # Only used when encoder variant supports role split (hybrid with feature_role_split=True)
-        base_dim, geometry_dim, appearance_dim = get_encoder_output_dims(self._grid, self._encoder_variant)
-        print(f"[EncoderDims] variant={self._encoder_variant} role_split={self._feature_role_split} base_dim={base_dim} geometry_dim={geometry_dim} appearance_dim={appearance_dim}")
+        base_dim, geometry_dim, appearance_dim = get_encoder_output_dims(self._grid)
+        print(f"[EncoderDims] enable_vm={self._enable_vm} role_split={self._feature_role_split} base_dim={base_dim} geometry_dim={geometry_dim} appearance_dim={appearance_dim}")
         # TODO(stage1-task3): if feature_role_split enabled, print (geometry_dim, appearance_dim, fused_dim) and assert downstream expectations
         if self._feature_role_split:
             if geometry_dim != base_dim or appearance_dim != base_dim:
@@ -169,23 +167,29 @@ class GaussianModel:
         self._opacity_init = torch.tensor([[np.log(0.1 / (1 - 0.1))]], dtype=torch.float, device='cuda')
 
     def __init__(self, sh_degree: int, hash_size=19, width=64, depth=2, feature_role_split=True,
-                 geo_resolution=128, geo_rank=48, geo_channels=32, encoder_variant="hybrid",
-                 densify_strategy="feature_weighted", feature_mod_type="film",
+                 geo_resolution=128, geo_rank=48, geo_channels=32,
+                 enable_vm: bool = True,
+                 enable_mass_aware: bool = True,
                  mass_aware_scale: float = 0.1,
                  enable_mass_gate: bool = True,
                  mass_gate_opacity_threshold: float = 0.3,
-                 mass_gate_radius_percentile: float = 80.0):
+                 mass_gate_radius_percentile: float = 80.0,
+                 # Legacy kwargs accepted but ignored (backward compat)
+                 encoder_variant: str | None = None,
+                 densify_strategy: str | None = None,
+                 feature_mod_type: str | None = None,
+                 mass_aware: bool | None = None):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree
-        # Store encoder variant and densification strategy for ablation studies
-        self._encoder_variant = encoder_variant
-        self._densify_strategy = densify_strategy
-        self._feature_role_split = feature_role_split  # Geometry/appearance disentanglement flag
-        self._feature_mod_type = feature_mod_type  # 'film' or 'concat' for ECCV ablation
+        # ── Ablation switches ──
+        self._enable_vm = enable_vm
+        # Accept legacy 'mass_aware' kwarg for backward compat
+        self._enable_mass_aware = enable_mass_aware if mass_aware is None else mass_aware
+        self._feature_role_split = feature_role_split
         # Mass-aware gradient weighting scale (xi): higher = stronger pruning, lower = softer
         self._mass_aware_scale = mass_aware_scale
         # Mass Gate parameters (GlowGS innovation: block large & transparent from clone/split)
-        self._enable_mass_gate = enable_mass_gate
+        self._enable_mass_gate = enable_mass_gate if self._enable_mass_aware else False
         self._mass_gate_opacity_threshold = mass_gate_opacity_threshold
         self._mass_gate_radius_percentile = mass_gate_radius_percentile
         # Alert threshold for large prune events (fraction of points removed in one call)
@@ -405,30 +409,6 @@ class GaussianModel:
                 self._features_rest = self._precomputed_cache['features_rest']
             return
         
-        # 3DGS mode: skip encoder, use explicit SH parameters only
-        # In this mode, _features_rest is directly optimized (no encoder)
-        if self._encoder_variant == '3dgs':
-            # Initialize implicit attributes to defaults if not already set
-            N = self._xyz.shape[0]
-            if N == 0:
-                return
-            
-            # Set default geometry attributes (optimized separately)
-            if self._scaling.shape[0] != N:
-                self._scaling = torch.zeros((N, 3), device="cuda")
-            if self._rotation.shape[0] != N:
-                self._rotation = self._rotation_init.expand(N, -1).clone()
-            if self._opacity.shape[0] != N:
-                self._opacity = self._opacity_init.expand(N, -1).clone()
-            
-            # _features_rest is directly optimized in 3DGS mode (no encoder)
-            # Just ensure it exists and has the right shape
-            if self.max_sh_degree > 0 and self._features_rest.shape[0] != N:
-                sh_dim = (self.max_sh_degree + 1) ** 2 - 1
-                self._features_rest = torch.zeros((N, sh_dim, 3), device="cuda")
-            
-            return  # Early exit for 3DGS mode
-        
         # Smart caching: Only recompute if xyz changed or during densification
         # This saves ~28ms per iteration (profiler shows 569ms / 20 calls)
         N = self._xyz.shape[0]
@@ -457,9 +437,8 @@ class GaussianModel:
             self._cache_miss_count = 0
         self._cache_miss_count += 1
         
-        # Hybrid encoder does its own L-inf contraction; other variants use pre-contracted coords
-        _needs_aabb = self._encoder_variant == 'hybrid'
-        raw_xyz = self.get_xyz.detach() if _needs_aabb else self.get_contracted_xyz
+        # Hybrid encoder always does its own L-inf contraction via AABB
+        raw_xyz = self.get_xyz.detach()
 
         # Optimize chunk size: use larger chunks or process all at once if memory allows
         # For better GPU utilization, try to process in fewer, larger chunks
@@ -475,7 +454,7 @@ class GaussianModel:
             for i in range(0, N, chunk_size):
                 end_idx = min(i + chunk_size, N)
                 coords = raw_xyz[i: end_idx]
-                encoder_out = self._grid(coords, self._aabb) if _needs_aabb else self._grid(coords)
+                encoder_out = self._grid(coords, self._aabb)
 
                 # Support both 2-tuple legacy and 3-tuple new encoder outputs
                 if isinstance(encoder_out, tuple):
@@ -538,7 +517,7 @@ class GaussianModel:
             for i in range(0, N, chunk_size):
                 end_idx = min(i + chunk_size, N)
                 coords = raw_xyz[i: end_idx]
-                encoder_out = self._grid(coords, self._aabb) if _needs_aabb else self._grid(coords)
+                encoder_out = self._grid(coords, self._aabb)
                 feats = encoder_out if not isinstance(encoder_out, tuple) else encoder_out[0]
                 # Encoder already clamps, skip redundant clamp
                 opacity_chunks.append(self._opacity_head(feats) + self._opacity_init)
@@ -567,10 +546,6 @@ class GaussianModel:
         Call this once after model loading to avoid per-frame MLP inference.
         The cached attributes will be used by update_attributes() automatically.
         """
-        if self._encoder_variant == '3dgs':
-            if is_verbose():
-                print("[Precompute] 3DGS mode: no encoder decoding needed")
-            return
         
         # Force compute all attributes
         self._precomputed_cache = None  # Clear any existing cache
@@ -1225,16 +1200,9 @@ class GaussianModel:
         # Initialize SH mask high so sigmoid(6.0)~0.997, allowing full specular details from start
         self._sh_mask = nn.Parameter(torch.full((fused_point_cloud.shape[0], self.max_sh_degree), 6.0, device="cuda").requires_grad_(True))
 
-        # In 3DGS mode, initialize _features_rest as explicit parameters
-        if self._encoder_variant == '3dgs' and self.max_sh_degree > 0:
-            # Initialize higher-order SH coefficients to zero
-            self._features_rest = nn.Parameter(
-                features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True)
-            )
-        else:
-            # In encoder-based modes, _features_rest is implicit (generated by encoder)
-            # Initialize to empty tensor (will be populated by update_attributes)
-            self._features_rest = torch.empty(0)
+        # _features_rest is always implicit (generated by encoder)
+        # Initialize to empty tensor (will be populated by update_attributes)
+        self._features_rest = torch.empty(0)
 
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self._ensure_birth_iter(default_iter=0)
@@ -1272,14 +1240,6 @@ class GaussianModel:
             {'params': [self._mask], 'lr': training_args.mask_lr, "name": "mask"},
             {'params': [self._sh_mask], 'lr': training_args.sh_mask_lr, "name": "sh_mask"}
         ]
-        
-        # In 3DGS mode, add _features_rest as explicit optimizable parameter
-        if self._encoder_variant == '3dgs' and isinstance(self._features_rest, nn.Parameter):
-            param_groups.append({
-                'params': [self._features_rest], 
-                'lr': training_args.feature_rest_lr_init, 
-                "name": "f_rest"
-            })
         
         self.optimizer = torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
 
@@ -1352,7 +1312,6 @@ class GaussianModel:
                 lr = self.xyz_scheduler_args(iteration)
                 param_group['lr'] = lr
             elif param_group["name"] == "f_rest":
-                # In 3DGS mode, f_rest is in explicit optimizer
                 lr = self.feature_scheduler_args(iteration)
                 param_group['lr'] = lr
         
@@ -1581,15 +1540,10 @@ class GaussianModel:
             self._mask = safe_prune(self._mask, valid_points_mask, "mask")
             self._sh_mask = safe_prune(self._sh_mask, valid_points_mask, "sh_mask")
             
-            # Prune f_rest if applicable
-            if self._encoder_variant == '3dgs':
-                if isinstance(self._features_rest, (torch.Tensor, nn.Parameter)) and self._features_rest.numel() > 0:
+            # Prune f_rest if it exists and matches shape
+            if isinstance(self._features_rest, torch.Tensor) and self._features_rest.numel() > 0:
+                if self._features_rest.shape[0] == mask.shape[0]:
                     self._features_rest = safe_prune(self._features_rest, valid_points_mask, "f_rest")
-            else:
-                # For encoder models, prune if it exists and matches shape
-                if isinstance(self._features_rest, torch.Tensor) and self._features_rest.numel() > 0:
-                    if self._features_rest.shape[0] == mask.shape[0]:
-                        self._features_rest = safe_prune(self._features_rest, valid_points_mask, "f_rest")
             
             # Prune computed attributes (from update_attributes)
             for attr_name in ['_opacity', '_scaling', '_rotation']:
@@ -1629,10 +1583,6 @@ class GaussianModel:
             self._scaling_base = optimizable_tensors["scaling_base"]
             self._mask = optimizable_tensors["mask"]
             self._sh_mask = optimizable_tensors["sh_mask"]
-            
-            # In 3DGS mode, also prune f_rest
-            if self._encoder_variant == '3dgs' and "f_rest" in optimizable_tensors:
-                self._features_rest = optimizable_tensors["f_rest"]
 
             # Training buffers - these MUST exist and match in training mode
             self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
@@ -1685,10 +1635,6 @@ class GaussianModel:
             "mask": new_mask,
             "sh_mask": new_sh_mask,
         }
-        
-        # In 3DGS mode, explicitly add f_rest to optimizer
-        if self._encoder_variant == '3dgs' and new_features_rest is not None:
-            d["f_rest"] = new_features_rest
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -1696,10 +1642,6 @@ class GaussianModel:
         self._scaling_base = optimizable_tensors["scaling_base"]
         self._mask = optimizable_tensors["mask"]
         self._sh_mask = optimizable_tensors["sh_mask"]
-        
-        # In 3DGS mode, update _features_rest from optimizer
-        if self._encoder_variant == '3dgs' and "f_rest" in optimizable_tensors:
-            self._features_rest = optimizable_tensors["f_rest"]
 
         n_after = self.get_xyz.shape[0]
         added = n_after - n_before
@@ -1788,12 +1730,8 @@ class GaussianModel:
         new_scaling_base = self._safe_log_scale_for_new_points(new_log)
         new_mask = self._mask[selected_pts_mask].repeat(N,1)
         new_sh_mask = self._sh_mask[selected_pts_mask].repeat(N,1)
-        
-        new_features_rest = None
-        if self._encoder_variant == '3dgs' and isinstance(self._features_rest, nn.Parameter):
-            new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_scaling_base, new_mask, new_sh_mask, new_features_rest, iteration=iteration, kind="split")
+        self.densification_postfix(new_xyz, new_features_dc, new_scaling_base, new_mask, new_sh_mask, iteration=iteration, kind="split")
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter, iteration=iteration)
@@ -1851,12 +1789,8 @@ class GaussianModel:
         new_scaling_base = safe_log[selected_pts_mask]
         new_mask = self._mask[selected_pts_mask]
         new_sh_mask = self._sh_mask[selected_pts_mask]
-        
-        new_features_rest = None
-        if self._encoder_variant == '3dgs' and isinstance(self._features_rest, nn.Parameter):
-            new_features_rest = self._features_rest[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_scaling_base, new_mask, new_sh_mask, new_features_rest, iteration=iteration, kind="clone")
+        self.densification_postfix(new_xyz, new_features_dc, new_scaling_base, new_mask, new_sh_mask, iteration=iteration, kind="clone")
         self.update_attributes(force_update=True, iteration=iteration)
         self._debug_scale_stats(tag="after_densify_clone", tensor=self._scaling_base, iteration=iteration, force=True, check_assert=True)
 
@@ -1869,23 +1803,29 @@ class GaussianModel:
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        warmup_iter = 3000
-        tau = 0.5  # FIXED: Increased from 0.1 to reduce over-suppression (safe baseline)
-
-        if iteration < warmup_iter:
+        # Mass-aware bypass: when enable_mass_aware=False, skip size-decay weighting
+        # and use raw gradients for both clone and split (standard 3DGS behavior).
+        if not self._enable_mass_aware:
             clone_grads = grads
             split_grads = grads
         else:
-            # Post-warmup: apply size-decay weight to clone, keep split raw
-            # CRITICAL FIX: Use world-space scaling, NOT screen-space max_radii2D
-            world_scale = self.get_scaling.max(dim=1).values  # [N] World-space Gaussian radius
-            extent_safe = max(extent, 1e-6)
-            decay = (world_scale / (tau * extent_safe)) ** 2
-            weight = 1.0 / (1.0 + decay)  # [N] Size-decay weight (0.0~1.0)
-            
-            raw_grad = grads.squeeze(-1)  # [N]
-            clone_grads = (raw_grad * weight).unsqueeze(1)
-            split_grads = raw_grad.unsqueeze(1)
+            warmup_iter = 3000
+            tau = 0.5  # FIXED: Increased from 0.1 to reduce over-suppression (safe baseline)
+
+            if iteration < warmup_iter:
+                clone_grads = grads
+                split_grads = grads
+            else:
+                # Post-warmup: apply size-decay weight to clone, keep split raw
+                # CRITICAL FIX: Use world-space scaling, NOT screen-space max_radii2D
+                world_scale = self.get_scaling.max(dim=1).values  # [N] World-space Gaussian radius
+                extent_safe = max(extent, 1e-6)
+                decay = (world_scale / (tau * extent_safe)) ** 2
+                weight = 1.0 / (1.0 + decay)  # [N] Size-decay weight (0.0~1.0)
+                
+                raw_grad = grads.squeeze(-1)  # [N]
+                clone_grads = (raw_grad * weight).unsqueeze(1)
+                split_grads = raw_grad.unsqueeze(1)
 
         self.update_attributes(force_update=True, iteration=iteration)
         self.densify_and_clone(clone_grads, max_grad, extent, iteration=iteration)
@@ -2093,10 +2033,10 @@ class GaussianModel:
             'geo_rank': self._geo_rank,
             'geo_channels': self._geo_channels,
             'max_sh_degree': self.max_sh_degree,
-            'encoder_variant': self._encoder_variant,
+            'enable_vm': self._enable_vm,
+            'enable_mass_aware': self._enable_mass_aware,
         }
         np.savez(os.path.join(path, "config.npz"), **config)
-        # TODO(stage1-task4): store encoder_variant in checkpoint meta and validate on load; avoid vm_planes-only checks
         
         # Save the complete GeometryAppearanceEncoder state_dict
         # This includes hash_encoder, geo_encoder, and fusion_layer parameters
@@ -2228,11 +2168,25 @@ class GaussianModel:
             saved_feature_role_split = bool(config['feature_role_split'])
             if saved_feature_role_split != self._feature_role_split:
                 print(f"[WARNING] Model feature_role_split mismatch: saved={saved_feature_role_split}, current={self._feature_role_split}")
-            saved_variant = config['encoder_variant'] if 'encoder_variant' in config else 'hybrid'
-            if saved_variant != self._encoder_variant:
-                raise RuntimeError(
-                    f"encoder_variant mismatch between artifacts and args: saved={saved_variant}, requested={self._encoder_variant}"
-                )
+            # Migration: old configs used encoder_variant; new ones use enable_vm
+            if 'enable_vm' in config:
+                saved_enable_vm = bool(config['enable_vm'])
+                if saved_enable_vm != self._enable_vm:
+                    print(f"[WARNING] enable_vm mismatch: saved={saved_enable_vm}, current={self._enable_vm}")
+            elif 'encoder_variant' in config:
+                old_variant = str(config['encoder_variant'])
+                inferred_vm = (old_variant != 'hash_only')
+                if inferred_vm != self._enable_vm:
+                    print(f"[WARNING] Inferred enable_vm={inferred_vm} from legacy encoder_variant={old_variant}, current={self._enable_vm}")
+            # Migration: old configs used mass_aware; new ones use enable_mass_aware
+            if 'enable_mass_aware' in config:
+                saved_ma = bool(config['enable_mass_aware'])
+                if saved_ma != self._enable_mass_aware:
+                    print(f"[WARNING] enable_mass_aware mismatch: saved={saved_ma}, current={self._enable_mass_aware}")
+            elif 'mass_aware' in config:
+                saved_ma = bool(config['mass_aware'])
+                if saved_ma != self._enable_mass_aware:
+                    print(f"[WARNING] Inferred enable_mass_aware={saved_ma} from legacy mass_aware key, current={self._enable_mass_aware}")
             # Support both old 'glf_*' and new 'geo_*' config key names
             if 'geo_resolution' in config:
                 saved_geo_resolution = int(config['geo_resolution'])

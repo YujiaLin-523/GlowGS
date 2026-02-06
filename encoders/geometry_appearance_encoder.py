@@ -37,6 +37,7 @@ class GeometryAppearanceEncoder(nn.Module):
         geo_rank:           VM rank.
         feature_role_split: Return 3-tuple or single fused tensor.
         use_film:           True = FiLM modulation, False = naive concat.
+        enable_vm:          If False, VM branch output is zeroed (hash-only bypass).
     """
 
     def __init__(
@@ -48,12 +49,14 @@ class GeometryAppearanceEncoder(nn.Module):
         geo_rank: int = 48,
         feature_role_split: bool = True,
         use_film: bool = True,
+        enable_vm: bool = True,
     ):
         super().__init__()
 
         self.hash_encoder = hash_encoder
         self.hash_dim = hash_encoder.n_output_dims   # H
         self.use_film = use_film
+        self.enable_vm = enable_vm                    # ← ablation bypass
 
         # VM geometry encoder (accepts raw xyz + aabb)
         self.geo_encoder = GeoEncoder(
@@ -191,8 +194,16 @@ class GeometryAppearanceEncoder(nn.Module):
         # Hash branch (high-freq appearance).  tcnn outputs fp16 → cast to fp32.
         hash_latent = self.hash_encoder(coordinates).float()
 
-        # VM branch (low-freq geometry, with built-in L∞ contraction)
-        geo_latent = self.geo_encoder(coordinates, aabb)
+        # VM branch bypass: when enable_vm=False, feed a zero geo_latent so
+        # FiLM generates identity modulation (scale=0, shift=0) and the encoder
+        # output degrades to pure hash features, keeping dims identical.
+        if self.enable_vm:
+            geo_latent = self.geo_encoder(coordinates, aabb)
+        else:
+            geo_latent = torch.zeros(
+                hash_latent.shape[0], self.geo_dim,
+                device=hash_latent.device, dtype=hash_latent.dtype,
+            )
 
         if self.feature_role_split:
             return self._forward_split(hash_latent, geo_latent)

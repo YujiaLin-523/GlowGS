@@ -71,42 +71,6 @@ def get_directory_size_bytes(root: str, verbose: bool = False):
     return total
 
 
-def _validate_encoder_artifacts(model_path: str, encoder_variant: str, iteration: int | None = None):
-    compression_dir = os.path.join(model_path, "compression")
-    vm_planes = os.path.join(compression_dir, "vm_planes_fp16.npz")
-    if not os.path.isdir(compression_dir):
-        return
-
-    # Prefer explicit iteration config if available
-    config_paths = []
-    if iteration is not None and iteration >= 0:
-        config_paths.append(os.path.join(compression_dir, f"iteration_{iteration}", "config.npz"))
-    else:
-        # Fall back to latest iteration_* folder if present
-        iter_dirs = [d for d in os.listdir(compression_dir) if d.startswith("iteration_")]
-        if iter_dirs:
-            try:
-                latest_iter = max(int(d.split("iteration_")[1]) for d in iter_dirs if d.split("iteration_")[-1].isdigit())
-                config_paths.append(os.path.join(compression_dir, f"iteration_{latest_iter}", "config.npz"))
-            except ValueError:
-                pass
-
-    for cfg_path in config_paths:
-        if os.path.isfile(cfg_path):
-            cfg = np.load(cfg_path)
-            saved_variant = cfg['encoder_variant'] if 'encoder_variant' in cfg else 'hybrid'
-            if saved_variant != encoder_variant:
-                raise RuntimeError(
-                    f"encoder_variant mismatch: artifacts={saved_variant}, requested={encoder_variant}, cfg_path={cfg_path}"
-                )
-            break
-
-    has_vm = os.path.isfile(vm_planes)
-    if encoder_variant == "hash_only" and has_vm:
-        raise RuntimeError(f"encoder_variant=hash_only but VM planes found at {vm_planes}; use hybrid or clean artifacts")
-    if encoder_variant == "hybrid" and not has_vm:
-        raise RuntimeError(f"encoder_variant=hybrid but VM planes missing at {vm_planes}; ensure run matches variant")
-
 # Enable TF32 tensor cores for faster matmul on Ampere+ GPUs
 try:
     torch.set_float32_matmul_precision('high')
@@ -176,10 +140,9 @@ def save_ablation_config(output_dir, dataset, opt, pipe):
     """Save ablation study configuration to YAML file for experiment tracking."""
     config = {
         'ablation_settings': {
-            # Additive ablation controls (A→B→C→D)
-            'feature_mod_type': getattr(dataset, 'feature_mod_type', 'film'),
-            'densification_mode': getattr(dataset, 'densification_mode', 'mass_aware'),
-            'use_edge_loss': getattr(dataset, 'use_edge_loss', True),
+            'enable_vm': getattr(dataset, 'enable_vm', True),
+            'enable_mass_aware': getattr(dataset, 'enable_mass_aware', True),
+            'enable_edge_loss': getattr(dataset, 'enable_edge_loss', True),
         },
         'training_hyperparameters': {
             'iterations': opt.iterations,
@@ -200,7 +163,6 @@ def save_ablation_config(output_dir, dataset, opt, pipe):
             'width': dataset.width,
             'depth': dataset.depth,
             'feature_role_split': dataset.feature_role_split,
-            'encoder_variant': getattr(dataset, 'encoder_variant', 'hybrid'),
             'geo_resolution': dataset.geo_resolution,
             'geo_rank': dataset.geo_rank,
             'geo_channels': dataset.geo_channels,
@@ -225,28 +187,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     debug_full_gap = pipe.debug_full_gap or os.getenv("DEBUG_FULL_GAP", "0") in {"1", "true", "True"}
     
     # ========================================================================
-    # Additive ablation controls (A→B→C→D)
-    # A: Concat (baseline) - naive feature fusion
-    # B: +FiLM - add FiLM modulation (geometry guides appearance)
-    # C: +MassAware - add mass-aware densification
-    # D: +EdgeLoss - add edge-aware gradient loss (full GlowGS)
+    # Three ablation switches (unified)
     # ========================================================================
-    feature_mod_type = getattr(dataset, 'feature_mod_type', 'film')  # 'concat' or 'film'
-    densification_mode = getattr(dataset, 'densification_mode', 'mass_aware')  # 'standard' or 'mass_aware'
-    use_edge_loss = getattr(dataset, 'use_edge_loss', True)
+    enable_vm = getattr(dataset, 'enable_vm', True)
+    enable_mass_aware = getattr(dataset, 'enable_mass_aware', True)
+    enable_edge_loss = getattr(dataset, 'enable_edge_loss', True)
     
-    encoder_variant = getattr(dataset, 'encoder_variant', 'hybrid')
-    
-    # Map edge loss setting
-    edge_loss_mode = 'cosine_edge' if use_edge_loss else 'none'
-    
-    # Map densification mode to internal strategy name
-    densify_strategy = 'feature_weighted' if densification_mode == 'mass_aware' else 'original_3dgs'
+    # Edge loss mode: cosine_edge when enabled, none when disabled
+    edge_loss_mode = 'cosine_edge' if enable_edge_loss else 'none'
 
-    _validate_encoder_artifacts(dataset.model_path, encoder_variant)
-    
-    # Store feature_mod_type in dataset for encoder to use
-    dataset.feature_mod_type = feature_mod_type
+    print(f"[CFG] enable_vm={enable_vm} | enable_mass_aware={enable_mass_aware} | enable_edge_loss={enable_edge_loss} | source=train_args")
     
     # Store edge_loss_mode in opt for consistent access
     opt.edge_loss_mode = edge_loss_mode
@@ -257,9 +207,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians = GaussianModel(
         dataset.sh_degree, dataset.hash_size, dataset.width, dataset.depth, 
         dataset.feature_role_split, dataset.geo_resolution, dataset.geo_rank, dataset.geo_channels,
-        encoder_variant=encoder_variant,
-        densify_strategy=densify_strategy,
-        feature_mod_type=feature_mod_type,
+        enable_vm=enable_vm,
+        enable_mass_aware=enable_mass_aware,
         mass_aware_scale=getattr(opt, 'mass_aware_scale', 0.1),
         enable_mass_gate=getattr(opt, 'enable_mass_gate', True),
         mass_gate_opacity_threshold=getattr(opt, 'mass_gate_opacity_threshold', 0.3),
@@ -375,22 +324,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     print("\n" + "=" * 90)
     print("  ABLATION STUDY CONFIGURATION")
     print("-" * 90)
-    print(f"  [GlowGS] feature_mod_type      : {feature_mod_type}")
-    print(f"  [GlowGS] densification_mode    : {densification_mode}")
-    print(f"  [GlowGS] use_edge_loss         : {use_edge_loss}")
+    print(f"  [GlowGS] enable_vm             : {enable_vm}")
+    print(f"  [GlowGS] enable_mass_aware     : {enable_mass_aware}")
+    print(f"  [GlowGS] enable_edge_loss      : {enable_edge_loss}")
     print("-" * 90)
     
-    # Derive variant label (Additive ablation study A→B→C→D)
-    if feature_mod_type == 'concat' and densification_mode == 'standard' and not use_edge_loss:
-        variant_label = "A: Concat (Baseline)"
-    elif feature_mod_type == 'film' and densification_mode == 'standard' and not use_edge_loss:
-        variant_label = "B: +FiLM Modulation"
-    elif feature_mod_type == 'film' and densification_mode == 'mass_aware' and not use_edge_loss:
-        variant_label = "C: +Mass-Aware Densify"
-    elif feature_mod_type == 'film' and densification_mode == 'mass_aware' and use_edge_loss:
-        variant_label = "D: Full GlowGS"
+    # Derive variant label
+    if enable_vm and enable_mass_aware and enable_edge_loss:
+        variant_label = "Full GlowGS"
+    elif not enable_vm and not enable_mass_aware and not enable_edge_loss:
+        variant_label = "Baseline (hash-only, no mass-aware, no edge loss)"
     else:
-        variant_label = "Custom"
+        parts = []
+        if enable_vm: parts.append("VM")
+        if enable_mass_aware: parts.append("MassAware")
+        if enable_edge_loss: parts.append("EdgeLoss")
+        variant_label = "Partial: " + "+".join(parts)
     
     print(f"  Variant              │  {variant_label}")
     print(f"  Max Gaussians        │  {getattr(opt, 'max_gaussians', 6_000_000):,}")
@@ -977,17 +926,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Extract scene name from source_path
             scene_name = os.path.basename(dataset.source_path.rstrip('/'))
             
-            # Determine method name from ECCV ablation config (A→B→C→D)
-            if feature_mod_type == 'concat' and densification_mode == 'standard' and not use_edge_loss:
-                method_name = "A_Concat"
-            elif feature_mod_type == 'film' and densification_mode == 'standard' and not use_edge_loss:
-                method_name = "B_FiLM"
-            elif feature_mod_type == 'film' and densification_mode == 'mass_aware' and not use_edge_loss:
-                method_name = "C_MassAware"
-            elif feature_mod_type == 'film' and densification_mode == 'mass_aware' and use_edge_loss:
-                method_name = "D_Full"
+            # Determine method name from ablation switches
+            if enable_vm and enable_mass_aware and enable_edge_loss:
+                method_name = "Full_GlowGS"
+            elif not enable_vm and not enable_mass_aware and not enable_edge_loss:
+                method_name = "Baseline"
             else:
-                method_name = "Custom"
+                parts = []
+                if enable_vm: parts.append("VM")
+                if enable_mass_aware: parts.append("Mass")
+                if enable_edge_loss: parts.append("Edge")
+                method_name = "_".join(parts)
             
             # Create stats dictionary
             stats = {
@@ -1002,9 +951,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 "fps": round(fps, 1) if fps is not None else None,
                 "num_gaussians": gaussians.get_xyz.shape[0],
                 "config": {
-                    "feature_mod_type": feature_mod_type,
-                    "densification_mode": densification_mode,
-                    "use_edge_loss": use_edge_loss,
+                    "enable_vm": enable_vm,
+                    "enable_mass_aware": enable_mass_aware,
+                    "enable_edge_loss": enable_edge_loss,
                 }
             }
             
@@ -1109,9 +1058,7 @@ if __name__ == "__main__":
     print("Optimizing " + args.model_path)
     sys.stderr.write(f"Loading scene for training: {args.model_path}...\n")
 
-    # TODO(stage1-task4): keep train/render/convert/fps consistent on encoder_variant for fair ablation
-    args.encoder_variant_source = "cli" if "--encoder_variant" in sys.argv else "default"
-    print(f"[INFO] encoder_variant={args.encoder_variant} (source={args.encoder_variant_source}) | model_dir={args.model_path} | iterations={args.iterations}")
+    print(f"[INFO] enable_vm={args.enable_vm} | enable_mass_aware={args.enable_mass_aware} | enable_edge_loss={args.enable_edge_loss} | model_dir={args.model_path} | iterations={args.iterations}")
 
     if args.verbose:
         os.environ["GLOWGS_VERBOSE"] = "1"
@@ -1123,7 +1070,6 @@ if __name__ == "__main__":
     # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     dataset = lp.extract(args)
-    dataset.encoder_variant_source = args.encoder_variant_source
     training(dataset, op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, measure_fps=not args.disable_fps)
 
     # All done

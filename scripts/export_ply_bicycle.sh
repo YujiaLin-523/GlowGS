@@ -32,22 +32,18 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# config_name|model_dir|encoder_variant|feature_mod_type|densification_mode|use_edge_loss
+# config_name|model_dir|enable_vm|enable_mass_aware|enable_edge_loss
 declare -a CONFIGS=(
-    "ours|output/legacy_output/bicycle|hybrid|film|mass_aware|True"
-    "wo_vm|output/bicycle_wo_vm|hash_only|film|mass_aware|True"
-    "wo_mass|output/bicycle_wo_mass|hybrid|film|standard|True"
-    "wo_edge|output/bicycle_wo_edge|hybrid|film|mass_aware|False"
+    "ours|output/legacy_output/bicycle|True|True|True"
+    "wo_vm|output/bicycle_wo_vm|False|True|True"
+    "wo_mass|output/bicycle_wo_mass|True|False|True"
+    "wo_edge|output/bicycle_wo_edge|True|True|False"
 )
 
 for entry in "${CONFIGS[@]}"; do
-    IFS='|' read -r name model_dir encoder mod densify edge <<< "$entry"
+    IFS='|' read -r name model_dir vm ma el <<< "$entry"
     ply_dir="$model_dir/point_cloud/iteration_${ITERATION}"
     ply_path="$ply_dir/point_cloud.ply"
-    vm_root="$model_dir/compression/vm_planes_fp16.npz"
-    vm_iter="$model_dir/compression/iteration_${ITERATION}/vm_planes_fp16.npz"
-    vm_grid="$model_dir/compression/iteration_${ITERATION}/grid_all.npz"
-
     echo "------------------------------------------------------------"
     echo "Config: $name"
     echo "Model: $model_dir"
@@ -58,34 +54,18 @@ for entry in "${CONFIGS[@]}"; do
         continue
     fi
 
-    # For hybrid runs, convert2ply expects vm_planes_fp16.npz under compression/.
-    # If missing, try to stage from iteration directory; if still missing, and grid_all exists,
-    # warn user to rebuild via grid_all (manual or helper script).
-    if [[ "$encoder" == "hybrid" && ! -f "$vm_root" ]]; then
-        if [[ -f "$vm_iter" ]]; then
-            echo "Staging VM planes to compression root for validator..."
-            cp "$vm_iter" "$vm_root"
-        else
-            echo "[WARN] VM planes missing: $vm_root and $vm_iter"
-            if [[ -f "$vm_grid" ]]; then
-                echo "        grid_all.npz is present; run the helper to rebuild vm_planes_fp16.npz from grid_all if needed."
-            fi
-        fi
-    fi
-
     mkdir -p "$ply_dir"
 
     cmd=(python convert2ply.py \
         -s data/360_v2/bicycle \
         -m "$model_dir" \
         --iteration "$ITERATION" \
-        --encoder_variant "$encoder" \
-        --feature_mod_type "$mod" \
-        --densification_mode "$densify" \
-        --use_edge_loss "$edge")
+        --enable_vm "$vm" \
+        --enable_mass_aware "$ma" \
+        --enable_edge_loss "$el")
 
-    echo "Running: CONVERT_SKIP_ENCODER_VALIDATION=1 ${cmd[*]}"
-    CONVERT_SKIP_ENCODER_VALIDATION=1 "${cmd[@]}"
+    echo "Running: ${cmd[*]}"
+    "${cmd[@]}"
     echo "Saved: $ply_path"
 
 done
