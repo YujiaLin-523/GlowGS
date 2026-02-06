@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-RGB + zoom + error + normal evidence chain for 3DGS vs GlowGS.
-This script saves every required subplot individually (no need to stitch).
+Save cropped Error maps and Depth maps (magma/black style) for two methods.
+
+Outputs:
+- <Method>_error.png           : Zoomed error crop (with colorbar)
+- <Method>_depth.png           : Full depth map, magma, no colorbar
+- <Method>_foliage.png         : Top-left foliage detail (depth), magma, no colorbar
+- <Method>_bench_noise.png     : Bottom-center bench detail (depth), magma, no colorbar
 """
 
 import os
@@ -9,40 +14,45 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
+import matplotlib
+import matplotlib.colors as mcolors
 import numpy as np
-from PIL import Image, ImageColor, ImageDraw, ImageFont
+from PIL import Image
 
 OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # -----------------------------------------------------------------------------
 # Input configuration (edit these paths and labels as needed)
 # -----------------------------------------------------------------------------
-GT_RGB_PATH: Optional[str] = "/home/ubuntu/lyj/Project/GlowGS/output/bicycle/test/ours_30000/gt/00000.png"  # e.g., "/path/to/gt.png"; if None, expect rgb_gt in NPZ
-ZOOM_BOX = (2200, 1450, 420, 420)  # (x, y, w, h) in pixel space of the full image
-ZOOM_SCALE = 4                     # ×4 or ×8 magnification label appears on zoomed patches
-RECT_COLOR = "#00A0FF"            # uniform zoom box color
-RECT_LINEWIDTH = 2.5
-ERROR_CMAP = "inferno"             # high contrast: black-red-yellow
-FIG_BG = "#FFFFFF"
+GT_RGB_PATH: Optional[str] = "/home/ubuntu/lyj/Project/GlowGS/output/legacy_output/bicycle/test/ours_30000/gt/00000.png"  # e.g., "/path/to/gt.png"; if None, expect rgb_gt in NPZ
+ERROR_CMAP = "inferno"             # Error map colormap (kept from previous style)
+# Depth colormap: mirror historical Ours_Depth (magma_r with black background)
+DEPTH_CMAP_NAME = "magma_r"
+
+# Error zoom box (pixel space of full image)
+ZOOM_BOX = (2200, 1450, 420, 420)   # (x, y, w, h)
+ZOOM_SCALE = 4
+
+# Detail crops (fractions of H/W to preserve original aspect)
+FOLIAGE_CROP = (0.0, 0.35, 0.0, 0.35)   # y0, y1, x0, x1 (fractions)
+BENCH_CROP = (0.60, 0.85, 0.30, 0.70)
+DETAIL_SCALE = 2  # Upscale detail crops for visibility
 
 
 @dataclass
 class MethodEntry:
     name: str
     npz_path: str
-    size_fps: str  # text shown on the RGB corner, e.g., "49 MB / 65 FPS"
 
 
 METHODS: List[MethodEntry] = [
     MethodEntry(
-        name="3DGS",
-        npz_path="/home/ubuntu/lyj/Project/gaussian-splatting/baseline_view0.npz",
-        size_fps="734 MB / 134 FPS",
+        name="Hash Only",
+        npz_path="/home/ubuntu/lyj/Project/GlowGS/bicycle_hash_only.npz",
     ),
     MethodEntry(
-        name="GlowGS",
+        name="Hash + VM",
         npz_path="/home/ubuntu/lyj/Project/GlowGS/ours_view0.npz",
-        size_fps="11 MB / 195 FPS",
     ),
 ]
 
@@ -83,15 +93,7 @@ def gamma_correct(img: np.ndarray, gamma: float = 2.2) -> np.ndarray:
     return np.power(np.clip(img, 0.0, 1.0), 1.0 / gamma)
 
 
-def prepare_normal(norm: Optional[np.ndarray]) -> Optional[np.ndarray]:
-    if norm is None:
-        return None
-    mapped = (np.asarray(norm, dtype=np.float32) + 1.0) / 2.0
-    mask_black = np.all(norm == 0.0, axis=-1, keepdims=True)
-    return np.where(mask_black, 0.0, mapped)
-
-
-def load_single_npz(path: str) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+def load_single_npz(path: str) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
     if not path or not os.path.isfile(path) or not path.endswith(".npz"):
         raise FileNotFoundError(f"NPZ missing: {path}")
     try:
@@ -101,9 +103,15 @@ def load_single_npz(path: str) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndar
 
     rgb = ensure_rgb(data["rgb"])
     depth = np.asarray(data.get("depth"), dtype=np.float32) if "depth" in data else None
-    norm = np.asarray(data.get("norm"), dtype=np.float32) if "norm" in data else None
     rgb_gt = ensure_rgb(data.get("rgb_gt")) if "rgb_gt" in data else None
-    return rgb, depth, norm, rgb_gt
+    return rgb, depth, rgb_gt
+
+
+def mask_depth(depth: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    if depth is None:
+        return None
+    depth = np.asarray(depth, dtype=np.float32)
+    return np.where(depth > 0, depth, np.nan)
 
 
 def load_gt_image(path: str, target_shape: Tuple[int, int]) -> np.ndarray:
@@ -113,97 +121,114 @@ def load_gt_image(path: str, target_shape: Tuple[int, int]) -> np.ndarray:
     return ensure_rgb(np.asarray(img))
 
 
-def crop(image: np.ndarray, box: Tuple[int, int, int, int]) -> np.ndarray:
+def crop_xywh(image: np.ndarray, box: Tuple[int, int, int, int]) -> np.ndarray:
     x, y, w, h = box
     h_img, w_img = image.shape[:2]
-    x0 = max(0, x)
-    y0 = max(0, y)
-    x1 = min(w_img, x + w)
-    y1 = min(h_img, y + h)
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(w_img, x + w), min(h_img, y + h)
     patch = image[y0:y1, x0:x1]
     if patch.size == 0:
         raise ValueError("Zoom box is outside the image bounds; adjust ZOOM_BOX.")
     return patch
 
 
+def crop_fraction(image: np.ndarray, frac_box: Tuple[float, float, float, float]) -> np.ndarray:
+    y0f, y1f, x0f, x1f = frac_box
+    h, w = image.shape[:2]
+    y0, y1 = int(h * y0f), int(h * y1f)
+    x0, x1 = int(w * x0f), int(w * x1f)
+    return image[y0:y1, x0:x1]
+
+
 def upscale_patch(patch: np.ndarray, scale: int) -> np.ndarray:
+    if scale <= 1:
+        return patch
     h, w = patch.shape[:2]
     new_size = (w * scale, h * scale)
-    return np.asarray(Image.fromarray((patch * 255).astype(np.uint8)).resize(new_size, resample=Image.BICUBIC)) / 255.0
+    safe = np.nan_to_num(patch, nan=0.0, posinf=0.0, neginf=0.0)
+    return np.asarray(Image.fromarray((safe * 255).astype(np.uint8)).resize(new_size, resample=Image.BICUBIC)) / 255.0
 
 
-def draw_box_on_rgb(rgb: np.ndarray, box: Tuple[int, int, int, int]) -> np.ndarray:
-    img = (rgb * 255).clip(0, 255).astype(np.uint8).copy()
-    x, y, w, h = box
-    t = max(1, int(round(RECT_LINEWIDTH)))
-    x0, y0 = max(0, x), max(0, y)
-    x1, y1 = min(img.shape[1], x + w), min(img.shape[0], y + h)
-    # Top and bottom edges
-    img[y0:y0 + t, x0:x1, :] = np.array(ImageColor.getrgb(RECT_COLOR), dtype=np.uint8)
-    img[y1 - t:y1, x0:x1, :] = np.array(ImageColor.getrgb(RECT_COLOR), dtype=np.uint8)
-    # Left and right edges
-    img[y0:y1, x0:x0 + t, :] = np.array(ImageColor.getrgb(RECT_COLOR), dtype=np.uint8)
-    img[y0:y1, x1 - t:x1, :] = np.array(ImageColor.getrgb(RECT_COLOR), dtype=np.uint8)
-    return img.astype(np.float32) / 255.0
-
-
-def annotate_rgb(rgb: np.ndarray, text: str) -> np.ndarray:
-    img = Image.fromarray((rgb * 255).clip(0, 255).astype(np.uint8))
-    draw = ImageDraw.Draw(img, mode="RGB")
-    try:
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 18)
-    except OSError:
-        font = ImageFont.load_default()
-    text_pos = (int(0.02 * img.width), int(0.05 * img.height))
-    padding = 4
-    bbox = draw.textbbox(text_pos, text, font=font)
-    bg_rect = (bbox[0] - padding, bbox[1] - padding, bbox[2] + padding, bbox[3] + padding)
-    draw.rectangle(bg_rect, fill=(0, 0, 0))
-    draw.text(text_pos, text, fill=(255, 255, 255), font=font)
-    return np.asarray(img).astype(np.float32) / 255.0
-
-
-def save_with_colorbar(img: np.ndarray, vmin: int, vmax: int, label: str, path: str, cmap) -> None:
-    """Save error map with inset colorbar in lower-right corner."""
+def save_map_with_colorbar(img: np.ndarray, vmin: float, vmax: float, label: str, path: str, cmap: str) -> None:
+    """Save map (error) with inset colorbar in lower-right corner."""
     from mpl_toolkits.axes_grid1.inset_locator import inset_axes
     import matplotlib.font_manager as fm
-    
+
     h, w = img.shape[:2]
-    fig, ax = plt.subplots(figsize=(w / 200, h / 200), dpi=200)
+    fig, ax = plt.subplots(figsize=(w / 200, h / 200), dpi=200, facecolor="black")
     fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
     im = ax.imshow(img, vmin=vmin, vmax=vmax, cmap=cmap)
     ax.set_axis_off()
     ax.set_position([0, 0, 1, 1])  # Fill entire figure
-    
-    # Inset colorbar in lower-right corner (vertical, 40% height)
+
     axins = inset_axes(
         ax,
         width="5%",
         height="40%",
         loc="lower right",
-        borderpad=3.0,  # Increased to shift colorbar left
+        borderpad=3.0,
     )
-    
-    cbar = fig.colorbar(im, cax=axins, orientation="vertical", ticks=[vmin, vmax])
-    
-    # Remove tick marks (length=0)
+
+    fig.colorbar(im, cax=axins, orientation="vertical", ticks=[vmin, vmax])
     axins.tick_params(axis="y", which="both", length=0)
-    
-    # Font: DejaVu Sans bold white (cross-platform compatible)
+
     font_props = fm.FontProperties(family="DejaVu Sans", weight="bold", size=10)
-    
-    # Set tick labels
-    axins.set_yticklabels(["0", "1"], fontproperties=font_props, color="white")
-    
-    # Title (MAE) above colorbar
-    axins.set_title("MAE", fontproperties=font_props, color="white", pad=4)
-    
-    # Thin white border around colorbar
+
+    if vmax >= 1:
+        labels = [f"{vmin:.0f}", f"{vmax:.0f}"]
+    else:
+        labels = [f"{vmin:.1f}", f"{vmax:.1f}"]
+    axins.set_yticklabels(labels, fontproperties=font_props, color="white")
+
+    axins.set_title(label, fontproperties=font_props, color="white", pad=4)
+
     for spine in axins.spines.values():
         spine.set_edgecolor("white")
         spine.set_linewidth(0.5)
-    
-    fig.savefig(path, dpi=300, pad_inches=0)
+
+    fig.savefig(path, dpi=300, pad_inches=0, bbox_inches="tight", facecolor="black", edgecolor="none")
+    plt.close(fig)
+
+
+def save_map_plain(img: np.ndarray, vmin: float, vmax: float, path: str, cmap_name: str) -> None:
+    """Save map without colorbar/axes on black background."""
+    h, w = img.shape[:2]
+    fig_w = w / 400
+    fig_h = h / 400
+    cmap = matplotlib.colormaps.get_cmap(cmap_name).copy()
+    cmap.set_bad(color="black")
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor="black", dpi=200)
+    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+    ax.imshow(img, vmin=vmin, vmax=vmax, cmap=cmap)
+    ax.axis("off")
+    ax.set_position([0, 0, 1, 1])
+    fig.savefig(path, dpi=300, pad_inches=0, bbox_inches="tight", facecolor="black", edgecolor="none")
+    plt.close(fig)
+
+
+def depth_to_rgb(depth_vis: np.ndarray, vmin: float, vmax: float, cmap_name: str) -> np.ndarray:
+    """Map depth (with NaNs) to RGB using shared vmin/vmax and black for invalid."""
+    norm = mcolors.Normalize(vmin=vmin, vmax=vmax, clip=True)
+    cmap = matplotlib.colormaps.get_cmap(cmap_name)
+    h, w = depth_vis.shape[:2]
+    rgb = np.zeros((h, w, 3), dtype=np.float32)
+    mask = np.isfinite(depth_vis)
+    if mask.any():
+        rgb[mask] = cmap(norm(depth_vis[mask]))[:, :3]
+    return rgb
+
+
+def save_rgb_plain(rgb: np.ndarray, path: str) -> None:
+    """Save RGB image (0-1) on black background without axes/colorbar."""
+    h, w = rgb.shape[:2]
+    fig_w = w / 400
+    fig_h = h / 400
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor="black", dpi=200)
+    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+    ax.imshow(rgb, vmin=0.0, vmax=1.0)
+    ax.axis("off")
+    ax.set_position([0, 0, 1, 1])
+    fig.savefig(path, dpi=300, pad_inches=0, bbox_inches="tight", facecolor="black", edgecolor="none")
     plt.close(fig)
 
 
@@ -214,15 +239,14 @@ def main() -> None:
     gt_rgb: Optional[np.ndarray] = None
 
     for entry in METHODS:
-        rgb, depth, norm, rgb_gt = load_single_npz(entry.npz_path)
+        rgb, depth, rgb_gt = load_single_npz(entry.npz_path)
         rgb = gamma_correct(rgb)
-        norm = prepare_normal(norm)
+        depth_masked = mask_depth(depth)
         records.append({
             "name": entry.name,
-            "size_fps": entry.size_fps,
             "rgb": rgb,
             "depth": depth,
-            "norm": norm,
+            "depth_vis": depth_masked,
         })
         if gt_rgb is None and rgb_gt is not None:
             gt_rgb = gamma_correct(rgb_gt)
@@ -233,75 +257,69 @@ def main() -> None:
         gt_rgb = load_gt_image(GT_RGB_PATH, target_shape=records[0]["rgb"].shape[:2])
         gt_rgb = gamma_correct(gt_rgb)
 
-    # Shared error range across methods
+    # Compute error maps for all methods
     error_maps = []
     for rec in records:
         error = np.mean(np.abs(rec["rgb"] - gt_rgb), axis=-1)
         error_maps.append(error)
+
+    # Shared error range across methods
     stacked_errors = np.concatenate([e.flatten() for e in error_maps])
     vmax_err = np.percentile(stacked_errors, 99.5)
     vmax_err = max(vmax_err, 1e-4)
 
-    # Save per-method subplots
+    # Shared depth range across methods (valid depths), match historical 2-98 percentiles
+    depth_values = []
+    for rec in records:
+        if rec["depth_vis"] is not None:
+            valid_depth = rec["depth_vis"][np.isfinite(rec["depth_vis"])]
+            if valid_depth.size > 0:
+                depth_values.append(valid_depth)
+    if depth_values:
+        all_depths = np.concatenate(depth_values)
+        vmin_depth = np.percentile(all_depths, 2)
+        vmax_depth = np.percentile(all_depths, 98)
+        if vmin_depth == vmax_depth:
+            vmax_depth = vmin_depth + 1e-6
+    else:
+        vmin_depth, vmax_depth = 0, 1
+
+    # Save per-method outputs
     for rec, error in zip(records, error_maps):
         name = rec["name"]
-        rgb = rec["rgb"]
-        norm = rec["norm"]
+        depth = rec["depth"]
+        depth_vis = rec["depth_vis"]
 
-        boxed = draw_box_on_rgb(rgb, ZOOM_BOX)
-        boxed = annotate_rgb(boxed, rec["size_fps"])
-        # plt.imsave(os.path.join(OUTPUT_DIR, f"{name}_rgb_full.png"), boxed)
-
-        zoom_rgb = crop(rgb, ZOOM_BOX)
-        zoom_rgb = upscale_patch(zoom_rgb, ZOOM_SCALE)
-        zoom_fig, zoom_ax = plt.subplots(figsize=(zoom_rgb.shape[1] / 200, zoom_rgb.shape[0] / 200), dpi=200)
-        zoom_ax.imshow(zoom_rgb)
-        zoom_ax.text(0.02, 0.95, f"×{ZOOM_SCALE}", color="white", fontsize=12, fontweight="bold", transform=zoom_ax.transAxes, bbox=dict(facecolor="black", alpha=0.65, pad=3, edgecolor="none"), va="top")
-        zoom_ax.axis("off")
-        zoom_fig.tight_layout(pad=0)
-        # zoom_fig.savefig(os.path.join(OUTPUT_DIR, f"{name}_zoom_rgb.png"), bbox_inches="tight", dpi=300, facecolor=FIG_BG)
-        plt.close(zoom_fig)
-
-        zoom_err = crop(error, ZOOM_BOX)
+        # 1) Cropped error (zoom) with colorbar
+        zoom_err = crop_xywh(error, ZOOM_BOX)
         zoom_err = upscale_patch(zoom_err, ZOOM_SCALE)
-        save_with_colorbar(zoom_err, vmin=0, vmax=int(vmax_err), label="Error", path=os.path.join(OUTPUT_DIR, f"{name}_error.png"), cmap=ERROR_CMAP)
+        err_path = os.path.join(OUTPUT_DIR, f"{name}_error.png")
+        save_map_with_colorbar(
+            zoom_err,
+            vmin=0.0,
+            vmax=vmax_err,
+            label="MAE",
+            path=err_path,
+            cmap=ERROR_CMAP,
+        )
 
-        if norm is None:
-            raise ValueError(f"Missing normals for {name}; required for geometry evidence.")
-        norm_patch = crop(norm, ZOOM_BOX)
-        norm_patch = upscale_patch(norm_patch, ZOOM_SCALE)
-        norm_fig, norm_ax = plt.subplots(figsize=(norm_patch.shape[1] / 200, norm_patch.shape[0] / 200), dpi=200)
-        norm_ax.imshow(norm_patch)
-        norm_ax.axis("off")
-        norm_ax.set_title("Normal")
-        norm_fig.tight_layout(pad=0)
-        # norm_fig.savefig(os.path.join(OUTPUT_DIR, f"{name}_normal.png"), bbox_inches="tight", dpi=300, facecolor=FIG_BG)
-        plt.close(norm_fig)
+        # 2) Full depth map (magma, black, no colorbar)
+        if depth_vis is not None:
+            depth_rgb = depth_to_rgb(depth_vis, vmin_depth, vmax_depth, DEPTH_CMAP_NAME)
 
-    # Optional combined grid for quick sanity check
-    fig, axes = plt.subplots(2, 4, figsize=(12, 6), facecolor=FIG_BG)
-    col_titles = ["RGB", "Zoom", "", "Normal"]
-    for c, title in enumerate(col_titles):
-        if title:
-            axes[0, c].set_title(title)
+            depth_path = os.path.join(OUTPUT_DIR, f"{name.replace(' ', '_')}_depth.png")
+            save_rgb_plain(depth_rgb, depth_path)
 
-    for r, rec in enumerate(records):
-        axes[r, 0].imshow(draw_box_on_rgb(rec["rgb"], ZOOM_BOX))
-        axes[r, 0].axis("off")
-        axes[r, 0].text(-0.06, 0.5, rec["name"], transform=axes[r, 0].transAxes, fontsize=12, fontweight="bold", va="center", ha="right")
+            # 3) Detail crops (foliage and bench), saved per method from RGB depth
+            for tag, frac in [("foliage", FOLIAGE_CROP), ("bench_noise", BENCH_CROP)]:
+                detail = crop_fraction(depth_rgb, frac)
+                detail = upscale_patch(detail, DETAIL_SCALE)
+                detail_path = os.path.join(OUTPUT_DIR, f"{name}_{tag}.png")
+                save_rgb_plain(detail, detail_path)
+        else:
+            print(f"Warning: No depth data for {rec['name']}")
 
-        axes[r, 1].imshow(upscale_patch(crop(rec["rgb"], ZOOM_BOX), ZOOM_SCALE))
-        axes[r, 1].axis("off")
-
-        axes[r, 2].imshow(upscale_patch(crop(error_maps[r], ZOOM_BOX), ZOOM_SCALE), vmin=0.0, vmax=vmax_err, cmap=ERROR_CMAP)
-        axes[r, 2].axis("off")
-
-        axes[r, 3].imshow(upscale_patch(crop(records[r]["norm"], ZOOM_BOX), ZOOM_SCALE))
-        axes[r, 3].axis("off")
-
-    fig.tight_layout(pad=0.3, w_pad=0.2, h_pad=0.2)
-    fig.savefig(os.path.join(OUTPUT_DIR, "figure_2_geo_quickgrid.png"), dpi=300, bbox_inches="tight", facecolor=FIG_BG)
-    plt.close(fig)
+    print(f"\nAll images saved to: {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":

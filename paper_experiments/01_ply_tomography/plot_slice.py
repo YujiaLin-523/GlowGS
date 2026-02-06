@@ -15,9 +15,9 @@ from plyfile import PlyData
 # ----------------------------------------------------------------------------- 
 # Data locations
 # -----------------------------------------------------------------------------
-BASELINE_PLY = "/home/ubuntu/lyj/Project/gaussian-splatting/output/bicycle/point_cloud/iteration_30000/point_cloud.ply"
-OURS_PLY = "/home/ubuntu/lyj/Project/GlowGS/output/legacy_output/bicycle/point_cloud/iteration_30000/point_cloud.ply"
-OUTPUT_DIR = "./paper_experiments/01_ply_tomography/"
+BASELINE_PLY = "output/bicycle_hash_only/point_cloud/iteration_30000/point_cloud.ply"
+OURS_PLY = "output/legacy_output/bicycle/point_cloud/iteration_30000/point_cloud.ply"
+OUTPUT_DIR = "./paper_experiments/01_ply_tomography_vm/"
 
 # ----------------------------------------------------------------------------- 
 # Visualization configuration

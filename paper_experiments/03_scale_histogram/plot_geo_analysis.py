@@ -19,9 +19,9 @@ plt.rcParams.update({
     "figure.dpi": 300,
 })
 
-PATH_BASELINE = "/home/ubuntu/lyj/Project/gaussian-splatting/output/bicycle/point_cloud/iteration_30000/point_cloud.ply"
-PATH_OURS = "/home/ubuntu/lyj/Project/GlowGS/output/legacy_output/bicycle/point_cloud/iteration_30000/point_cloud.ply"
-OUTPUT_DIR = "./paper_experiments/03_scale_histogram"
+PATH_BASELINE = "output/bicycle_hash_only/point_cloud/iteration_30000/point_cloud.ply"
+PATH_OURS = "output/legacy_output/bicycle/point_cloud/iteration_30000/point_cloud.ply"
+OUTPUT_DIR = "./paper_experiments/03_scale_histogram_vm"
 
 def load_data(path):
     ply = PlyData.read(path)
@@ -136,8 +136,8 @@ def main():
         # 只画前 10cm
         mask_b = res_b_plot[0] < 0.1
         mask_o = res_o_plot[0] < 0.1
-        ax1.plot(res_b_plot[0][mask_b], res_b_plot[1][mask_b], color=COLOR_3DGS, lw=2.5, label='3DGS')
-        ax1.plot(res_o_plot[0][mask_o], res_o_plot[1][mask_o], color=COLOR_OURS, lw=2.5, label='Ours')
+        ax1.plot(res_b_plot[0][mask_b], res_b_plot[1][mask_b], color=COLOR_3DGS, lw=2.5, label='Hash Only')
+        ax1.plot(res_o_plot[0][mask_o], res_o_plot[1][mask_o], color=COLOR_OURS, lw=2.5, label='Hash + VM')
     
     ax1.set_xlabel("Depth along ray (m)", fontweight='bold', fontsize=12)
     ax1.set_ylabel("Accumulated Opacity", fontweight='bold', fontsize=12)
@@ -193,7 +193,7 @@ def main():
 
     # --- 右图：小提琴图 (Violin Plot) ---
     data = [thick_b, thick_o, thick_b_tail, thick_o_tail]
-    labels = ["3DGS", "Ours", "3DGS\nTail", "Ours\nTail"]
+    labels = ["Hash Only", "Hash + VM", "Hash Only\nTail", "Hash + VM\nTail"]
     positions = [1, 2, 3.5, 4.5]  # 增加间距，更清晰
     colors = ["#FF7F0E", "#D62728", "#9467BD", "#1F77B4"]  # 橙、红、紫、蓝
     

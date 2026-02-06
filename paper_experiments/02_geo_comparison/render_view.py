@@ -8,9 +8,9 @@ from plyfile import PlyData
 # ==============================================================================
 # 🔴 必填配置 (请确认路径)
 # ==============================================================================
-PLY_PATH = "/home/ubuntu/lyj/Project/GlowGS/output/bicycle/point_cloud/iteration_30000/point_cloud.ply"
-SOURCE_PATH = "/home/ubuntu/lyj/Project/GlowGS/data/360_v2/bicycle"
-OUTPUT_FILENAME = "ours_view0.npz"
+PLY_PATH = "output/truck_hash_only/point_cloud/iteration_30000/point_cloud.ply"
+SOURCE_PATH = "data/tandt/truck"
+OUTPUT_FILENAME = "truck_hash_only.npz"
 
 # 渲染参数
 SPLAT_SCALE = 5.0    # 稍微放大一点点，填补缝隙

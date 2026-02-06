@@ -20,9 +20,9 @@ plt.rcParams.update({
     "figure.dpi": 300,
 })
 
-PATH_BASELINE = "/home/ubuntu/lyj/Project/gaussian-splatting/output/bicycle/point_cloud/iteration_30000/point_cloud.ply"
-PATH_OURS = "/home/ubuntu/lyj/Project/GlowGS/output/legacy_output/bicycle/point_cloud/iteration_30000/point_cloud.ply"
-OUTPUT_DIR = "./paper_experiments/03_scale_histogram"
+PATH_BASELINE = "output/bicycle_hash_only/point_cloud/iteration_30000/point_cloud.ply"
+PATH_OURS = "output/legacy_output/bicycle/point_cloud/iteration_30000/point_cloud.ply"
+OUTPUT_DIR = "./paper_experiments/03_scale_histogram_vm"
 
 def load_data(path):
     ply = PlyData.read(path)
@@ -44,8 +44,8 @@ def plot_fig5_layout_fix(op_base, op_ours):
     # --- 左图：直方图 ---
     bins = np.linspace(0, 1.0, 50)
     # 线条加粗，颜色加深
-    ax1.hist(op_base, bins=bins, color=COLOR_BASE, histtype="step", lw=2.5, zorder=2, label="3DGS")
-    ax1.hist(op_ours, bins=bins, color=COLOR_OURS, histtype="step", lw=3.0, zorder=3, label="Ours")
+    ax1.hist(op_base, bins=bins, color=COLOR_BASE, histtype="step", lw=2.5, zorder=2, label="Hash Only")
+    ax1.hist(op_ours, bins=bins, color=COLOR_OURS, histtype="step", lw=3.0, zorder=3, label="Hash + VM")
     # 填充极淡的颜色增加层次
     ax1.hist(op_base, bins=bins, color=COLOR_BASE, alpha=0.1, histtype="stepfilled", zorder=1)
     ax1.hist(op_ours, bins=bins, color=COLOR_OURS, alpha=0.1, histtype="stepfilled", zorder=1)
@@ -72,8 +72,8 @@ def plot_fig5_layout_fix(op_base, op_ours):
     x = np.arange(2)
     width = 0.35
     
-    bars_b = ax2.bar(x - width/2, vals_b, width, color=COLOR_BASE, alpha=0.9, label='3DGS')
-    bars_o = ax2.bar(x + width/2, vals_o, width, color=COLOR_OURS, alpha=0.9, label='Ours')
+    bars_b = ax2.bar(x - width/2, vals_b, width, color=COLOR_BASE, alpha=0.9, label='Hash Only')
+    bars_o = ax2.bar(x + width/2, vals_o, width, color=COLOR_OURS, alpha=0.9, label='Hash + VM')
 
     # 标数值
     for rect in bars_b + bars_o:

@@ -13,15 +13,15 @@ CONFIG = {
     "bubble_max": 2800,
 }
 
-# 顶刊配色 (保持不变)
+# Muted 统一色板
 COLORS = {
-    "Ours":     "#D62728",
-    "3DGS":     "#FF7F0E",
-    "Scaffold": "#1F77B4",
-    "Mip":      "#9467BD",
-    "Compact":  "#17BECF",
-    "Light":    "#2CA02C",
-    "HAC":      "#7F7F7F", 
+    "Ours":     "#F09496",   # Muted Brick Red
+    "3DGS":     "#7F7F7F",   # Neutral Gray
+    "Scaffold": "#5F97C6",   # Muted Blue
+    "Mip":      "#9C9BE9",   # Muted Purple
+    "Compact":  "#7BC8C8",   # Muted Teal
+    "Light":    "#AFC778",   # Muted Green
+    "HAC":      "#D4A76A",   # Muted Amber
 }
 
 plt.rcParams.update({
