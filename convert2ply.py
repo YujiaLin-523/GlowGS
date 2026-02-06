@@ -29,7 +29,6 @@ def convert(dataset : ModelParams, iteration : int):
             dataset.hash_size,
             dataset.width,
             dataset.depth,
-            dataset.feature_role_split,
             dataset.geo_resolution,
             dataset.geo_rank,
             dataset.geo_channels,

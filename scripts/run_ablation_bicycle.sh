@@ -13,7 +13,7 @@
 #   - 3DGS:         /home/ubuntu/lyj/Project/gaussian-splatting/output/bicycle/
 #
 # Output Structure:
-#   output/bicycle_wo_vm/              # w/o VM (hash_only encoder)
+#   output/bicycle_wo_vm/              # w/o VM (enable_vm=False, hash-only bypass)
 #   output/bicycle_wo_mass/            # w/o Mass-aware
 #   output/bicycle_wo_edge/            # w/o Edge Loss
 #

@@ -43,8 +43,8 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         enable_mass_aware = getattr(dataset, 'enable_mass_aware', True)
 
         gaussians = GaussianModel(
-            dataset.sh_degree, dataset.hash_size, dataset.width, dataset.depth, 
-            dataset.feature_role_split, dataset.geo_resolution, dataset.geo_rank, dataset.geo_channels,
+            dataset.sh_degree, dataset.hash_size, dataset.width, dataset.depth,
+            dataset.geo_resolution, dataset.geo_rank, dataset.geo_channels,
             enable_vm=enable_vm,
             enable_mass_aware=enable_mass_aware,
         )

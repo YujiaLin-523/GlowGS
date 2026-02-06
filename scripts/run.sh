@@ -1,6 +1,6 @@
 #!/bin/bash
 # Full training pipeline with GeometryAppearanceEncoder
-# Uses --feature_role_split for geometry/appearance feature disentanglement
+# Uses for geometry/appearance feature disentanglement
 
 SCENE_LIST="bonsai counter kitchen room bicycle garden stump flowers treehill"
 
@@ -12,8 +12,8 @@ do
         FACTOR=4
     fi
     
-    echo python train.py -s data/360_v2/${SCENE} -i images_${FACTOR} --eval --lambda_mask 0.004 --pcd_path output/${SCENE}/nerfacto/run/point_cloud.ply --feature_role_split
-    python train.py -s data/360_v2/${SCENE} -i images_${FACTOR} -m output/${SCENE} --eval --lambda_mask 0.004 --pcd_path output/${SCENE}/nerfacto/run/point_cloud.ply --feature_role_split
+    echo python train.py -s data/360_v2/${SCENE} -i images_${FACTOR} --eval --lambda_mask 0.004 --pcd_path output/${SCENE}/nerfacto/run/point_cloud.ply
+    python train.py -s data/360_v2/${SCENE} -i images_${FACTOR} -m output/${SCENE} --eval --lambda_mask 0.004 --pcd_path output/${SCENE}/nerfacto/run/point_cloud.ply
 
     echo python render.py -s data/360_v2/${SCENE} -m output/${SCENE}
     python render.py -s data/360_v2/${SCENE} -m output/${SCENE}
@@ -26,8 +26,8 @@ SCENE_LIST="train truck"
 
 for SCENE in $SCENE_LIST;
 do
-    echo python train.py -s data/tandt/${SCENE} --eval --lambda_mask 0.004 --pcd_path output/${SCENE}/nerfacto/run/point_cloud.ply --feature_role_split
-    python train.py -s data/tandt/${SCENE} -m output/${SCENE} --eval --lambda_mask 0.004 --pcd_path output/${SCENE}/nerfacto/run/point_cloud.ply --feature_role_split
+    echo python train.py -s data/tandt/${SCENE} --eval --lambda_mask 0.004 --pcd_path output/${SCENE}/nerfacto/run/point_cloud.ply
+    python train.py -s data/tandt/${SCENE} -m output/${SCENE} --eval --lambda_mask 0.004 --pcd_path output/${SCENE}/nerfacto/run/point_cloud.ply
 
     echo python render.py -s data/tandt/${SCENE} -m output/${SCENE}
     python render.py -s data/tandt/${SCENE} -m output/${SCENE}
@@ -40,8 +40,8 @@ SCENE_LIST="drjohnson playroom"
 
 for SCENE in $SCENE_LIST;
 do
-    echo python train.py -s data/db/${SCENE} --eval --lambda_mask 0.004 --pcd_path output/${SCENE}/nerfacto/run/point_cloud.ply --feature_role_split
-    python train.py -s data/db/${SCENE} -m output/${SCENE} --eval --lambda_mask 0.004 --pcd_path output/${SCENE}/nerfacto/run/point_cloud.ply --feature_role_split
+    echo python train.py -s data/db/${SCENE} --eval --lambda_mask 0.004 --pcd_path output/${SCENE}/nerfacto/run/point_cloud.ply
+    python train.py -s data/db/${SCENE} -m output/${SCENE} --eval --lambda_mask 0.004 --pcd_path output/${SCENE}/nerfacto/run/point_cloud.ply
 
     echo python render.py -s data/db/${SCENE} -m output/${SCENE}
     python render.py -s data/db/${SCENE} -m output/${SCENE}

@@ -2,21 +2,21 @@
 Feature Encoders for GlowGS
 
 Provides geometry-appearance dual-branch encoding for 3D Gaussian Splatting:
-- GeoEncoder: Geometry encoder using tri-plane factorization
-- GeometryAppearanceEncoder: Dual-branch with explicit feature role split
-- encoder_factory: Unified interface for ablation studies
+- vm_encoder.GeoEncoder:  VM (Vector-Matrix) tri-plane geometry encoder
+- hybrid_encoder.GeometryAppearanceEncoder:  Hash + VM + FiLM hybrid encoder
+- factory:  Unified creation with ``enable_vm`` ablation switch
 
 Author: GlowGS Project
 License: See LICENSE.md
 """
 
-from .geo_encoder import GeoEncoder
-from .geometry_appearance_encoder import GeometryAppearanceEncoder
-from .encoder_factory import create_gaussian_encoder, get_encoder_output_dims
+from .vm_encoder import GeoEncoder
+from .hybrid_encoder import GeometryAppearanceEncoder
+from .factory import create_gaussian_encoder, get_encoder_output_dims
 
 __all__ = [
-    'GeoEncoder', 
+    'GeoEncoder',
     'GeometryAppearanceEncoder',
     'create_gaussian_encoder',
-    'get_encoder_output_dims'
+    'get_encoder_output_dims',
 ]

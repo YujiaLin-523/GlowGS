@@ -1,6 +1,6 @@
 #!/bin/bash
 # 360_v2 dataset training script with GeometryAppearanceEncoder
-# Uses --feature_role_split for geometry/appearance feature disentanglement
+# Feature role split is now always-on (geometry/appearance disentanglement via FiLM)
 
 # bicycle
 python train.py \

@@ -135,57 +135,32 @@ class GaussianModel:
         self._opacity_head = tcnn.Network(n_input_dims=self._grid.n_output_dims, n_output_dims=1, network_config=self.network_config)
         
         self._aabb = torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], dtype=torch.float, device='cuda')
-        # Lightweight projection layers for feature_role_split path
-        # Map geometry_latent/appearance_latent (C_shared + C_role) to head input dim (C_shared)
-        # Only used when encoder variant supports role split (hybrid with feature_role_split=True)
+
+        # Verify encoder output dimensions match head input requirements
         base_dim, geometry_dim, appearance_dim = get_encoder_output_dims(self._grid)
-        print(f"[EncoderDims] enable_vm={self._enable_vm} role_split={self._feature_role_split} base_dim={base_dim} geometry_dim={geometry_dim} appearance_dim={appearance_dim}")
-        # TODO(stage1-task3): if feature_role_split enabled, print (geometry_dim, appearance_dim, fused_dim) and assert downstream expectations
-        if self._feature_role_split:
-            if geometry_dim != base_dim or appearance_dim != base_dim:
-                raise ValueError(
-                    f"Role-split dims mismatch: base_dim={base_dim}, geometry_dim={geometry_dim}, appearance_dim={appearance_dim}"
-                )
-        
-        if geometry_dim != base_dim:  # Role split is active
-            # Projection for geometry heads (scale, rotation, opacity)
-            self._geometry_input_proj = nn.Linear(geometry_dim, base_dim, bias=True).cuda()
-            # Projection for appearance head (SH)
-            self._appearance_input_proj = nn.Linear(appearance_dim, base_dim, bias=True).cuda()
-            nn.init.normal_(self._geometry_input_proj.weight, std=0.01)
-            nn.init.zeros_(self._geometry_input_proj.bias)
-            nn.init.normal_(self._appearance_input_proj.weight, std=0.01)
-            nn.init.zeros_(self._appearance_input_proj.bias)
-            # Mark as role-split mode for update_attributes
-            self._use_role_split = True
-        else:
-            # Fused latent mode: no separate projections needed
-            self._geometry_input_proj = None
-            self._appearance_input_proj = None
-            self._use_role_split = False
+        assert geometry_dim == base_dim and appearance_dim == base_dim, (
+            f"Encoder dim mismatch: base={base_dim}, geo={geometry_dim}, app={appearance_dim}. "
+            f"All three must be equal for direct head feeding."
+        )
+        print(f"[EncoderDims] enable_vm={self._enable_vm} base_dim={base_dim} "
+              f"geometry_dim={geometry_dim} appearance_dim={appearance_dim}")
+
         self._rotation_init = torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float, device='cuda')
         self._opacity_init = torch.tensor([[np.log(0.1 / (1 - 0.1))]], dtype=torch.float, device='cuda')
 
-    def __init__(self, sh_degree: int, hash_size=19, width=64, depth=2, feature_role_split=True,
+    def __init__(self, sh_degree: int, hash_size=19, width=64, depth=2,
                  geo_resolution=128, geo_rank=48, geo_channels=32,
                  enable_vm: bool = True,
                  enable_mass_aware: bool = True,
                  mass_aware_scale: float = 0.1,
                  enable_mass_gate: bool = True,
                  mass_gate_opacity_threshold: float = 0.3,
-                 mass_gate_radius_percentile: float = 80.0,
-                 # Legacy kwargs accepted but ignored (backward compat)
-                 encoder_variant: str | None = None,
-                 densify_strategy: str | None = None,
-                 feature_mod_type: str | None = None,
-                 mass_aware: bool | None = None):
+                 mass_gate_radius_percentile: float = 80.0):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree
         # ── Ablation switches ──
         self._enable_vm = enable_vm
-        # Accept legacy 'mass_aware' kwarg for backward compat
-        self._enable_mass_aware = enable_mass_aware if mass_aware is None else mass_aware
-        self._feature_role_split = feature_role_split
+        self._enable_mass_aware = enable_mass_aware
         # Mass-aware gradient weighting scale (xi): higher = stronger pruning, lower = softer
         self._mass_aware_scale = mass_aware_scale
         # Mass Gate parameters (GlowGS innovation: block large & transparent from clone/split)
@@ -441,99 +416,41 @@ class GaussianModel:
         raw_xyz = self.get_xyz.detach()
 
         # Optimize chunk size: use larger chunks or process all at once if memory allows
-        # For better GPU utilization, try to process in fewer, larger chunks
-        chunk_size = min(131072, N) if N > 65536 else N  # Process all at once if < 65k, else use 128k chunks
+        chunk_size = min(131072, N) if N > 65536 else N
 
-        if self._use_role_split:
-            # Collect outputs to avoid in-place writes that may invalidate autograd versions
-            opacity_chunks = []
-            scaling_chunks = []
-            rotation_chunks = []
-            features_rest_chunks = [] if self.max_sh_degree > 0 else None
+        # Feature role split routing:
+        #   geometry_latent  → geometry heads (opacity, scaling, rotation)
+        #   appearance_latent → appearance head (SH/color features_rest)
+        opacity_chunks = []
+        scaling_chunks = []
+        rotation_chunks = []
+        features_rest_chunks = [] if self.max_sh_degree > 0 else None
 
-            for i in range(0, N, chunk_size):
-                end_idx = min(i + chunk_size, N)
-                coords = raw_xyz[i: end_idx]
-                encoder_out = self._grid(coords, self._aabb)
+        for i in range(0, N, chunk_size):
+            end_idx = min(i + chunk_size, N)
+            coords = raw_xyz[i:end_idx]
+            geometry_latent, appearance_latent = self._grid(coords, self._aabb)
 
-                # Support both 2-tuple legacy and 3-tuple new encoder outputs
-                if isinstance(encoder_out, tuple):
-                    if len(encoder_out) == 3:
-                        shared_chunk, geometry_chunk, appearance_chunk = encoder_out
-                    elif len(encoder_out) == 2:
-                        geometry_chunk, appearance_chunk = encoder_out
-                        shared_chunk = geometry_chunk
-                else:
-                    # Unexpected fused output; treat as fused latent
-                    fused = encoder_out
-                    fused = torch.clamp(fused, -10.0, 10.0)
-                    try:
-                        self._opacity[i:end_idx] = self._opacity_head(fused) + self._opacity_init
-                        self._scaling[i:end_idx] = self._scaling_head(fused)
-                        self._rotation[i:end_idx] = self._rotation_head(fused) + self._rotation_init
-                        if self.max_sh_degree > 0:
-                            self._features_rest[i:end_idx] = self._features_rest_head(fused).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3)
-                    except Exception:
-                        # Fallback: zero initialization
-                        self._opacity[i:end_idx] = self._opacity_init.expand(end_idx - i, -1)
-                        self._scaling[i:end_idx] = 0.0
-                        self._rotation[i:end_idx] = self._rotation_init.expand(end_idx - i, -1)
-                    continue
+            # Geometry heads: opacity, scaling, rotation
+            scaling_chunks.append(self._scaling_head(geometry_latent))
+            rotation_chunks.append(self._rotation_head(geometry_latent) + self._rotation_init)
+            opacity_chunks.append(self._opacity_head(geometry_latent) + self._opacity_init)
 
-                # Geometry heads: scale, rotation, opacity
-                # Project geometry_latent (C_shared + C_role) to head input dim (C_shared)
-                geometry_proj = self._geometry_input_proj(geometry_chunk)  # [N, C_shared]
-                geometry_proj = torch.clamp(geometry_proj, -10.0, 10.0)
-                
-                # Append outputs; avoid in-place writes to keep autograd versions clean
-                scaling_chunks.append(self._scaling_head(geometry_proj))
-                rotation_chunks.append(self._rotation_head(geometry_proj) + self._rotation_init)
-                opacity_chunks.append(self._opacity_head(geometry_proj) + self._opacity_init)
+            # Appearance head: SH features
+            if self.max_sh_degree > 0:
+                features_rest_chunks.append(
+                    self._features_rest_head(appearance_latent).view(
+                        -1, (self.max_sh_degree + 1) ** 2 - 1, 3)
+                )
 
-                # Appearance / SH head
-                if self.max_sh_degree > 0:
-                    appearance_proj = self._appearance_input_proj(appearance_chunk)  # [N, C_shared]
-                    appearance_proj = torch.clamp(appearance_proj, -10.0, 10.0)
-                    features_rest_chunks.append(
-                        self._features_rest_head(appearance_proj).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3)
-                    )
+        self._opacity = torch.cat(opacity_chunks, dim=0)
+        self._scaling = torch.cat(scaling_chunks, dim=0)
+        self._rotation = torch.cat(rotation_chunks, dim=0)
+        if self.max_sh_degree > 0 and features_rest_chunks is not None:
+            self._features_rest = torch.cat(features_rest_chunks, dim=0)
 
-            # Concatenate chunk outputs
-            self._opacity = torch.cat(opacity_chunks, dim=0)
-            self._scaling = torch.cat(scaling_chunks, dim=0)
-            self._rotation = torch.cat(rotation_chunks, dim=0)
-            if self.max_sh_degree > 0 and features_rest_chunks is not None:
-                self._features_rest = torch.cat(features_rest_chunks, dim=0)
-            # Update cache hash after successful computation
-            self._cached_attributes_hash = (self._xyz.data_ptr(), N, self._xyz.requires_grad)
-        else:
-            # Fallback: single fused latent for all heads
-            # Pre-allocate output tensors for better performance
-            opacity_chunks = []
-            scaling_chunks = []
-            rotation_chunks = []
-            features_rest_chunks = [] if self.max_sh_degree > 0 else None
-            
-            for i in range(0, N, chunk_size):
-                end_idx = min(i + chunk_size, N)
-                coords = raw_xyz[i: end_idx]
-                encoder_out = self._grid(coords, self._aabb)
-                feats = encoder_out if not isinstance(encoder_out, tuple) else encoder_out[0]
-                # Encoder already clamps, skip redundant clamp
-                opacity_chunks.append(self._opacity_head(feats) + self._opacity_init)
-                scaling_chunks.append(self._scaling_head(feats))
-                rotation_chunks.append(self._rotation_head(feats) + self._rotation_init)
-                if self.max_sh_degree > 0:
-                    features_rest_chunks.append(self._features_rest_head(feats).view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3))
-
-            self._opacity = torch.cat(opacity_chunks, dim=0)
-            self._scaling = torch.cat(scaling_chunks, dim=0)
-            self._rotation = torch.cat(rotation_chunks, dim=0)
-            if self.max_sh_degree > 0 and features_rest_chunks is not None:
-                self._features_rest = torch.cat(features_rest_chunks, dim=0)
-            
-            # Update cache hash after successful computation
-            self._cached_attributes_hash = (self._xyz.data_ptr(), N, self._xyz.requires_grad)
+        # Update cache hash after successful computation
+        self._cached_attributes_hash = (self._xyz.data_ptr(), N, self._xyz.requires_grad)
         
         # NOTE: Removed torch.cuda.empty_cache() here for real-time performance
         # empty_cache() is expensive (~1-2ms) and should only be called when necessary
@@ -1250,23 +1167,6 @@ class GaussianModel:
             {'params': self._scaling_head.parameters(), 'lr': 0.0, "name": "scaling"},
             {'params': list(self._rotation_head.parameters()), 'lr': 0.0, "name": "rotation"},
         ]
-        # Include projection layers into implicit optimizer so they can adapt
-        try:
-            proj_params = []
-            if hasattr(self, '_geometry_input_proj') and self._geometry_input_proj is not None:
-                proj_params.extend(list(self._geometry_input_proj.parameters()))
-            if hasattr(self, '_appearance_input_proj') and self._appearance_input_proj is not None:
-                proj_params.extend(list(self._appearance_input_proj.parameters()))
-            # Fallback: legacy projection layers
-            if len(proj_params) == 0:
-                if hasattr(self, '_opacity_input_proj'):
-                    proj_params.extend(list(self._opacity_input_proj.parameters()))
-                if hasattr(self, '_sh_input_proj'):
-                    proj_params.extend(list(self._sh_input_proj.parameters()))
-            if len(proj_params) > 0:
-                param_groups_i.append({'params': proj_params, 'lr': 0.0, "name": "proj"})
-        except Exception:
-            pass
         self.optimizer_i = torch.optim.Adam(param_groups_i, lr=0.0, eps=1e-15)
 
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -2028,7 +1928,6 @@ class GaussianModel:
         
         # Save model configuration for correct loading
         config = {
-            'feature_role_split': self._feature_role_split,
             'geo_resolution': self._geo_resolution,
             'geo_rank': self._geo_rank,
             'geo_channels': self._geo_channels,
@@ -2039,7 +1938,7 @@ class GaussianModel:
         np.savez(os.path.join(path, "config.npz"), **config)
         
         # Save the complete GeometryAppearanceEncoder state_dict
-        # This includes hash_encoder, geo_encoder, and fusion_layer parameters
+        # This includes hash_encoder, geo_encoder, and FiLM layer parameters
         # All files use underscore naming format for consistency
         
         grid_state_dict = self._grid.state_dict()
@@ -2070,12 +1969,16 @@ class GaussianModel:
         # Mask / SH mask stored as logits (no binarization) to keep activation semantics.
         _save_npz(os.path.join(path, "mask_logits_fp16.npz"), data=_to_np_fp16(self._mask))
         _save_npz(os.path.join(path, "sh_mask_logits_fp16.npz"), data=_to_np_fp16(self._sh_mask))
-        # Tri-plane VM parameters stored in FP16 to avoid implicit attribute drift.
-        if hasattr(self._grid, 'plane_xy'):
+        # VM parameters (3 planes + 3 lines) stored in FP16 to avoid implicit attribute drift.
+        geo_enc = getattr(self._grid, 'geo_encoder', None)
+        if geo_enc is not None and hasattr(geo_enc, 'plane_xy'):
             _save_npz(os.path.join(path, "vm_planes_fp16.npz"),
-                      plane_xy=_to_np_fp16(self._grid.plane_xy),
-                      plane_xz=_to_np_fp16(self._grid.plane_xz),
-                      plane_yz=_to_np_fp16(self._grid.plane_yz))
+                      plane_xy=_to_np_fp16(geo_enc.plane_xy),
+                      plane_xz=_to_np_fp16(geo_enc.plane_xz),
+                      plane_yz=_to_np_fp16(geo_enc.plane_yz),
+                      line_z=_to_np_fp16(geo_enc.line_z),
+                      line_y=_to_np_fp16(geo_enc.line_y),
+                      line_x=_to_np_fp16(geo_enc.line_x))
         # Tinycudann heads stored FP16, no quantization.
         _save_npz(os.path.join(path, "mlps_fp16.npz"),
                   opacity=_to_np_fp16(self._opacity_head.state_dict()['params']),
@@ -2164,34 +2067,19 @@ class GaussianModel:
         config_path = os.path.join(path, 'config.npz')
         if os.path.exists(config_path):
             config = np.load(config_path)
-            # Verify config matches current model (print warnings if mismatch)
-            saved_feature_role_split = bool(config['feature_role_split'])
-            if saved_feature_role_split != self._feature_role_split:
-                print(f"[WARNING] Model feature_role_split mismatch: saved={saved_feature_role_split}, current={self._feature_role_split}")
-            # Migration: old configs used encoder_variant; new ones use enable_vm
+            # Verify enable_vm matches current model
             if 'enable_vm' in config:
                 saved_enable_vm = bool(config['enable_vm'])
                 if saved_enable_vm != self._enable_vm:
                     print(f"[WARNING] enable_vm mismatch: saved={saved_enable_vm}, current={self._enable_vm}")
-            elif 'encoder_variant' in config:
-                old_variant = str(config['encoder_variant'])
-                inferred_vm = (old_variant != 'hash_only')
-                if inferred_vm != self._enable_vm:
-                    print(f"[WARNING] Inferred enable_vm={inferred_vm} from legacy encoder_variant={old_variant}, current={self._enable_vm}")
-            # Migration: old configs used mass_aware; new ones use enable_mass_aware
+            # Verify enable_mass_aware matches current model
             if 'enable_mass_aware' in config:
                 saved_ma = bool(config['enable_mass_aware'])
                 if saved_ma != self._enable_mass_aware:
                     print(f"[WARNING] enable_mass_aware mismatch: saved={saved_ma}, current={self._enable_mass_aware}")
-            elif 'mass_aware' in config:
-                saved_ma = bool(config['mass_aware'])
-                if saved_ma != self._enable_mass_aware:
-                    print(f"[WARNING] Inferred enable_mass_aware={saved_ma} from legacy mass_aware key, current={self._enable_mass_aware}")
-            # Support both old 'glf_*' and new 'geo_*' config key names
+            # Verify GeoEncoder resolution
             if 'geo_resolution' in config:
                 saved_geo_resolution = int(config['geo_resolution'])
-            elif 'glf_resolution' in config:
-                saved_geo_resolution = int(config['glf_resolution'])
             else:
                 saved_geo_resolution = self._geo_resolution
             if saved_geo_resolution != self._geo_resolution:
@@ -2342,12 +2230,17 @@ class GaussianModel:
             sm_npz = _load_npz(sh_mask_logits_fp16_path)
             _strict_assign(self._sh_mask, _np_to_torch(sm_npz['data'], device='cuda', dtype=torch.float16), "sh_mask", sh_mask_logits_fp16_path)
         vm_planes_fp16_path = os.path.join(path, 'vm_planes_fp16.npz')
-        if os.path.exists(vm_planes_fp16_path) and hasattr(self._grid, 'plane_xy'):
-            # TODO(stage1-task4): ensure compression/export pipeline supports hash_only without vm_planes artifacts
+        geo_enc = getattr(self._grid, 'geo_encoder', None)
+        if os.path.exists(vm_planes_fp16_path) and geo_enc is not None and hasattr(geo_enc, 'plane_xy'):
             vm_npz = _load_npz(vm_planes_fp16_path)
-            _strict_assign(self._grid.plane_xy, _np_to_torch(vm_npz['plane_xy'], device='cuda', dtype=torch.float16), "plane_xy", vm_planes_fp16_path)
-            _strict_assign(self._grid.plane_xz, _np_to_torch(vm_npz['plane_xz'], device='cuda', dtype=torch.float16), "plane_xz", vm_planes_fp16_path)
-            _strict_assign(self._grid.plane_yz, _np_to_torch(vm_npz['plane_yz'], device='cuda', dtype=torch.float16), "plane_yz", vm_planes_fp16_path)
+            _strict_assign(geo_enc.plane_xy, _np_to_torch(vm_npz['plane_xy'], device='cuda', dtype=torch.float16), "plane_xy", vm_planes_fp16_path)
+            _strict_assign(geo_enc.plane_xz, _np_to_torch(vm_npz['plane_xz'], device='cuda', dtype=torch.float16), "plane_xz", vm_planes_fp16_path)
+            _strict_assign(geo_enc.plane_yz, _np_to_torch(vm_npz['plane_yz'], device='cuda', dtype=torch.float16), "plane_yz", vm_planes_fp16_path)
+            # Lines may be absent in older checkpoints — only restore if present
+            if 'line_z' in vm_npz:
+                _strict_assign(geo_enc.line_z, _np_to_torch(vm_npz['line_z'], device='cuda', dtype=torch.float16), "line_z", vm_planes_fp16_path)
+                _strict_assign(geo_enc.line_y, _np_to_torch(vm_npz['line_y'], device='cuda', dtype=torch.float16), "line_y", vm_planes_fp16_path)
+                _strict_assign(geo_enc.line_x, _np_to_torch(vm_npz['line_x'], device='cuda', dtype=torch.float16), "line_x", vm_planes_fp16_path)
 
         self.active_sh_degree = self.max_sh_degree
 

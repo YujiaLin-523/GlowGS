@@ -137,23 +137,21 @@ class GeoEncoder(nn.Module):
         coords: [N, 3] in [-1, 1]   (already contracted)
         """
         N = coords.shape[0]
+        _zero = torch.zeros(N, 1, device=coords.device, dtype=coords.dtype)
 
         # 2-D plane grids
         grid_xy = coords[:, [0, 1]].view(1, 1, N, 2)   # (x, y)
         grid_xz = coords[:, [0, 2]].view(1, 1, N, 2)   # (x, z)
         grid_yz = coords[:, [1, 2]].view(1, 1, N, 2)   # (y, z)
 
-        # 1-D line grids (pseudo-2D with fixed 0 on width axis)
+        # 1-D line grids (no in-place ops — safe for torch.compile)
         # Lines are [1, R, Res, 1] (vertical), so sample with (0, u):
         #   grid_sample interprets grid as (w_coord, h_coord)
         #   width=1 → w_coord=0 always;  height=Res → h_coord=u
-        zeros = torch.zeros(N, 1, device=coords.device, dtype=coords.dtype)
+        grid_z = torch.cat([_zero, coords[:, 2:3]], dim=1).view(1, 1, N, 2)
+        grid_y = torch.cat([_zero, coords[:, 1:2]], dim=1).view(1, 1, N, 2)
+        grid_x = torch.cat([_zero, coords[:, 0:1]], dim=1).view(1, 1, N, 2)
 
-        grid_z = torch.cat([zeros, coords[:, 2:3]], dim=-1).view(1, 1, N, 2)  # (0, z)
-        grid_y = torch.cat([zeros, coords[:, 1:2]], dim=-1).view(1, 1, N, 2)  # (0, y)
-        grid_x = torch.cat([zeros, coords[:, 0:1]], dim=-1).view(1, 1, N, 2)  # (0, x)
-
-        # VM branches: plane × line (Hadamard product)
         vm_xy = self._sample_plane(p_xy, grid_xy) * self._sample_line(l_z, grid_z)
         vm_xz = self._sample_plane(p_xz, grid_xz) * self._sample_line(l_y, grid_y)
         vm_yz = self._sample_plane(p_yz, grid_yz) * self._sample_line(l_x, grid_x)

@@ -162,7 +162,6 @@ def save_ablation_config(output_dir, dataset, opt, pipe):
             'hash_size': dataset.hash_size,
             'width': dataset.width,
             'depth': dataset.depth,
-            'feature_role_split': dataset.feature_role_split,
             'geo_resolution': dataset.geo_resolution,
             'geo_rank': dataset.geo_rank,
             'geo_channels': dataset.geo_channels,
@@ -205,8 +204,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     save_ablation_config(dataset.model_path, dataset, opt, pipe)
     
     gaussians = GaussianModel(
-        dataset.sh_degree, dataset.hash_size, dataset.width, dataset.depth, 
-        dataset.feature_role_split, dataset.geo_resolution, dataset.geo_rank, dataset.geo_channels,
+        dataset.sh_degree, dataset.hash_size, dataset.width, dataset.depth,
+        dataset.geo_resolution, dataset.geo_rank, dataset.geo_channels,
         enable_vm=enable_vm,
         enable_mass_aware=enable_mass_aware,
         mass_aware_scale=getattr(opt, 'mass_aware_scale', 0.1),

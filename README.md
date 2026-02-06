@@ -276,9 +276,9 @@ bash scripts/evaluate_db.sh
 ```
 GlowGS/
 ├── encoders/
-│   ├── encoder_factory.py      # Unified encoder creation (ablation support)
-│   ├── geo_encoder.py          # VM tri-plane encoder
-│   └── geometry_appearance_encoder.py  # Hybrid hash-VM encoder
+│   ├── factory.py              # Unified encoder creation (ablation support)
+│   ├── vm_encoder.py           # VM tri-plane encoder (TensoRF-style)
+│   └── hybrid_encoder.py       # Hybrid hash-VM encoder + FiLM modulation
 ├── scene/
 │   └── gaussian_model.py       # Core Gaussian model with densification
 ├── utils/

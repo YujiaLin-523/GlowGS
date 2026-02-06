@@ -19,8 +19,8 @@ def measure_fps(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
         print(f"[Config] enable_vm={enable_vm}, enable_mass_aware={enable_mass_aware}")
 
         gaussians = GaussianModel(
-            dataset.sh_degree, dataset.hash_size, dataset.width, dataset.depth, 
-            dataset.feature_role_split, dataset.geo_resolution, dataset.geo_rank, dataset.geo_channels,
+            dataset.sh_degree, dataset.hash_size, dataset.width, dataset.depth,
+            dataset.geo_resolution, dataset.geo_rank, dataset.geo_channels,
             enable_vm=enable_vm,
             enable_mass_aware=enable_mass_aware,
         )

@@ -10,12 +10,12 @@ Pipeline (enable_vm=True):
         geometry_latent  = hash * (1 + scale_g) + shift_g * hash_mag
         appearance_latent = hash * (1 + scale_a) + shift_a * hash_mag
 
-    Output: (shared_latent, geometry_latent, appearance_latent)
+    Output: (geometry_latent, appearance_latent)
             each [N, H]  → downstream MLP heads
 
 Pipeline (enable_vm=False, hash-only ablation):
     xyz ──► Hash Grid ──► hash_latent  [N, H]
-    Output: (hash_latent, hash_latent, hash_latent)
+    Output: (hash_latent, hash_latent)
     VM and FiLM are structurally present but completely bypassed.
 
 Dimension contract (example):
@@ -27,7 +27,7 @@ Dimension contract (example):
 import torch
 import torch.nn as nn
 from typing import Tuple
-from .geo_encoder import GeoEncoder
+from .vm_encoder import GeoEncoder
 
 
 class GeometryAppearanceEncoder(nn.Module):
@@ -132,14 +132,11 @@ class GeometryAppearanceEncoder(nn.Module):
         geometry_latent   = hash_latent * (1.0 + warmup * g_scale) + (warmup * g_shift * hash_mag)
         appearance_latent = hash_latent * (1.0 + warmup * a_scale) + (warmup * a_shift * hash_mag)
 
-        shared_latent = hash_latent
-
         # Stability clamp
         geometry_latent   = torch.clamp(geometry_latent,   -10.0, 10.0)
         appearance_latent = torch.clamp(appearance_latent, -10.0, 10.0)
-        shared_latent     = torch.clamp(shared_latent,     -10.0, 10.0)
 
-        return shared_latent, geometry_latent, appearance_latent
+        return geometry_latent, appearance_latent
 
     # ---------- progressive upsample (delegate) ----------
     def upsample_resolution(self, new_resolution: int):
@@ -157,10 +154,10 @@ class GeometryAppearanceEncoder(nn.Module):
             coordinates: [N, 3] raw world positions.
             aabb:        [6]    scene bounding box.
         Returns:
-            (shared, geometry, appearance)  each [N, H]
+            (geometry, appearance)  each [N, H]
 
-            enable_vm=True:  shared = clamped hash, geometry/appearance = FiLM modulated
-            enable_vm=False: all three = clamped hash (VM & FiLM bypassed)
+            enable_vm=True:  geometry/appearance = FiLM-modulated hash
+            enable_vm=False: both = clamped raw hash (VM & FiLM bypassed)
         """
         # Hash branch (high-freq appearance).  tcnn outputs fp16 → cast to fp32.
         hash_latent = self.hash_encoder(coordinates).float()
@@ -170,7 +167,7 @@ class GeometryAppearanceEncoder(nn.Module):
         # all three outputs are identical raw hash features.
         if not self.enable_vm:
             h = torch.clamp(hash_latent, -10.0, 10.0)
-            return h, h, h
+            return h, h
 
         # ---- enable_vm=True: full pipeline ----
         geo_latent = self.geo_encoder(coordinates, aabb)

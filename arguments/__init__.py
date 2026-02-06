@@ -86,7 +86,6 @@ class ModelParams(ParamGroup):
         self.geo_resolution = 128    # VM initial resolution (upsampled at step 7000)
         self.geo_rank = 48           # VM rank (increased for sum aggregation)
         self.geo_channels = 32       # VM output feature channels
-        self.feature_role_split = True  # Enable geometry/appearance feature disentanglement
         
         # ── Three ablation switches (unified, --flag True/False) ──
         self.enable_vm = True              # VM tri-plane branch in encoder
@@ -264,13 +263,11 @@ def get_combined_args(parser : ArgumentParser):
         if k not in merged_dict:
             merged_dict[k] = v
     
-    # Ensure GeoEncoder parameters have defaults for backward compatibility
-    # with models trained before these parameters were added
+    # Ensure GeoEncoder parameters have defaults
     geo_defaults = {
         'geo_resolution': 128,
         'geo_rank': 48,
         'geo_channels': 32,
-        'feature_role_split': True
     }
     for key, default_val in geo_defaults.items():
         if key not in merged_dict:

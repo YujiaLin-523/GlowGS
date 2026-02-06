@@ -5,18 +5,16 @@ Always builds the full hybrid encoder (hash + VM + FiLM).  The ``enable_vm``
 flag controls whether the VM branch contributes to the output:
 
     enable_vm=True  → full GlowGS  (hash + VM, FiLM modulated)
-    enable_vm=False → VM output zeroed, numerically equivalent to hash-only
-                      but the encoder object has the *same* interface / dims.
+    enable_vm=False → VM & FiLM bypassed; all three outputs = raw hash
+                      features (clean hash-only ablation)
 
-No separate ``hash_only`` or ``3dgs`` variant classes exist; ablation is done
-via the single ``enable_vm`` boolean.
+Ablation is controlled by the single ``enable_vm`` boolean.
 """
 
 import torch
 import torch.nn as nn
 import tinycudann as tcnn
-from .geo_encoder import GeoEncoder
-from .geometry_appearance_encoder import GeometryAppearanceEncoder
+from .hybrid_encoder import GeometryAppearanceEncoder
 
 
 def create_gaussian_encoder(
@@ -26,10 +24,6 @@ def create_gaussian_encoder(
     geo_rank: int = 48,
     geo_channels: int = 32,
     enable_vm: bool = True,
-    *,
-    # Legacy kwargs kept so old call-sites don't crash; values are ignored.
-    variant: str | None = None,
-    feature_mod_type: str | None = None,
 ):
     """
     Build the GlowGS hybrid encoder.
@@ -40,10 +34,9 @@ def create_gaussian_encoder(
         geo_resolution:  VM initial resolution.
         geo_rank:        VM rank.
         geo_channels:    VM output channels.
-        enable_vm:       If *False*, the VM branch output is zeroed inside the
-                         ``GeometryAppearanceEncoder`` (bypass), so the encoder
-                         degrades to hash-only numerically while keeping the
-                         same output dimensions and interface.
+        enable_vm:       If *False*, the VM branch and FiLM are bypassed,
+                         and the encoder outputs raw hash features for all
+                         three branches (clean hash-only ablation).
     Returns:
         encoder – ``GeometryAppearanceEncoder`` instance.
     """
@@ -55,9 +48,7 @@ def create_gaussian_encoder(
         geo_channels=geo_channels,
         geo_resolution=geo_resolution,
         geo_rank=geo_rank,
-        feature_role_split=True,
-        use_film=True,           # FiLM is always structurally present
-        enable_vm=enable_vm,     # ← bypass switch
+        enable_vm=enable_vm,
     )
 
     if encoder.n_output_dims != hash_encoder.n_output_dims:
@@ -75,12 +66,11 @@ def create_gaussian_encoder(
     return encoder
 
 
-def get_encoder_output_dims(encoder, variant: str | None = None):
+def get_encoder_output_dims(encoder):
     """
     Return (base_dim, geometry_dim, appearance_dim).
 
-    For the hybrid encoder with role-split these are all equal to hash_dim.
-    The ``variant`` arg is accepted but ignored (legacy compat).
+    For the hybrid encoder these are all equal to hash_dim.
     """
     base_dim = encoder.n_output_dims
     geo_dim = getattr(encoder, 'geometry_dim', base_dim)
