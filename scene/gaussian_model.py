@@ -169,7 +169,7 @@ class GaussianModel:
         self._opacity_init = torch.tensor([[np.log(0.1 / (1 - 0.1))]], dtype=torch.float, device='cuda')
 
     def __init__(self, sh_degree: int, hash_size=19, width=64, depth=2, feature_role_split=True,
-                 geo_resolution=160, geo_rank=32, geo_channels=8, encoder_variant="hybrid",
+                 geo_resolution=128, geo_rank=48, geo_channels=32, encoder_variant="hybrid",
                  densify_strategy="feature_weighted", feature_mod_type="film",
                  mass_aware_scale: float = 0.1,
                  enable_mass_gate: bool = True,
@@ -457,14 +457,15 @@ class GaussianModel:
             self._cache_miss_count = 0
         self._cache_miss_count += 1
         
-        contracted_xyz = self.get_contracted_xyz
+        # Hybrid encoder does its own L-inf contraction; other variants use pre-contracted coords
+        _needs_aabb = self._encoder_variant == 'hybrid'
+        raw_xyz = self.get_xyz.detach() if _needs_aabb else self.get_contracted_xyz
 
         # Optimize chunk size: use larger chunks or process all at once if memory allows
         # For better GPU utilization, try to process in fewer, larger chunks
         chunk_size = min(131072, N) if N > 65536 else N  # Process all at once if < 65k, else use 128k chunks
 
         if self._use_role_split:
-            # TODO(stage1-task3): grep all encoder output usages; ensure hash_only uses identical tensors where consumed
             # Collect outputs to avoid in-place writes that may invalidate autograd versions
             opacity_chunks = []
             scaling_chunks = []
@@ -473,8 +474,8 @@ class GaussianModel:
 
             for i in range(0, N, chunk_size):
                 end_idx = min(i + chunk_size, N)
-                coords = contracted_xyz[i: end_idx]
-                encoder_out = self._grid(coords)
+                coords = raw_xyz[i: end_idx]
+                encoder_out = self._grid(coords, self._aabb) if _needs_aabb else self._grid(coords)
 
                 # Support both 2-tuple legacy and 3-tuple new encoder outputs
                 if isinstance(encoder_out, tuple):
@@ -536,8 +537,8 @@ class GaussianModel:
             
             for i in range(0, N, chunk_size):
                 end_idx = min(i + chunk_size, N)
-                coords = contracted_xyz[i: end_idx]
-                encoder_out = self._grid(coords)
+                coords = raw_xyz[i: end_idx]
+                encoder_out = self._grid(coords, self._aabb) if _needs_aabb else self._grid(coords)
                 feats = encoder_out if not isinstance(encoder_out, tuple) else encoder_out[0]
                 # Encoder already clamps, skip redundant clamp
                 opacity_chunks.append(self._opacity_head(feats) + self._opacity_init)
@@ -1453,6 +1454,47 @@ class GaussianModel:
     #     self._sh_mask = nn.Parameter(torch.tensor(sh_mask, dtype=torch.float, device="cuda").requires_grad_(True))
 
     #     self.active_sh_degree = self.max_sh_degree
+
+    # ------------------------------------------------------------------
+    # VM upsample → Optimizer state sync
+    # ------------------------------------------------------------------
+    def _register_vm_optimizer(self):
+        """
+        After GeoEncoder.upsample_resolution(), the 6 VM nn.Parameters have
+        been replaced via setattr with new (larger) tensors.  Adam still holds
+        references to the OLD tensors, so we must:
+
+          1. Replace the 'grid' param list in optimizer_i with the current
+             self._grid.parameters().
+          2. Delete stale Adam states (exp_avg / exp_avg_sq) for the dead
+             old tensors.
+          3. New parameters will get fresh Adam states on their next .step().
+
+        This is the "精细操作" approach — unchanged parameters (hash encoder,
+        FiLM MLP, projection) keep their accumulated momentum.
+        """
+        if self.optimizer_i is None:
+            return
+
+        new_params = list(self._grid.parameters())
+        new_id_set = {id(p) for p in new_params}
+
+        replaced = 0
+        for group in self.optimizer_i.param_groups:
+            if group["name"] == "grid":
+                old_params = group["params"]
+                # Delete optimizer state for parameters that no longer exist
+                for old_p in old_params:
+                    if id(old_p) not in new_id_set:
+                        if old_p in self.optimizer_i.state:
+                            del self.optimizer_i.state[old_p]
+                        replaced += 1
+                # Replace param list with current module parameters
+                group["params"] = new_params
+                break
+
+        print(f"[OPTIMIZER] VM upsample sync: replaced {replaced} stale param "
+              f"refs, optimizer_i 'grid' group now has {len(new_params)} params")
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}

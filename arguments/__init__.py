@@ -85,10 +85,10 @@ class ModelParams(ParamGroup):
         self.hash_size = 19          # log2_hashmap_size: 19 → 512K entries (balance of size/quality)
         self.width = 64              # MLP hidden width
         self.depth = 2               # MLP depth
-        # GeoEncoder (tri-plane) parameters - bandwidth-expanded for structural fidelity
-        self.geo_resolution = 160    # Higher VM resolution to reduce aliasing on fine structures
-        self.geo_rank = 32           # Increased rank to match spatial bandwidth
-        self.geo_channels = 8        # Output feature channels
+        # GeoEncoder (VM decomposition) parameters
+        self.geo_resolution = 128    # VM initial resolution (upsampled at step 7000)
+        self.geo_rank = 48           # VM rank (increased for sum aggregation)
+        self.geo_channels = 32       # VM output feature channels
         self.feature_role_split = True  # Enable geometry/appearance feature disentanglement
         self.encoder_variant = "hybrid"  # Encoder architecture variant
         # TODO(stage1-task2): encoder_variant must round-trip via cfg_args for render/convert/fps consistency
@@ -274,9 +274,9 @@ def get_combined_args(parser : ArgumentParser):
     # Ensure GeoEncoder parameters have defaults for backward compatibility
     # with models trained before these parameters were added
     geo_defaults = {
-        'geo_resolution': 160,
-        'geo_rank': 32,
-        'geo_channels': 8,
+        'geo_resolution': 128,
+        'geo_rank': 48,
+        'geo_channels': 32,
         'feature_role_split': True
     }
     for key, default_val in geo_defaults.items():

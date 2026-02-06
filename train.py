@@ -619,6 +619,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 warmup_progress = min(1.0, iteration / 5000.0)
                 gaussians._grid.set_warmup_progress(warmup_progress)
             
+            # Progressive VM upsampling (TensoRF-style: 128 → 256 at step 7000)
+            if iteration == 7000 and hasattr(gaussians._grid, 'upsample_resolution'):
+                gaussians._grid.upsample_resolution(256)
+                # Re-register upsampled parameters with the optimizer
+                if hasattr(gaussians, '_register_vm_optimizer'):
+                    gaussians._register_vm_optimizer()
+            
             # ----------------------------------------------------------------
             # Standard pixel-wise loss: treat all regions equally for optimal PSNR
             # ----------------------------------------------------------------

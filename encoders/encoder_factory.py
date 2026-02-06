@@ -17,25 +17,25 @@ def create_gaussian_encoder(
     variant: str,
     encoding_config: dict,
     network_config: dict,
-    geo_resolution: int = 48,
-    geo_rank: int = 6,
-    geo_channels: int = 8,
+    geo_resolution: int = 128,
+    geo_rank: int = 48,
+    geo_channels: int = 32,
     feature_mod_type: str = "film",
 ):
     """
     Factory function to create encoder based on variant type.
     
     Supports two encoder types for ablation studies:
-    - 'hybrid': Full GlowGS hybrid encoder (hash + VM tri-plane with geometry/appearance split)
+    - 'hybrid': Full GlowGS hybrid encoder (hash + VM with geometry/appearance split)
     - '3dgs': No encoder (uses explicit SH parameters, 3DGS baseline mode)
     
     Args:
         variant: Either "hybrid" or "3dgs"
         encoding_config: Hash grid config (for hybrid)
         network_config: MLP config (unused here, kept for interface consistency)
-        geo_resolution: Tri-plane resolution for VM encoder
-        geo_rank: Low-rank factorization rank
-        geo_channels: VM encoder output channels
+        geo_resolution: VM resolution (default 128)
+        geo_rank: VM rank (default 48)
+        geo_channels: VM encoder output channels (default 32)
         feature_mod_type: 'film' (FiLM modulation) or 'concat' (naive concatenation)
     
     Returns:
