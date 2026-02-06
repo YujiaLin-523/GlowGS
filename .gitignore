@@ -106,4 +106,4 @@ credentials.json
 
 # -------------------- Assets --------------------
 assets
-train_baseline.sh
+paper_experiments
