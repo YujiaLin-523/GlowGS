@@ -4,7 +4,7 @@
 	ignore = dirty
 [submodule "submodules/diff-gaussian-rasterization-sh"]
 	path = submodules/diff-gaussian-rasterization-sh
-	url = https://github.com/seungjoo-shin/diff-gaussian-rasterization-sh.git
+	url = https://github.com/seungjooshin/diff-gaussian-rasterization-sh.git
 	ignore = dirty
 [submodule "submodules/simple-knn"]
 	path = submodules/simple-knn
@@ -16,5 +16,5 @@
 	ignore = dirty
 [submodule "submodules/nerfstudio"]
 	path = submodules/nerfstudio
-	url = https://github.com/nerfstudio-project/nerfstudio.git
+	url = https://github.com/seungjooshin/nerfstudio.git
 	ignore = dirty
