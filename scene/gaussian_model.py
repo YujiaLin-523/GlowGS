@@ -128,20 +128,21 @@ class GaussianModel:
         # Move encoder and its submodules to GPU
         self._grid = self._grid.cuda()
         
+        # Get encoder output dimensions
+        base_dim, geometry_dim, appearance_dim = get_encoder_output_dims(self._grid)
+        
         # MLP heads for Gaussian attributes
-        self._features_rest_head = tcnn.Network(n_input_dims=self._grid.n_output_dims, n_output_dims=(self.max_sh_degree + 1) ** 2 * 3 - 3, network_config=self.network_config)
-        self._scaling_head = tcnn.Network(n_input_dims=self._grid.n_output_dims, n_output_dims=3, network_config=self.network_config)
-        self._rotation_head = tcnn.Network(n_input_dims=self._grid.n_output_dims, n_output_dims=4, network_config=self.network_config)
-        self._opacity_head = tcnn.Network(n_input_dims=self._grid.n_output_dims, n_output_dims=1, network_config=self.network_config)
+        # Geometry heads: use geometry_dim (H+G when VM enabled, H otherwise)
+        self._scaling_head = tcnn.Network(n_input_dims=geometry_dim, n_output_dims=3, network_config=self.network_config)
+        self._rotation_head = tcnn.Network(n_input_dims=geometry_dim, n_output_dims=4, network_config=self.network_config)
+        self._opacity_head = tcnn.Network(n_input_dims=geometry_dim, n_output_dims=1, network_config=self.network_config)
+        
+        # Appearance head: use appearance_dim (always H)
+        self._features_rest_head = tcnn.Network(n_input_dims=appearance_dim, n_output_dims=(self.max_sh_degree + 1) ** 2 * 3 - 3, network_config=self.network_config)
         
         self._aabb = torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], dtype=torch.float, device='cuda')
 
-        # Verify encoder output dimensions match head input requirements
-        base_dim, geometry_dim, appearance_dim = get_encoder_output_dims(self._grid)
-        assert geometry_dim == base_dim and appearance_dim == base_dim, (
-            f"Encoder dim mismatch: base={base_dim}, geo={geometry_dim}, app={appearance_dim}. "
-            f"All three must be equal for direct head feeding."
-        )
+        # Log encoder dimensions
         print(f"[EncoderDims] enable_vm={self._enable_vm} base_dim={base_dim} "
               f"geometry_dim={geometry_dim} appearance_dim={appearance_dim}")
 

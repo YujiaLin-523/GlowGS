@@ -60,8 +60,9 @@ def create_gaussian_encoder(
     print(
         f"[Encoder] enable_vm={enable_vm}({vm_tag}) "
         f"hash_dim={hash_encoder.n_output_dims} "
-        f"geo_dim={getattr(encoder, 'geo_dim', None)} "
-        f"out_dim={encoder.n_output_dims}"
+        f"geo_vm_dim={getattr(encoder, 'geo_dim', None)} "
+        f"geometry_dim={encoder.geometry_dim} "
+        f"appearance_dim={encoder.appearance_dim}"
     )
     return encoder
 
@@ -70,7 +71,10 @@ def get_encoder_output_dims(encoder):
     """
     Return (base_dim, geometry_dim, appearance_dim).
 
-    For the hybrid encoder these are all equal to hash_dim.
+    For the hybrid encoder with concat architecture:
+        - base_dim = hash_dim (H)
+        - geometry_dim = H+G when enable_vm=True, H otherwise
+        - appearance_dim = H (always)
     """
     base_dim = encoder.n_output_dims
     geo_dim = getattr(encoder, 'geometry_dim', base_dim)
