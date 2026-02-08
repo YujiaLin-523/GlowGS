@@ -1106,6 +1106,16 @@ class GaussianModel:
         if is_verbose():
             print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
+        xyz_min = fused_point_cloud.min(dim=0)[0]
+        xyz_max = fused_point_cloud.max(dim=0)[0]
+        # Add 10% margin to prevent edge points from being exactly on boundary
+        margin = (xyz_max - xyz_min) * 0.1
+        self._aabb = torch.cat([xyz_min - margin, xyz_max + margin]).float()
+        
+        if is_verbose():
+            print(f"[AABB] Computed from point cloud: min={xyz_min.cpu().numpy()}, max={xyz_max.cpu().numpy()}")
+            print(f"[AABB] With 10% margin: {self._aabb.cpu().numpy()}")
+
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None]
 

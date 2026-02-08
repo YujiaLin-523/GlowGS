@@ -12,7 +12,7 @@
 from scene.cameras import Camera
 import numpy as np
 from utils.general_utils import PILtoTorch
-from utils.graphics_utils import fov2focal
+from utils.graphics_utils import fov2focal, focal2fov
 
 WARNED = False
 
@@ -46,8 +46,25 @@ def loadCam(args, id, cam_info, resolution_scale):
     if resized_image_rgb.shape[1] == 4:
         loaded_mask = resized_image_rgb[3:4, ...]
 
+    actual_w = gt_image.shape[2]
+    actual_h = gt_image.shape[1]
+    
+    # Derive original focal lengths from COLMAP FoV
+    fx_orig = fov2focal(cam_info.FovX, cam_info.width)
+    fy_orig = fov2focal(cam_info.FovY, cam_info.height)
+    
+    # Compute scaled focal lengths
+    scale_w = cam_info.width / actual_w
+    scale_h = cam_info.height / actual_h
+    fx_scaled = fx_orig / scale_w
+    fy_scaled = fy_orig / scale_h
+    
+    # Convert back to FoV for the resized image
+    FovX_scaled = focal2fov(fx_scaled, actual_w)
+    FovY_scaled = focal2fov(fy_scaled, actual_h)
+
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
+                  FoVx=FovX_scaled, FoVy=FovY_scaled, 
                   image=gt_image, gt_alpha_mask=loaded_mask,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device)
 
