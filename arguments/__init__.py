@@ -83,9 +83,11 @@ class ModelParams(ParamGroup):
         self.width = 64              # MLP hidden width
         self.depth = 2               # MLP depth
         # GeoEncoder (VM decomposition) parameters
-        self.geo_resolution = 128    # VM initial resolution (upsampled at step 7000)
+        self.geo_resolution = 128    # VM initial resolution
         self.geo_rank = 48           # VM rank (increased for sum aggregation)
         self.geo_channels = 32       # VM output feature channels
+        self.vm_final_resolution = 300  # VM final resolution after all upsamples
+        self.vm_upsample_iters = "2000,3500,5000,7000"  # Progressive upsample iterations (comma-separated)
         
         # ── Three ablation switches (unified, --flag True/False) ──
         self.enable_vm = True              # VM tri-plane branch in encoder
@@ -268,6 +270,8 @@ def get_combined_args(parser : ArgumentParser):
         'geo_resolution': 128,
         'geo_rank': 48,
         'geo_channels': 32,
+        'vm_final_resolution': 300,
+        'vm_upsample_iters': '2000,3500,5000,7000',
     }
     for key, default_val in geo_defaults.items():
         if key not in merged_dict:

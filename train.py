@@ -10,6 +10,7 @@
 #
 
 import os
+import math
 import torch
 import torchvision
 import yaml
@@ -567,12 +568,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 warmup_progress = min(1.0, iteration / 5000.0)
                 gaussians._grid.set_warmup_progress(warmup_progress)
             
-            # Progressive VM upsampling (TensoRF-style: 128 → 256 at step 7000)
-            if iteration == 7000 and hasattr(gaussians._grid, 'upsample_resolution'):
-                gaussians._grid.upsample_resolution(256)
-                # Re-register upsampled parameters with the optimizer
-                if hasattr(gaussians, '_register_vm_optimizer'):
-                    gaussians._register_vm_optimizer()
+            # Progressive VM upsampling (TensoRF-style: coarse → fine over multiple steps)
+            if hasattr(gaussians._grid, 'upsample_resolution'):
+                _upsample_iters_str = getattr(dataset, 'vm_upsample_iters', '2000,3500,5000,7000')
+                _vm_final_res = getattr(dataset, 'vm_final_resolution', 300)
+                _vm_init_res = getattr(dataset, 'geo_resolution', 128)
+                _upsample_iters = [int(x) for x in _upsample_iters_str.split(',')]
+                if iteration in _upsample_iters:
+                    _step_idx = _upsample_iters.index(iteration)
+                    _n_steps = len(_upsample_iters)
+                    # Log-linear interpolation from init to final resolution (matching TensoRF)
+                    _log_init = math.log(_vm_init_res)
+                    _log_final = math.log(_vm_final_res)
+                    _new_res = int(round(math.exp(
+                        _log_init + (_log_final - _log_init) * (_step_idx + 1) / _n_steps
+                    )))
+                    gaussians._grid.upsample_resolution(_new_res)
+                    # Re-register upsampled parameters with the optimizer
+                    if hasattr(gaussians, '_register_vm_optimizer'):
+                        gaussians._register_vm_optimizer()
             
             # ----------------------------------------------------------------
             # Standard pixel-wise loss: treat all regions equally for optimal PSNR
@@ -791,38 +805,43 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
 
             # -----------------------------------------------------------------
-            # Densification with capacity control.
+            # Densification (LocoGS-style gating)
             # -----------------------------------------------------------------
-            # Keep track of max radii in image-space for pruning (always needed)
-            gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-            # Pass opacity and radii for Mass-Aware Gradient Weighting
-            gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, 
-                                              opacity=gaussians.get_opacity, radii=radii, iteration=iteration)
-            
-            if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                torch.cuda.empty_cache()
-                n_before = gaussians.get_xyz.shape[0]
-                
-                # Use configured min_opacity (LocoGS default: 0.005)
-                min_opacity = getattr(opt, 'min_opacity', 0.005)
+            if iteration < opt.densify_until_iter:
+                # Keep track of max radii in image-space for pruning
+                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                # Pass opacity and radii for Mass-Aware Gradient Weighting
+                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, 
+                                                  opacity=gaussians.get_opacity, radii=radii, iteration=iteration)
+
+                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    torch.cuda.empty_cache()
+                    n_before = gaussians.get_xyz.shape[0]
+                    
+                    min_opacity = getattr(opt, 'min_opacity', 0.005)
+                    mask_prune_threshold = getattr(opt, 'mask_prune_threshold', 0.005)
+                    
+                    gaussians.maybe_densify_and_prune(
+                        iteration=iteration,
+                        max_grad=opt.densify_grad_threshold,
+                        min_opacity=min_opacity,
+                        extent=scene.cameras_extent,
+                        max_screen_size=size_threshold,
+                        mask_prune_threshold=mask_prune_threshold,
+                    )
+                    
+                    n_after = gaussians.get_xyz.shape[0]
+                    if debug_full_gap:
+                        densify_events += int(n_after > n_before)
+                        prune_events += int(n_after < n_before)
+                    torch.cuda.empty_cache()
+            else:
+                # Post-densification: periodic mask pruning only
+                prune_interval = getattr(opt, 'prune_interval', 1000)
                 mask_prune_threshold = getattr(opt, 'mask_prune_threshold', 0.005)
-                
-                # Call capacity-controlled wrapper instead of direct densify_and_prune
-                gaussians.maybe_densify_and_prune(
-                    iteration=iteration,
-                    max_grad=opt.densify_grad_threshold,
-                    min_opacity=min_opacity,
-                    extent=scene.cameras_extent,
-                    max_screen_size=size_threshold,
-                    mask_prune_threshold=mask_prune_threshold,
-                )
-                
-                n_after = gaussians.get_xyz.shape[0]
-                if debug_full_gap:
-                    densify_events += int(n_after > n_before)
-                    prune_events += int(n_after < n_before)
-                torch.cuda.empty_cache()
+                if iteration % prune_interval == 0:
+                    gaussians.mask_prune(mask_threshold=mask_prune_threshold, iteration=iteration)
             
             if (iteration in saving_iterations):
                 print(f"\n[ITER {iteration}] Saving Gaussians")

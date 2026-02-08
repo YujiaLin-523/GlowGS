@@ -1713,6 +1713,16 @@ class GaussianModel:
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
+        # Gradient distribution diagnostic (helps choose densify_grad_threshold)
+        valid_grads = grads[grads > 0].squeeze()
+        if valid_grads.numel() > 0:
+            pcts = torch.quantile(valid_grads, torch.tensor([0.5, 0.8, 0.85, 0.9, 0.95, 0.99], device=valid_grads.device))
+            sel_ratio = float((valid_grads >= max_grad).sum()) / valid_grads.numel()
+            print(f"[GRAD DIAG iter={iteration}] N_valid={valid_grads.numel()} "
+                  f"p50={pcts[0]:.6f} p80={pcts[1]:.6f} p85={pcts[2]:.6f} "
+                  f"p90={pcts[3]:.6f} p95={pcts[4]:.6f} p99={pcts[5]:.6f} "
+                  f"threshold={max_grad:.6f} select_ratio={sel_ratio:.3f}")
+
         # Mass-aware bypass: when enable_mass_aware=False, skip size-decay weighting
         # and use raw gradients for both clone and split (standard 3DGS behavior).
         if not self._enable_mass_aware:
@@ -1784,7 +1794,7 @@ class GaussianModel:
             }
             self._log_prune_breakdown(iteration, prune_mask, reason_counts, N_before=N_before)
         # Telemetry: record prune event (reason masks may overlap; counts are per-mask intersections)
-            self._record_prune_event(
+        self._record_prune_event(
             prune_mask=prune_mask,
             reason_masks={
                 "low_opacity": opacity_mask,
@@ -1838,19 +1848,9 @@ class GaussianModel:
         
         num_points = self.get_xyz.shape[0]
         
-        # Dynamic threshold: raise threshold as we approach capacity
-        # This naturally slows down point growth when resources are tight
-        capacity_ratio = num_points / max_points
-        if capacity_ratio > 0.5:
-            # Scale threshold: at 50% capacity -> 1x, at 100% capacity -> 3x
-            threshold_scale = 1.0 + 2.0 * (capacity_ratio - 0.5) / 0.5
-            adaptive_grad = max_grad * threshold_scale
-        else:
-            adaptive_grad = max_grad
-        
         # Densify only if under capacity and within schedule
         if iteration < densify_until and num_points < max_points:
-            self.densify_and_prune(adaptive_grad, min_opacity, extent, max_screen_size, iteration=iteration, mask_prune_threshold=mask_prune_threshold)
+            self.densify_and_prune(max_grad, min_opacity, extent, max_screen_size, iteration=iteration, mask_prune_threshold=mask_prune_threshold)
             new_count = self.get_xyz.shape[0]
             # Log capacity warning if approaching limit
             if new_count >= max_points * 0.9:

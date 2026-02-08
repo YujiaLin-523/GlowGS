@@ -113,7 +113,7 @@ class GeoEncoder(nn.Module):
         """
         return F.grid_sample(
             plane, grid,
-            mode='bilinear', padding_mode='zeros', align_corners=True,
+            mode='bilinear', padding_mode='border', align_corners=True,
         )
 
     def _sample_line(self, line: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
@@ -122,7 +122,7 @@ class GeoEncoder(nn.Module):
         """
         return F.grid_sample(
             line, grid,
-            mode='bilinear', padding_mode='zeros', align_corners=True,
+            mode='bilinear', padding_mode='border', align_corners=True,
         )
 
     # ------------------------------------------------------------------
