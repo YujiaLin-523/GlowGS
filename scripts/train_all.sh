@@ -16,7 +16,6 @@ train_scene() {
     local scene_path=$1
     local scene_name=$2
     local output_dir="output/${scene_name}"
-    local pcd_path="${output_dir}/nerfacto/run/point_cloud.ply"
     
     echo "----------------------------------------"
     echo "Training: ${scene_name}"
@@ -28,7 +27,6 @@ train_scene() {
         -s "${scene_path}" \
         -m "${output_dir}" \
         --eval \
-        --pcd_path "${pcd_path}"
     
     echo "✓ Completed: ${scene_name}"
     echo ""
