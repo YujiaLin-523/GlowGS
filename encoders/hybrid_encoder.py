@@ -1,32 +1,34 @@
 """
-Geometry-Appearance Dual-Branch Encoder (GlowGS Innovation #1)
+VM Scaffold + Hash Residual Encoder (with Lightweight Alignment)
 
-Pipeline (enable_vm=True):
-    xyz ──► Hash Grid ──► hash_latent  [N, H]  (high-freq features)
-    xyz ──► VM GeoEncoder(AABB) ──► geo_vm [N, G]  (low-freq geometry)
+Architecture
+    coordinates  [N, 3]  in [0, 1]^3  (from contract_to_unisphere)
+    ├── Hash branch:  fh = Hash(coordinates)  ∈ R^H  (high-freq detail)
+    └── VM branch:    fg = VM(coordinates)    ∈ R^G  (low-freq scaffold)
 
-    Concat for geometry (direct feature access):
-        geometry_latent = concat(hash_latent, geo_vm)  [N, H+G]
+    Residual alignment (applied to Hash residual only):
+        r̃ = W · fh          (W: linear projection, identity-init)
+        r  = c ⊙ r̃          (c: learnable channel scale, ones-init)
 
-    FiLM for appearance (geo guides appearance):
-        geo_vm → MLP → (scale, shift)  each [N, H]
-        appearance_latent = hash * (1 + w·scale) + w·shift·hash_mag  [N, H]
+    Fusion (no concat, no gate, no FiLM):
+        f = fg + r
 
-    Output: (geometry_latent, appearance_latent)
-            geometry [N, H+G] → opacity/scaling/rotation heads
-            appearance [N, H] → features_rest head
+    Output: single fused feature  f ∈ R^32  → all four MLP heads
+            (opacity, scaling, rotation, SH/color)
 
-Pipeline (enable_vm=False, hash-only ablation):
-    xyz ──► Hash Grid ──► hash_latent  [N, H]
-    Output: (hash_latent, hash_latent)
-    VM and FiLM are structurally present but completely bypassed.
+    Ablation:
+        enable_vm=True   →  full VM scaffold + Hash residual (default)
+        enable_vm=False  →  hash-only:  f = Hash(coordinates)
 
-Dimension contract (example):
-    Hash dim H = 32 (tcnn: 16 levels × 2 features)
+Dimension contract:
+    Hash dim H = 32  (tcnn: 16 levels × 2 features)
     VM   dim G = 32  (GeoEncoder out_channels)
-    Geometry output = H+G = 64
-    Appearance output = H = 32
-    FiLM hidden = 128  (small MLP: G → 128 → 2H)
+    Fused output = 32  (unified for all heads)
+
+Both branches receive the **exact same** ``coordinates`` tensor.
+Hash (tcnn) uses [0,1]^3 directly.
+VM (GeoEncoder) internally converts to [-1,1]^3 for grid_sample — this
+is a PyTorch API requirement, not a different normalization.
 """
 
 import torch
@@ -37,16 +39,15 @@ from .vm_encoder import GeoEncoder
 
 class GeometryAppearanceEncoder(nn.Module):
     """
-    Hybrid encoder: Hash Grid (appearance) + VM GeoEncoder (geometry) + FiLM.
+    Hybrid encoder: VM scaffold + Hash residual with lightweight alignment.
 
     Args:
         hash_encoder:       Pre-built tcnn.Encoding (n_input_dims=3).
-        out_dim:            Output feature dim per branch (should == hash_dim).
-        geo_channels:       GeoEncoder output channels (G).
+        out_dim:            Output feature dim (should == hash_dim == geo_channels).
+        geo_channels:       GeoEncoder output channels (G), must == hash_dim.
         geo_resolution:     VM initial resolution.
         geo_rank:           VM rank.
-        enable_vm:          If False, VM branch and FiLM are bypassed
-                            (clean hash-only ablation).
+        enable_vm:          If False, VM branch is bypassed (hash-only ablation).
     """
 
     def __init__(
@@ -61,121 +62,78 @@ class GeometryAppearanceEncoder(nn.Module):
         super().__init__()
 
         self.hash_encoder = hash_encoder
-        self.hash_dim = hash_encoder.n_output_dims   # H
-        self.enable_vm = enable_vm                    # ← ablation bypass
+        self.hash_dim = hash_encoder.n_output_dims   # H (typically 32)
+        self.enable_vm = enable_vm
 
-        # VM geometry encoder (accepts raw xyz + aabb)
+        # Dimension consistency: VM and Hash must produce same dim for residual
+        assert geo_channels == self.hash_dim, (
+            f"VM geo_channels ({geo_channels}) must equal hash_dim ({self.hash_dim}) "
+            f"for residual fusion."
+        )
+
+        # ── VM geometry encoder (low-freq scaffold) ──────────────────────
         self.geo_encoder = GeoEncoder(
             resolution=geo_resolution,
             rank=geo_rank,
             out_channels=geo_channels,
             init_scale=0.1,
         )
-        self.geo_dim = geo_channels                  # G
+        self.geo_dim = geo_channels   # G == H
 
-        # ---- FiLM generator for appearance only (geo → modulate hash) ----
-        # Geometry uses direct concat instead of FiLM
-        # Small MLP:  G → film_hidden → 2H  (scale + shift)
-        film_hidden = max(128, self.hash_dim * 2)
-        self.appearance_film = nn.Sequential(
-            nn.Linear(self.geo_dim, film_hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(film_hidden, self.hash_dim * 2),
-        )
+        # ── Residual alignment module (Hash → aligned residual) ──────────
+        # Linear projection: identity-init so initial r̃ ≈ fh
+        self.linear_align = nn.Linear(self.hash_dim, self.hash_dim, bias=False)
+        nn.init.eye_(self.linear_align.weight)
 
-        # Init FiLM to identity: final layer weights/bias = 0
-        # → scale=0, shift=0 → output = hash * 1 + 0 = hash
-        nn.init.zeros_(self.appearance_film[-1].weight)
-        nn.init.zeros_(self.appearance_film[-1].bias)
+        # Channel scale: ones-init so initial r = r̃ (no amplitude change)
+        self.channel_scale = nn.Parameter(torch.ones(self.hash_dim))
 
-        # Output dimensions: geometry = H+G, appearance = H
-        self._geometry_dim = self.hash_dim + self.geo_dim  # H+G
-        self._appearance_dim = self.hash_dim                 # H
+        # ── Output dimension (unified) ───────────────────────────────────
         self._out_dim = out_dim
-
-        # ---- Compilation ----
-        try:
-            self._forward_film_compiled = torch.compile(self._forward_film_impl)
-        except Exception:
-            self._forward_film_compiled = self._forward_film_impl
-
-    # ---------- warmup ----------
-    def set_warmup_progress(self, progress: float):
-        """FiLM warmup (0→1). Called each iteration from train.py."""
-        self._warmup_progress = max(0.0, min(1.0, progress))
+        self._fused_dim = self.hash_dim   # == geo_channels == 32
 
     # ---------- dimension properties ----------
     @property
     def n_output_dims(self) -> int:
-        """Return hash_dim for backward compatibility (used by factory checks)."""
-        return self.hash_dim
+        return self._fused_dim
 
     @property
     def geometry_dim(self) -> int:
-        """Geometry branch output dimension: H+G when VM enabled, H otherwise."""
-        return self._geometry_dim if self.enable_vm else self.hash_dim
+        return self._fused_dim
 
     @property
     def appearance_dim(self) -> int:
-        """Appearance branch output dimension: always H."""
-        return self.hash_dim
+        return self._fused_dim
 
-    # ---------- Forward implementations ----------
-    def _forward_film_impl(self, hash_latent: torch.Tensor, geo_latent: torch.Tensor):
-        """Concat for geometry, FiLM for appearance."""
-        # Geometry: direct concat (no information bottleneck)
-        geometry_latent = torch.cat([hash_latent, geo_latent], dim=-1)  # [N, H+G]
-
-        # Appearance: FiLM modulation (geo guides appearance)
-        a_params = self.appearance_film(geo_latent)  # [N, 2H]
-        a_scale, a_shift = a_params.chunk(2, dim=-1)
-
-        # Characteristic magnitude of hash (detached to prevent feedback)
-        hash_mag = hash_latent.detach().abs().mean(dim=-1, keepdim=True).clamp_min(1e-3)
-
-        warmup = getattr(self, '_warmup_progress', 1.0)
-
-        # FiLM:  appearance = hash * (1 + w·scale) + w·shift·hash_mag
-        appearance_latent = hash_latent * (1.0 + warmup * a_scale) + (warmup * a_shift * hash_mag)
-
-        # Stability clamp
-        geometry_latent = torch.clamp(geometry_latent, -10.0, 10.0)
-        appearance_latent = torch.clamp(appearance_latent, -10.0, 10.0)
-
-        return geometry_latent, appearance_latent
-
-    # ---------- progressive upsample (delegate) ----------
+    # ---------- progressive upsample (delegate to GeoEncoder) ----------
     def upsample_resolution(self, new_resolution: int):
-        """Upsample VM parameters of the inner GeoEncoder."""
         self.geo_encoder.upsample_resolution(new_resolution)
 
     # ---------- public forward ----------
-    def forward(
-        self,
-        coordinates: torch.Tensor,
-        aabb: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, coordinates: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            coordinates: [N, 3] raw world positions.
-            aabb:        [6]    scene bounding box.
+            coordinates: [N, 3] positions in [0, 1]^3.
+                         Produced by ``contract_to_unisphere()`` upstream.
+                         Passed to Hash and VM identically (same tensor).
+
         Returns:
-            (geometry_latent, appearance_latent)
-
-            enable_vm=True:  geometry = concat(hash, geo_vm) [N, H+G]
-                             appearance = FiLM(hash, geo_vm) [N, H]
-            enable_vm=False: both = clamped raw hash [N, H] (VM & FiLM bypassed)
+            (fused, fused) — same tensor twice for API compatibility.
         """
-        # Hash branch (high-freq features).  tcnn outputs fp16 → cast to fp32.
-        hash_latent = self.hash_encoder(coordinates).float()
+        # ── Hash branch ──────────────────────────────────────────────────
+        # tcnn outputs fp16 → cast to fp32 for stability
+        hash_latent = self.hash_encoder(coordinates).float()   # [N, H]
 
-        # ---- enable_vm=False fast path: skip VM + FiLM entirely ----
-        # This is a clean hash-only ablation: no VM computation, no FiLM,
-        # both outputs are identical raw hash features.
         if not self.enable_vm:
-            h = torch.clamp(hash_latent, -10.0, 10.0)
-            return h, h
+            return hash_latent, hash_latent
 
-        # ---- enable_vm=True: full pipeline ----
-        geo_latent = self.geo_encoder(coordinates, aabb)
-        return self._forward_film_compiled(hash_latent, geo_latent)
+        # ── VM branch (same coordinates tensor) ─────────────────────────
+        fg = self.geo_encoder(coordinates)                     # [N, G=32]
+
+        # ── Residual alignment ───────────────────────────────────────────
+        r = self.channel_scale * self.linear_align(hash_latent)  # [N, H]
+
+        # ── Fusion ───────────────────────────────────────────────────────
+        f = fg + r                                             # [N, 32]
+
+        return f, f

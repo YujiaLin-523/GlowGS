@@ -563,11 +563,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Loss
             gt_image = viewpoint_cam.original_image.cuda()
             
-            # Update FiLM warmup progress (0->1 over first 5k iterations)
-            if hasattr(gaussians._grid, 'set_warmup_progress'):
-                warmup_progress = min(1.0, iteration / 5000.0)
-                gaussians._grid.set_warmup_progress(warmup_progress)
-            
             # Progressive VM upsampling (TensoRF-style: coarse → fine over multiple steps)
             if hasattr(gaussians._grid, 'upsample_resolution'):
                 _upsample_iters_str = getattr(dataset, 'vm_upsample_iters', '2000,3500,5000,7000')

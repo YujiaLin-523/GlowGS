@@ -1,9 +1,9 @@
 """
 Feature Encoders for GlowGS
 
-Provides geometry-appearance dual-branch encoding for 3D Gaussian Splatting:
+Provides VM scaffold + Hash residual encoding for 3D Gaussian Splatting:
 - vm_encoder.GeoEncoder:  VM (Vector-Matrix) tri-plane geometry encoder
-- hybrid_encoder.GeometryAppearanceEncoder:  Hash + VM + FiLM hybrid encoder
+- hybrid_encoder.GeometryAppearanceEncoder:  VM scaffold + Hash residual + alignment
 - factory:  Unified creation with ``enable_vm`` ablation switch
 
 Author: GlowGS Project

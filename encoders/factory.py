@@ -1,12 +1,15 @@
 """
 Encoder Factory for GlowGS
 
-Always builds the full hybrid encoder (hash + VM + FiLM).  The ``enable_vm``
-flag controls whether the VM branch contributes to the output:
+Always builds the full hybrid encoder (VM scaffold + Hash residual).
+The ``enable_vm`` flag controls whether the VM branch contributes:
 
-    enable_vm=True  → full GlowGS  (hash + VM, FiLM modulated)
-    enable_vm=False → VM & FiLM bypassed; all three outputs = raw hash
-                      features (clean hash-only ablation)
+    enable_vm=True  → full GlowGS  (VM scaffold + aligned Hash residual)
+    enable_vm=False → VM bypassed; output = raw hash features
+                      (clean hash-only ablation)
+
+Output dimensions are unified: all heads receive the same fused feature
+dimension (hash_dim = geo_channels = 32).
 
 Ablation is controlled by the single ``enable_vm`` boolean.
 """
@@ -26,17 +29,17 @@ def create_gaussian_encoder(
     enable_vm: bool = True,
 ):
     """
-    Build the GlowGS hybrid encoder.
+    Build the GlowGS hybrid encoder (VM scaffold + Hash residual).
 
     Args:
         encoding_config: Hash grid config dict (for ``tcnn.Encoding``).
         network_config:  MLP config dict (unused here; kept for interface).
         geo_resolution:  VM initial resolution.
         geo_rank:        VM rank.
-        geo_channels:    VM output channels.
-        enable_vm:       If *False*, the VM branch and FiLM are bypassed,
-                         and the encoder outputs raw hash features for all
-                         three branches (clean hash-only ablation).
+        geo_channels:    VM output channels (must == hash_dim for residual fusion).
+        enable_vm:       If *False*, the VM branch is bypassed,
+                         and the encoder outputs raw hash features
+                         (clean hash-only ablation).
     Returns:
         encoder – ``GeometryAppearanceEncoder`` instance.
     """
@@ -61,8 +64,9 @@ def create_gaussian_encoder(
         f"[Encoder] enable_vm={enable_vm}({vm_tag}) "
         f"hash_dim={hash_encoder.n_output_dims} "
         f"geo_vm_dim={getattr(encoder, 'geo_dim', None)} "
-        f"geometry_dim={encoder.geometry_dim} "
-        f"appearance_dim={encoder.appearance_dim}"
+        f"fused_dim={encoder.n_output_dims} "
+        f"(unified geometry_dim={encoder.geometry_dim} "
+        f"appearance_dim={encoder.appearance_dim})"
     )
     return encoder
 
@@ -71,10 +75,8 @@ def get_encoder_output_dims(encoder):
     """
     Return (base_dim, geometry_dim, appearance_dim).
 
-    For the hybrid encoder with concat architecture:
-        - base_dim = hash_dim (H)
-        - geometry_dim = H+G when enable_vm=True, H otherwise
-        - appearance_dim = H (always)
+    With the VM scaffold + Hash residual architecture, all three are
+    the same (unified fused feature dimension = hash_dim = 32).
     """
     base_dim = encoder.n_output_dims
     geo_dim = getattr(encoder, 'geometry_dim', base_dim)

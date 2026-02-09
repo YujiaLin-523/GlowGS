@@ -2,17 +2,20 @@
 GeoEncoder — TensoRF-style Vector-Matrix (VM) Decomposition
 
 Architecture
-    Raw world xyz  ──► L∞ contraction (AABB → [-1,1]³) ──►
+    [0,1]³ coords (contract_to_unisphere output, shared with Hash)
+    ──►  _vm_forward_impl  (internally maps [0,1]→[-1,1] for grid_sample)
     ┌─ Plane XY(x,y) × Line Z(z) ─┐
     │  Plane XZ(x,z) × Line Y(y)  │ ──► Element-wise Sum ──► Linear ──► geo_feat [N, C]
     └─ Plane YZ(y,z) × Line X(x) ─┘
 
 Key design choices (matching TensoRF):
-  • grid_sample:  align_corners=True, padding_mode='zeros'
+  • Input coordinates in [0,1]^3 — exactly the same tensor Hash receives
+  • [0,1]→[-1,1] mapping is performed inside _vm_forward_impl right before
+    grid construction, because grid_sample(align_corners=True) requires [-1,1]
+  • grid_sample:  padding_mode='border', align_corners=True
   • Lines are *vertical* strips [1, R, Res, 1] sampled with (0, u)
   • Fusion = Hadamard product per branch, then Sum (not Concat)
   • init_scale = 0.1  so  plane×line ≈ 0.01  at start
-  • Built-in L∞ (cuboid) contraction for unbounded scenes
   • Progressive resolution upsampling via upsample_resolution()
 """
 
@@ -23,7 +26,10 @@ import torch.nn.functional as F
 
 class GeoEncoder(nn.Module):
     """
-    Geometry encoder using VM decomposition with built-in L∞ contraction.
+    Geometry encoder using VM decomposition.
+
+    Input: [N, 3] coordinates in [0, 1]^3 (from contract_to_unisphere).
+    Output: [N, out_channels] geometry features.
 
     Args:
         resolution:   Spatial resolution of planes / lines (default 128).
@@ -68,43 +74,6 @@ class GeoEncoder(nn.Module):
             self._vm_forward = self._vm_forward_impl
 
     # ------------------------------------------------------------------
-    # L∞ (cuboid) contraction
-    # ------------------------------------------------------------------
-    @staticmethod
-    def contract_linf(xyz: torch.Tensor, aabb: torch.Tensor) -> torch.Tensor:
-        """
-        Map world coordinates to [-1, 1]³ using L-infinity (cuboid) contraction.
-
-        Inside the AABB → linear mapping to [-1, 1].
-        Outside the AABB → compressed into the boundary shell via L∞ norm,
-        so that the entire unbounded space maps into [-1, 1]³.
-
-        Args:
-            xyz:  [N, 3]  raw world positions.
-            aabb: [6]     (min_x, min_y, min_z, max_x, max_y, max_z).
-        Returns:
-            contracted: [N, 3] in [-1, 1].
-        """
-        aabb_min = aabb[:3]
-        aabb_max = aabb[3:]
-        aabb_center = (aabb_min + aabb_max) * 0.5
-        aabb_half   = (aabb_max - aabb_min) * 0.5
-
-        # Normalise so that AABB → [-1, 1]
-        x = (xyz - aabb_center) / aabb_half.clamp(min=1e-6)
-
-        # L∞ contraction for points outside the unit cube
-        linf = x.abs().max(dim=-1, keepdim=True).values  # [N, 1]
-        mask = (linf > 1.0).squeeze(-1)                  # [N]
-        if mask.any():
-            # contract: x_contracted = x / |x|_inf * (2 - 1/|x|_inf)
-            # Maps |x|_inf ∈ (1, ∞) → (1, 2), preserving direction
-            scale = (2.0 - 1.0 / linf[mask]) / linf[mask]
-            x[mask] = x[mask] * scale
-
-        return x.clamp(-1.0, 1.0)
-
-    # ------------------------------------------------------------------
     # grid_sample helpers
     # ------------------------------------------------------------------
     def _sample_plane(self, plane: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
@@ -129,13 +98,22 @@ class GeoEncoder(nn.Module):
     # VM forward (compilable core)
     # ------------------------------------------------------------------
     def _vm_forward_impl(
-        self, coords,
+        self, coordinates,
         p_xy, p_xz, p_yz,
         l_z, l_y, l_x,
     ):
         """
-        coords: [N, 3] in [-1, 1]   (already contracted)
+        Args:
+            coordinates: [N, 3] in [0, 1]^3 — the same tensor Hash receives.
+
+        Internally converts to [-1, 1]^3 for grid_sample(align_corners=True).
+        This is a PyTorch API requirement, not a separate normalization —
+        the spatial information is identical to what Hash sees.
         """
+        # grid_sample(align_corners=True) requires [-1, 1] input.
+        # This is the ONLY place the conversion happens.
+        coords = coordinates * 2.0 - 1.0
+
         N = coords.shape[0]
         _zero = torch.zeros(N, 1, device=coords.device, dtype=coords.dtype)
 
@@ -194,18 +172,17 @@ class GeoEncoder(nn.Module):
     # ------------------------------------------------------------------
     # Public forward
     # ------------------------------------------------------------------
-    def forward(self, coordinates: torch.Tensor, aabb: torch.Tensor) -> torch.Tensor:
+    def forward(self, coordinates: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            coordinates: [N, 3] raw world positions (unbounded).
-            aabb:        [6]    scene bounding box.
+            coordinates: [N, 3] positions in [0, 1]^3.
+                         Identical tensor to what Hash receives — produced
+                         by ``contract_to_unisphere()`` upstream.
         Returns:
             geo_feat: [N, out_channels]
         """
-        coords = self.contract_linf(coordinates, aabb)
-
         return self._vm_forward(
-            coords,
+            coordinates,
             self.plane_xy, self.plane_xz, self.plane_yz,
             self.line_z, self.line_y, self.line_x,
         )

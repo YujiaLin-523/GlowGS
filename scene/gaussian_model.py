@@ -128,23 +128,27 @@ class GaussianModel:
         # Move encoder and its submodules to GPU
         self._grid = self._grid.cuda()
         
-        # Get encoder output dimensions
+        # Get encoder output dimensions (unified: all heads use same fused_dim)
         base_dim, geometry_dim, appearance_dim = get_encoder_output_dims(self._grid)
+        assert geometry_dim == appearance_dim, (
+            f"Unified encoder requires geometry_dim == appearance_dim, "
+            f"got {geometry_dim} vs {appearance_dim}"
+        )
+        fused_dim = geometry_dim  # == appearance_dim == 32
         
-        # MLP heads for Gaussian attributes
-        # Geometry heads: use geometry_dim (H+G when VM enabled, H otherwise)
-        self._scaling_head = tcnn.Network(n_input_dims=geometry_dim, n_output_dims=3, network_config=self.network_config)
-        self._rotation_head = tcnn.Network(n_input_dims=geometry_dim, n_output_dims=4, network_config=self.network_config)
-        self._opacity_head = tcnn.Network(n_input_dims=geometry_dim, n_output_dims=1, network_config=self.network_config)
+        # MLP heads for Gaussian attributes (all use unified fused_dim)
+        self._scaling_head = tcnn.Network(n_input_dims=fused_dim, n_output_dims=3, network_config=self.network_config)
+        self._rotation_head = tcnn.Network(n_input_dims=fused_dim, n_output_dims=4, network_config=self.network_config)
+        self._opacity_head = tcnn.Network(n_input_dims=fused_dim, n_output_dims=1, network_config=self.network_config)
         
-        # Appearance head: use appearance_dim (always H)
-        self._features_rest_head = tcnn.Network(n_input_dims=appearance_dim, n_output_dims=(self.max_sh_degree + 1) ** 2 * 3 - 3, network_config=self.network_config)
+        # Appearance head: same fused_dim input
+        self._features_rest_head = tcnn.Network(n_input_dims=fused_dim, n_output_dims=(self.max_sh_degree + 1) ** 2 * 3 - 3, network_config=self.network_config)
         
         self._aabb = torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], dtype=torch.float, device='cuda')
 
         # Log encoder dimensions
-        print(f"[EncoderDims] enable_vm={self._enable_vm} base_dim={base_dim} "
-              f"geometry_dim={geometry_dim} appearance_dim={appearance_dim}")
+        print(f"[EncoderDims] enable_vm={self._enable_vm} fused_dim={fused_dim} "
+              f"(base={base_dim} geo={geometry_dim} app={appearance_dim})")
 
         self._rotation_init = torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float, device='cuda')
         self._opacity_init = torch.tensor([[np.log(0.1 / (1 - 0.1))]], dtype=torch.float, device='cuda')
@@ -369,9 +373,14 @@ class GaussianModel:
         """
         Update implicit Gaussian attributes from encoder output.
         
-        Feature role split routing:
-            - geometry_latent → scale, rotation, opacity heads
-            - appearance_latent → SH/color head (features_rest)
+        Coordinate pipeline (matching LocoGS):
+            raw xyz → contract_to_unisphere(xyz, aabb) → [0,1]^3
+            → Hash branch (tcnn expects [0,1]^3)
+            → VM branch (internally maps [0,1] → [-1,1] for grid_sample)
+        
+        Unified feature routing:
+            fused_feat = VM scaffold + λ · aligned Hash residual
+            → all four heads (opacity, scaling, rotation, SH/color)
         
         Args:
             force_update: If True, bypass cache and force recomputation
@@ -413,15 +422,16 @@ class GaussianModel:
             self._cache_miss_count = 0
         self._cache_miss_count += 1
         
-        # Hybrid encoder always does its own L-inf contraction via AABB
-        raw_xyz = self.get_xyz.detach()
+        # Contract coordinates to [0,1]^3 (matching LocoGS pipeline).
+        # This unified input goes to BOTH Hash (tcnn expects [0,1]^3)
+        # and VM (internally maps [0,1] → [-1,1] for grid_sample).
+        contracted_xyz = contract_to_unisphere(self.get_xyz.detach(), self._aabb)
 
         # Optimize chunk size: use larger chunks or process all at once if memory allows
         chunk_size = min(131072, N) if N > 65536 else N
 
-        # Feature role split routing:
-        #   geometry_latent  → geometry heads (opacity, scaling, rotation)
-        #   appearance_latent → appearance head (SH/color features_rest)
+        # Unified feature routing: all heads receive the same fused feature
+        # (VM scaffold + aligned Hash residual, or hash-only if enable_vm=False)
         opacity_chunks = []
         scaling_chunks = []
         rotation_chunks = []
@@ -429,18 +439,18 @@ class GaussianModel:
 
         for i in range(0, N, chunk_size):
             end_idx = min(i + chunk_size, N)
-            coords = raw_xyz[i:end_idx]
-            geometry_latent, appearance_latent = self._grid(coords, self._aabb)
+            coords = contracted_xyz[i:end_idx]
+            fused_feat, _ = self._grid(coords)
 
-            # Geometry heads: opacity, scaling, rotation
-            scaling_chunks.append(self._scaling_head(geometry_latent))
-            rotation_chunks.append(self._rotation_head(geometry_latent) + self._rotation_init)
-            opacity_chunks.append(self._opacity_head(geometry_latent) + self._opacity_init)
+            # All heads use the same unified fused feature
+            scaling_chunks.append(self._scaling_head(fused_feat))
+            rotation_chunks.append(self._rotation_head(fused_feat) + self._rotation_init)
+            opacity_chunks.append(self._opacity_head(fused_feat) + self._opacity_init)
 
-            # Appearance head: SH features
+            # Appearance head: SH features (same fused feature input)
             if self.max_sh_degree > 0:
                 features_rest_chunks.append(
-                    self._features_rest_head(appearance_latent).view(
+                    self._features_rest_head(fused_feat).view(
                         -1, (self.max_sh_degree + 1) ** 2 - 1, 3)
                 )
 
