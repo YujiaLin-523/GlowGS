@@ -1714,15 +1714,15 @@ class GaussianModel:
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        # Gradient distribution diagnostic (helps choose densify_grad_threshold)
-        valid_grads = grads[grads > 0].squeeze()
-        if valid_grads.numel() > 0:
-            pcts = torch.quantile(valid_grads, torch.tensor([0.5, 0.8, 0.85, 0.9, 0.95, 0.99], device=valid_grads.device))
-            sel_ratio = float((valid_grads >= max_grad).sum()) / valid_grads.numel()
-            print(f"[GRAD DIAG iter={iteration}] N_valid={valid_grads.numel()} "
-                  f"p50={pcts[0]:.6f} p80={pcts[1]:.6f} p85={pcts[2]:.6f} "
-                  f"p90={pcts[3]:.6f} p95={pcts[4]:.6f} p99={pcts[5]:.6f} "
-                  f"threshold={max_grad:.6f} select_ratio={sel_ratio:.3f}")
+        # # Gradient distribution diagnostic (helps choose densify_grad_threshold)
+        # valid_grads = grads[grads > 0].squeeze()
+        # if valid_grads.numel() > 0:
+        #     pcts = torch.quantile(valid_grads, torch.tensor([0.5, 0.8, 0.85, 0.9, 0.95, 0.99], device=valid_grads.device))
+        #     sel_ratio = float((valid_grads >= max_grad).sum()) / valid_grads.numel()
+        #     print(f"[GRAD DIAG iter={iteration}] N_valid={valid_grads.numel()} "
+        #           f"p50={pcts[0]:.6f} p80={pcts[1]:.6f} p85={pcts[2]:.6f} "
+        #           f"p90={pcts[3]:.6f} p95={pcts[4]:.6f} p99={pcts[5]:.6f} "
+        #           f"threshold={max_grad:.6f} select_ratio={sel_ratio:.3f}")
 
         # Mass-aware bypass: when enable_mass_aware=False, skip size-decay weighting
         # and use raw gradients for both clone and split (standard 3DGS behavior).

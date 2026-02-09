@@ -727,10 +727,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 def _stat_pair_ext(stats_dict, prefix_high):
                     if not isinstance(stats_dict, dict):
                         return ("N/A", "N/A")
-                    return (
-                        _fmt_stat(stats_dict.get(f"{prefix_high}_p95")),
-                        _fmt_stat(stats_dict.get(f"{prefix_high}_p99")),
-                    )
+                    # Use 6 decimal places for radii to detect small values
+                    p95_val = stats_dict.get(f"{prefix_high}_p95")
+                    p99_val = stats_dict.get(f"{prefix_high}_p99")
+                    p95_str = f"{float(p95_val):.6f}" if p95_val is not None else "N/A"
+                    p99_str = f"{float(p99_val):.6f}" if p99_val is not None else "N/A"
+                    return (p95_str, p99_str)
                 added_total = (dp_counters.get("clone_add", 0) or 0) + (dp_counters.get("split_add", 0) or 0)
                 densify_line = (
                     f"  Densify Δ: calls={_fmt_count(dp_counters.get('densify_calls'))} | "
@@ -772,18 +774,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     nco50, nco95 = _stat_pair(new_clone_stats, "op")
                     ncs50, ncs95 = _stat_pair(new_clone_stats, "logS")
                     ncr95, ncr99 = _stat_pair_ext(new_clone_stats, "r2d")
+                    ncr_max = _fmt_stat(new_clone_stats.get("r2d_max")) if isinstance(new_clone_stats, dict) else "N/A"
+                    ncr_mean = _fmt_stat(new_clone_stats.get("r2d_mean")) if isinstance(new_clone_stats, dict) else "N/A"
                     nso50, nso95 = _stat_pair(new_split_stats, "op")
                     nss50, nss95 = _stat_pair(new_split_stats, "logS")
                     nsr95, nsr99 = _stat_pair_ext(new_split_stats, "r2d")
+                    nsr_max = _fmt_stat(new_split_stats.get("r2d_max")) if isinstance(new_split_stats, dict) else "N/A"
+                    nsr_mean = _fmt_stat(new_split_stats.get("r2d_mean")) if isinstance(new_split_stats, dict) else "N/A"
                     po50, po95 = _stat_pair(prune_stats, "op")
                     ps50, ps95 = _stat_pair(prune_stats, "logS")
-                    pr95 = _fmt_stat(prune_stats.get("r2d_p95") if isinstance(prune_stats, dict) else None)
-                    pr99 = _fmt_stat(prune_stats.get("r2d_p99") if isinstance(prune_stats, dict) else None)
+                    pr95_str = f"{float(prune_stats.get('r2d_p95')):.6f}" if isinstance(prune_stats, dict) and prune_stats.get('r2d_p95') is not None else "N/A"
+                    pr99_str = f"{float(prune_stats.get('r2d_p99')):.6f}" if isinstance(prune_stats, dict) and prune_stats.get('r2d_p99') is not None else "N/A"
+                    pr_max = _fmt_stat(prune_stats.get("r2d_max")) if isinstance(prune_stats, dict) else "N/A"
                     print(f"  Densify(sel/clone): grad p50={cg50} p95={cg95} | op p50={co50} p95={co95} | logS p50={cs50} p95={cs95}")
                     print(f"  Densify(sel/split): grad p50={sg50} p95={sg95} | op p50={so50} p95={so95} | logS p50={ss50} p95={ss95}")
-                    print(f"  Densify(new/clone): op p50={nco50} p95={nco95} | logS p50={ncs50} p95={ncs95} | r2d p95={ncr95} p99={ncr99}")
-                    print(f"  Densify(new/split): op p50={nso50} p95={nso95} | logS p50={nss50} p95={nss95} | r2d p95={nsr95} p99={nsr99}")
-                    print(f"  Prune(pruned): op p50={po50} p95={po95} | logS p50={ps50} p95={ps95} | r2d p95={pr95} p99={pr99}")
+                    print(f"  Densify(new/clone): op p50={nco50} p95={nco95} | logS p50={ncs50} p95={ncs95} | r2d p95={ncr95} p99={ncr99} max={ncr_max} mean={ncr_mean}")
+                    print(f"  Densify(new/split): op p50={nso50} p95={nso95} | logS p50={nss50} p95={nss95} | r2d p95={nsr95} p99={nsr99} max={nsr_max} mean={nsr_mean}")
+                    print(f"  Prune(pruned): op p50={po50} p95={po95} | logS p50={ps50} p95={ps95} | r2d p95={pr95_str} p99={pr99_str} max={pr_max}")
                 
                 print("-" * 90)
                 print(f"  Loss Total  │  {loss_total_val:.6f}")
