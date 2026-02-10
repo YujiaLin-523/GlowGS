@@ -833,7 +833,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     n_before = gaussians.get_xyz.shape[0]
                     
                     min_opacity = getattr(opt, 'min_opacity', 0.005)
-                    mask_prune_threshold = getattr(opt, 'mask_prune_threshold', 0.005)
+                    mask_prune_threshold = getattr(opt, 'mask_prune_threshold', 0.01)
                     
                     gaussians.maybe_densify_and_prune(
                         iteration=iteration,
@@ -852,7 +852,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             else:
                 # Post-densification: periodic mask pruning only
                 prune_interval = getattr(opt, 'prune_interval', 1000)
-                mask_prune_threshold = getattr(opt, 'mask_prune_threshold', 0.005)
+                mask_prune_threshold = getattr(opt, 'mask_prune_threshold', 0.01)
                 if iteration % prune_interval == 0:
                     gaussians.mask_prune(mask_threshold=mask_prune_threshold, iteration=iteration)
             
@@ -867,10 +867,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scaler.step(gaussians.optimizer)
                 scaler.step(gaussians.optimizer_i)
                 scaler.update()
-
-                # GlowGS-only safety: keep log-scale in recoverable range (avoids runaway)
-                if hasattr(gaussians, "project_scaling_base_"):
-                    gaussians.project_scaling_base_(lo=-15.0, hi=4.0)
                 
                 gaussians.optimizer.zero_grad(set_to_none = True)
                 gaussians.optimizer_i.zero_grad(set_to_none = True)
