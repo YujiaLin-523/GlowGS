@@ -105,10 +105,6 @@ class GeometryAppearanceEncoder(nn.Module):
     def appearance_dim(self) -> int:
         return self._fused_dim
 
-    # ---------- progressive upsample (delegate to GeoEncoder) ----------
-    def upsample_resolution(self, new_resolution: int):
-        self.geo_encoder.upsample_resolution(new_resolution)
-
     # ---------- public forward ----------
     def forward(self, coordinates: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """

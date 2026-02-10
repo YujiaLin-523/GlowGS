@@ -1335,47 +1335,6 @@ class GaussianModel:
 
     #     self.active_sh_degree = self.max_sh_degree
 
-    # ------------------------------------------------------------------
-    # VM upsample → Optimizer state sync
-    # ------------------------------------------------------------------
-    def _register_vm_optimizer(self):
-        """
-        After GeoEncoder.upsample_resolution(), the 6 VM nn.Parameters have
-        been replaced via setattr with new (larger) tensors.  Adam still holds
-        references to the OLD tensors, so we must:
-
-          1. Replace the 'grid' param list in optimizer_i with the current
-             self._grid.parameters().
-          2. Delete stale Adam states (exp_avg / exp_avg_sq) for the dead
-             old tensors.
-          3. New parameters will get fresh Adam states on their next .step().
-
-        This is the "精细操作" approach — unchanged parameters (hash encoder,
-        FiLM MLP, projection) keep their accumulated momentum.
-        """
-        if self.optimizer_i is None:
-            return
-
-        new_params = list(self._grid.parameters())
-        new_id_set = {id(p) for p in new_params}
-
-        replaced = 0
-        for group in self.optimizer_i.param_groups:
-            if group["name"] == "grid":
-                old_params = group["params"]
-                # Delete optimizer state for parameters that no longer exist
-                for old_p in old_params:
-                    if id(old_p) not in new_id_set:
-                        if old_p in self.optimizer_i.state:
-                            del self.optimizer_i.state[old_p]
-                        replaced += 1
-                # Replace param list with current module parameters
-                group["params"] = new_params
-                break
-
-        print(f"[OPTIMIZER] VM upsample sync: replaced {replaced} stale param "
-              f"refs, optimizer_i 'grid' group now has {len(new_params)} params")
-
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:

@@ -141,11 +141,6 @@ class GeometryAppearanceEncoder(nn.Module):
 
         return shared_latent, geometry_latent, appearance_latent
 
-    # ---------- progressive upsample (delegate) ----------
-    def upsample_resolution(self, new_resolution: int):
-        """Upsample VM parameters of the inner GeoEncoder."""
-        self.geo_encoder.upsample_resolution(new_resolution)
-
     # ---------- public forward ----------
     def forward(
         self,

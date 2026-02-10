@@ -15,8 +15,7 @@ Key design choices (matching TensoRF):
   • grid_sample:  padding_mode='border', align_corners=True
   • Lines are *vertical* strips [1, R, Res, 1] sampled with (0, u)
   • Fusion = Hadamard product per branch, then Sum (not Concat)
-  • init_scale = 0.1  so  plane×line ≈ 0.01  at start
-  • Progressive resolution upsampling via upsample_resolution()
+    • init_scale = 0.1  so  plane×line ≈ 0.01  at start
 """
 
 import torch
@@ -32,7 +31,7 @@ class GeoEncoder(nn.Module):
     Output: [N, out_channels] geometry features.
 
     Args:
-        resolution:   Spatial resolution of planes / lines (default 128).
+        resolution:   Spatial resolution of planes / lines (default 192).
         rank:         Number of VM components per branch (default 48).
         out_channels: Output feature dimension after projection (default 32).
         init_scale:   Std of parameter initialization (default 0.1).
@@ -40,8 +39,8 @@ class GeoEncoder(nn.Module):
 
     def __init__(
         self,
-        resolution: int = 128,
-        rank: int = 48,
+        resolution: int = 192,
+        rank: int = 32,
         out_channels: int = 32,
         init_scale: float = 0.1,
     ):
@@ -140,34 +139,6 @@ class GeoEncoder(nn.Module):
 
         # Projection
         return self.projection(vm_feat)            # [N, out_channels]
-
-    # ------------------------------------------------------------------
-    # Progressive upsampling
-    # ------------------------------------------------------------------
-    def upsample_resolution(self, new_resolution: int):
-        """
-        Upsample all 6 VM parameters (3 planes + 3 lines) to *new_resolution*
-        using bilinear interpolation.  Typically called once at step ~7000.
-        """
-        if new_resolution == self.resolution:
-            return
-        device = self.plane_xy.device
-        dtype  = self.plane_xy.dtype
-
-        for name in ['plane_xy', 'plane_xz', 'plane_yz']:
-            old = getattr(self, name)                                        # [1, R, H, W]
-            new = F.interpolate(old.data, size=(new_resolution, new_resolution),
-                                mode='bilinear', align_corners=True)
-            setattr(self, name, nn.Parameter(new.to(device=device, dtype=dtype)))
-
-        for name in ['line_z', 'line_y', 'line_x']:
-            old = getattr(self, name)                                        # [1, R, H, 1]
-            new = F.interpolate(old.data, size=(new_resolution, 1),
-                                mode='bilinear', align_corners=True)
-            setattr(self, name, nn.Parameter(new.to(device=device, dtype=dtype)))
-
-        self.resolution = new_resolution
-        print(f"[GeoEncoder] Upsampled VM resolution → {new_resolution}")
 
     # ------------------------------------------------------------------
     # Public forward

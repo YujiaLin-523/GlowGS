@@ -563,26 +563,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Loss
             gt_image = viewpoint_cam.original_image.cuda()
             
-            # Progressive VM upsampling (TensoRF-style: coarse → fine over multiple steps)
-            if hasattr(gaussians._grid, 'upsample_resolution'):
-                _upsample_iters_str = getattr(dataset, 'vm_upsample_iters', '2000,3500,5000,7000')
-                _vm_final_res = getattr(dataset, 'vm_final_resolution', 300)
-                _vm_init_res = getattr(dataset, 'geo_resolution', 128)
-                _upsample_iters = [int(x) for x in _upsample_iters_str.split(',')]
-                if iteration in _upsample_iters:
-                    _step_idx = _upsample_iters.index(iteration)
-                    _n_steps = len(_upsample_iters)
-                    # Log-linear interpolation from init to final resolution (matching TensoRF)
-                    _log_init = math.log(_vm_init_res)
-                    _log_final = math.log(_vm_final_res)
-                    _new_res = int(round(math.exp(
-                        _log_init + (_log_final - _log_init) * (_step_idx + 1) / _n_steps
-                    )))
-                    gaussians._grid.upsample_resolution(_new_res)
-                    # Re-register upsampled parameters with the optimizer
-                    if hasattr(gaussians, '_register_vm_optimizer'):
-                        gaussians._register_vm_optimizer()
-            
             # ----------------------------------------------------------------
             # Standard pixel-wise loss: treat all regions equally for optimal PSNR
             # ----------------------------------------------------------------
