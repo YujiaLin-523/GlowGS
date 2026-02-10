@@ -9,6 +9,12 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import warnings
+warnings.filterwarnings("ignore", message=".*has_cuda.*deprecated.*")
+warnings.filterwarnings("ignore", message=".*has_cudnn.*deprecated.*")
+warnings.filterwarnings("ignore", message=".*has_mps.*deprecated.*")
+warnings.filterwarnings("ignore", message=".*has_mkldnn.*deprecated.*")
+
 import os
 import math
 import torch
@@ -767,6 +773,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     print(f"  Densify(new/split): op p50={nso50} p95={nso95} | logS p50={nss50} p95={nss95} | r2d p95={nsr95} p99={nsr99} max={nsr_max} mean={nsr_mean}")
                     print(f"  Prune(pruned): op p50={po50} p95={po95} | logS p50={ps50} p95={ps95} | r2d p95={pr95_str} p99={pr99_str} max={pr_max}")
                 
+                # ── Encoder residual energy diagnostics (computed from cached b/r/f) ──
+                _enc_cache = getattr(gaussians._grid, '_dbg_cache', None)
+                if _enc_cache is not None:
+                    _b = _enc_cache["b"]
+                    _r = _enc_cache["r"]
+                    _f = _enc_cache["f"]
+                    # Shape consistency guard
+                    if _b.shape == _r.shape == _f.shape:
+                        nb_vec = _b.norm(dim=1)
+                        nr_vec = _r.norm(dim=1)
+                        nb_val = nb_vec.mean().item()
+                        nr_val = nr_vec.mean().item()
+                        rho_val = nr_val / (nb_val + 1e-8)
+                        cos_val = ((_b * _r).sum(dim=1) / (nb_vec * nr_vec + 1e-8)).mean().item()
+                        print(f"  Encoder(residual)  │  nb={nb_val:.4f}  nr={nr_val:.4f}  rho={rho_val:.4f}  cos={cos_val:.4f}")
+                        # Consistency check: f must equal b+r (first 5 summaries)
+                        _summary_count = getattr(training, '_enc_check_count', 0)
+                        if _summary_count < 5:
+                            err_val = (_f - (_b + _r)).abs().mean().item()
+                            print(f"  Encoder(check)     │  err={err_val:.2e}  shape(b)={list(_b.shape)}  shape(r)={list(_r.shape)}  shape(f)={list(_f.shape)}")
+                            training._enc_check_count = _summary_count + 1
+                    else:
+                        print(f"  Encoder(residual)  │  SHAPE MISMATCH b={list(_b.shape)} r={list(_r.shape)} f={list(_f.shape)}")
+                elif getattr(gaussians._grid, 'enable_vm', True) is False:
+                    print(f"  Encoder(residual)  │  N/A (enable_vm=False, hash-only mode)")
                 print("-" * 90)
                 print(f"  Loss Total  │  {loss_total_val:.6f}")
                 print(f"  Loss RGB    │  L1 = {Ll1.item():.6f}  │  SSIM = {(1.0 - ssim(image, gt_image)).item():.6f}")

@@ -64,7 +64,7 @@ class GeometryAppearanceEncoder(nn.Module):
             resolution=geo_resolution,
             rank=geo_rank,
             out_channels=geo_channels,
-            init_scale=0.1,
+            init_scale=0.5,
         )
         self.geo_dim = geo_channels                  # G
 

@@ -76,7 +76,7 @@ class GeometryAppearanceEncoder(nn.Module):
             resolution=geo_resolution,
             rank=geo_rank,
             out_channels=geo_channels,
-            init_scale=0.1,
+            init_scale=0.5,
         )
         self.geo_dim = geo_channels   # G == H
 
@@ -91,6 +91,10 @@ class GeometryAppearanceEncoder(nn.Module):
         # ── Output dimension (unified) ───────────────────────────────────
         self._out_dim = out_dim
         self._fused_dim = self.hash_dim   # == geo_channels == 32
+
+        # ── Diagnostic cache (raw b/r/f tensors, consumed by training summary) ──
+        # Written every forward (detach only, no compute). Read+computed in train.py.
+        self._dbg_cache = None   # dict {"b", "r", "f"} or None
 
     # ---------- dimension properties ----------
     @property
@@ -121,6 +125,7 @@ class GeometryAppearanceEncoder(nn.Module):
         hash_latent = self.hash_encoder(coordinates).float()   # [N, H]
 
         if not self.enable_vm:
+            self._dbg_cache = None  # no VM → nothing to diagnose
             return hash_latent, hash_latent
 
         # ── VM branch (same coordinates tensor) ─────────────────────────
@@ -131,5 +136,14 @@ class GeometryAppearanceEncoder(nn.Module):
 
         # ── Fusion ───────────────────────────────────────────────────────
         f = fg + r                                             # [N, 32]
+
+        # ── Diagnostic cache (detach only, no compute — O(1) cost) ───────
+        # b=fg, r=r, f=f  are the EXACT three tensors satisfying f == b + r.
+        # Statistics are computed lazily in train.py at summary time only.
+        self._dbg_cache = {
+            "b": fg.detach(),
+            "r": r.detach(),
+            "f": f.detach(),
+        }
 
         return f, f

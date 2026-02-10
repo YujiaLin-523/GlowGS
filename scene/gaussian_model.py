@@ -146,10 +146,6 @@ class GaussianModel:
         
         self._aabb = torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], dtype=torch.float, device='cuda')
 
-        # Log encoder dimensions
-        print(f"[EncoderDims] enable_vm={self._enable_vm} fused_dim={fused_dim} "
-              f"(base={base_dim} geo={geometry_dim} app={appearance_dim})")
-
         self._rotation_init = torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float, device='cuda')
         self._opacity_init = torch.tensor([[np.log(0.1 / (1 - 0.1))]], dtype=torch.float, device='cuda')
 
