@@ -439,15 +439,16 @@ class GaussianModel:
             fused_feat, _ = self._grid(coords)
 
             # All heads use the same unified fused feature
-            scaling_chunks.append(self._scaling_head(fused_feat))
-            rotation_chunks.append(self._rotation_head(fused_feat) + self._rotation_init)
-            opacity_chunks.append(self._opacity_head(fused_feat) + self._opacity_init)
+            # .float() casts tcnn FP16 output to FP32 (matching LocoGS)
+            scaling_chunks.append(self._scaling_head(fused_feat).float())
+            rotation_chunks.append(self._rotation_head(fused_feat).float() + self._rotation_init)
+            opacity_chunks.append(self._opacity_head(fused_feat).float() + self._opacity_init)
 
             # Appearance head: SH features (same fused feature input)
             if self.max_sh_degree > 0:
                 features_rest_chunks.append(
                     self._features_rest_head(fused_feat).view(
-                        -1, (self.max_sh_degree + 1) ** 2 - 1, 3)
+                        -1, (self.max_sh_degree + 1) ** 2 - 1, 3).float()
                 )
 
         self._opacity = torch.cat(opacity_chunks, dim=0)
