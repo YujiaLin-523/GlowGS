@@ -160,7 +160,6 @@ def save_ablation_config(output_dir, dataset, opt, pipe):
             'max_gaussians': getattr(opt, 'max_gaussians', 6_000_000),
             'densify_until_iter': getattr(opt, 'densify_until_iter', 15000),
             'densify_grad_threshold': opt.densify_grad_threshold,
-            'mass_aware_scale': getattr(opt, 'mass_aware_scale', 0.1),
         },
         'dataset_settings': {
             'source_path': dataset.source_path,
@@ -215,7 +214,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         dataset.geo_resolution, dataset.geo_rank, dataset.geo_channels,
         enable_vm=enable_vm,
         enable_mass_aware=enable_mass_aware,
-        mass_aware_scale=getattr(opt, 'mass_aware_scale', 0.1),
         enable_mass_gate=getattr(opt, 'enable_mass_gate', True),
         mass_gate_opacity_threshold=getattr(opt, 'mass_gate_opacity_threshold', 0.3),
         mass_gate_radius_percentile=getattr(opt, 'mass_gate_radius_percentile', 80.0),
@@ -417,7 +415,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # AMP
         print("\n[Training Tech]")
         print(f"  AMP (mixed precision) : {use_amp}")
-        print(f"  Detail-aware densify  : {getattr(opt, 'enable_detail_aware', True)}")
         
         print("\n" + "#" * 90 + "\n")
 
@@ -579,10 +576,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Edge loss: unified interface for ablation studies
             # Mode can be "none" | "sobel_weighted" | "cosine_edge" (default)
             edge_loss_mode = getattr(opt, 'edge_loss_mode', 'cosine_edge')
-            edge_loss_start_iter = getattr(opt, 'edge_loss_start_iter', 0)
-            edge_loss_end_iter = getattr(opt, 'edge_loss_end_iter', edge_loss_start_iter + 2000)
-            lambda_grad = getattr(opt, 'lambda_grad', 0.05)
-            flat_weight = getattr(opt, 'edge_flat_weight', 0.5)
+            edge_loss_start_iter = getattr(opt, 'edge_loss_start_iter', 15000)
+            edge_loss_end_iter = getattr(opt, 'edge_loss_end_iter', 20000)
+            lambda_grad = getattr(opt, 'lambda_grad', 0.01)
+            flat_weight = getattr(opt, 'edge_flat_weight', 0.0)
             
             # Compute edge loss ramp weight: smooth transition from 0 to 1
             if iteration < edge_loss_start_iter:

@@ -164,76 +164,6 @@ def _get_or_compute_gt_gradients(gt_rgb, image_id=None):
     return gt_grad
 
 
-def compute_pixel_importance(gt_rgb, pred_rgb, power_edge=1.2, power_error=1.0):
-    """
-    Compute per-pixel importance for feature-weighted densification (GlowGS innovation #3).
-    
-    Design Philosophy:
-    - Identifies regions requiring more Gaussian capacity: high-frequency details + hard-to-fit areas.
-    - Combines two complementary signals:
-      1. Edge strength (from GT Laplacian): captures intrinsic scene complexity (textures, edges).
-      2. Error strength (from residual): captures current reconstruction difficulty.
-    - Weighted sum (0.7 edge + 0.3 error) ensures edges are always prioritized, even when
-      temporarily well-fitted, preventing premature under-representation.
-    
-    Usage: Per-pixel importance is aggregated to per-Gaussian importance scores via EMA,
-           which then modulate densification thresholds (high importance → easier to split/clone).
-    
-    Args:
-        gt_rgb: Ground truth image [C, H, W] or [B, C, H, W]
-        pred_rgb: Predicted image [C, H, W] or [B, C, H, W]
-        power_edge: Exponent for edge_strength (default 1.2)
-        power_error: Exponent for error_strength (default 1.0)
-    
-    Returns:
-        pixel_importance: [H, W] tensor with values in [0, 1]
-    """
-    # Ensure 4D: [B, C, H, W]
-    if gt_rgb.dim() == 3:
-        gt_rgb = gt_rgb.unsqueeze(0)
-    if pred_rgb.dim() == 3:
-        pred_rgb = pred_rgb.unsqueeze(0)
-    
-    # ---- Edge strength from GT Sobel ----
-    # OPTIMIZATION: Reuse cached GT gradients instead of recomputing
-    gt_grad = _get_or_compute_gt_gradients(gt_rgb, image_id=None)  # [B, 2, H, W]
-    # Compute magnitude from cached gradients
-    G_gt = torch.sqrt(gt_grad[:, 0:1, :, :] ** 2 + gt_grad[:, 1:2, :, :] ** 2 + 1e-6)  # [B, 1, H, W]
-    
-    # Robust percentile-based normalization (more stable than mean+std for skewed distributions)
-    g_p10 = torch.quantile(G_gt, 0.10).clamp(min=1e-6)
-    g_p90 = torch.quantile(G_gt, 0.90).clamp(min=1e-6)
-    g_range = (g_p90 - g_p10).clamp(min=1e-6)
-    # Map [p10, p90] to ~[0.1, 0.9], with saturation outside
-    edge_strength = ((G_gt - g_p10) / g_range * 0.8 + 0.1).clamp(0.0, 1.0)
-    edge_strength = edge_strength.squeeze(0).squeeze(0)  # [H, W]
-    
-    # ---- Error strength from residual ----
-    residual = (pred_rgb - gt_rgb).abs().mean(dim=1, keepdim=True)  # [B, 1, H, W]
-    r_p10 = torch.quantile(residual, 0.10).clamp(min=1e-6)
-    r_p90 = torch.quantile(residual, 0.90).clamp(min=1e-6)
-    
-    # Prevents noise amplification in converged scenes:
-    # If error spread is small (e.g. <0.05), we shouldn't map small errors to 1.0 importance.
-    r_range = (r_p90 - r_p10).clamp(min=0.05)
-    
-    error_strength = ((residual - r_p10) / r_range * 0.8 + 0.1).clamp(0.0, 1.0)
-    error_strength = error_strength.squeeze(0).squeeze(0)  # [H, W]
-    
-    # ---- Combine: multiplicative gating (error-driven) ----
-    # Key insight: importance should decay when error is low, even at edges.
-    # Old (additive): importance = 0.7*edge + 0.3*error  → edges always high
-    # New (gated): importance = error * (1 + edge)  → converges to 0 when error→0
-    edge_term = edge_strength ** power_edge
-    error_term = error_strength ** power_error
-    pixel_importance = error_term * (1.0 + edge_term)
-    
-    # Normalize to [0, 1] range (max possible is 2.0 when both terms are 1.0)
-    pixel_importance = (pixel_importance / 2.0).clamp(0.0, 1.0)
-    
-    return pixel_importance.detach()  # Detach to avoid graph retention
-
-
 def compute_edge_loss(pred_rgb, gt_rgb=None, gt_grad_cached=None, gt_image_id=None, mode: str = "sobel_weighted", 
                       lambda_edge: float = 0.05, flat_weight: float = 0.5, return_components: bool = False):
     """
@@ -291,18 +221,22 @@ def compute_edge_loss(pred_rgb, gt_rgb=None, gt_grad_cached=None, gt_image_id=No
         )
 
 
-def hybrid_edge_loss(pred_rgb, gt_rgb=None, gt_grad_cached=None, gt_image_id=None, flat_weight: float = 0.5, eps: float = 1e-6, return_components: bool = False):
+def hybrid_edge_loss(pred_rgb, gt_rgb=None, gt_grad_cached=None, gt_image_id=None, flat_weight: float = 0.0, eps: float = 1e-6, return_components: bool = False):
     """
-    Hybrid edge loss: cosine alignment on edge mask M, L1 magnitude suppression on flat regions.
+    Edge-aware cosine alignment loss on edge regions.
 
-    L_edge = M * (1 - cos) + lambda_flat * (1 - M) * ||∇I_pred||_1
+    L_edge = M * (1 - cos_similarity(∇I_pred, ∇I_gt))
+    
+    where M is a soft edge mask derived from GT Sobel gradient magnitude.
+    Only edge regions contribute to the loss; flat regions are left unconstrained
+    to avoid suppressing mid-frequency textures.
     
     Args:
         pred_rgb: Predicted RGB image [3, H, W] or [B, 3, H, W]
         gt_rgb: Ground truth RGB (optional if gt_grad_cached provided)
         gt_grad_cached: Precomputed GT gradients [2, H, W] (gx, gy) - PERFORMANCE OPTIMIZATION
         gt_image_id: Unique identifier for automatic caching (e.g., camera uid)
-        flat_weight: Weight for flat region regularization
+        flat_weight: Deprecated, kept for API compatibility (ignored)
         eps: Numerical stability epsilon
         return_components: Return (loss, edge_term, flat_term) if True
     """
@@ -316,46 +250,39 @@ def hybrid_edge_loss(pred_rgb, gt_rgb=None, gt_grad_cached=None, gt_image_id=Non
     
     # Use cached GT gradients if available (50% speedup)
     if gt_grad_cached is not None:
-        # Explicitly provided cached gradients (highest priority)
-        # gt_grad_cached is [2, H, W], expand to [1, 2, H, W]
         gt_grad = gt_grad_cached.unsqueeze(0)
     elif gt_image_id is not None and gt_rgb is not None:
-        # Automatic caching using image_id (e.g., camera uid)
         gt_grad = _get_or_compute_gt_gradients(gt_rgb, image_id=gt_image_id)
     else:
-        # Fallback: compute on-the-fly (backward compatibility)
         if gt_rgb is None:
             raise ValueError("Either gt_rgb or gt_grad_cached must be provided")
         if gt_rgb.dim() == 3:
             gt_rgb = gt_rgb.unsqueeze(0)
         gt_gray = _rgb_to_grayscale(gt_rgb)
-        gt_grad = _compute_sobel_gradients(gt_gray, kx, ky)  # [B, 2, H, W]
+        gt_grad = _compute_sobel_gradients(gt_gray, kx, ky)
 
     pred_norm = torch.linalg.norm(pred_grad, dim=1, keepdim=True).clamp_min(eps)
     gt_norm = torch.linalg.norm(gt_grad, dim=1, keepdim=True).clamp_min(eps)
 
-    # Cosine similarity
+    # Cosine similarity between predicted and GT gradient directions
     denom = pred_norm * gt_norm + eps
     cos_sim = (pred_grad * gt_grad).sum(dim=1, keepdim=True) / denom
     cos_sim = torch.clamp(cos_sim, -1.0, 1.0)
 
-    # Edge mask M from GT gradient percentile scaling
+    # Soft edge mask M from GT gradient magnitude (p80 + sigmoid for smooth transition)
     gt_detached = gt_norm.detach()
-    g_p95 = torch.quantile(gt_detached[..., ::4, ::4], 0.95).clamp(min=eps)
-    grad_scale = g_p95 / 0.7 + eps
-    mask = torch.clamp(gt_detached / grad_scale, 0.0, 1.0)
+    g_ref = torch.quantile(gt_detached[..., ::4, ::4], 0.80).clamp(min=eps)
+    # Sigmoid centered at 0.5 * g_ref, with steepness 5.0 / g_ref
+    # Maps: gradient ≈ 0 → M ≈ 0.08, gradient ≈ g_ref → M ≈ 0.92
+    mask = torch.sigmoid(5.0 * (gt_detached / g_ref - 0.5))
 
+    # Edge-only cosine alignment loss (no flat region penalty)
     mask_sum = mask.sum().clamp_min(1.0)
-    flat_mask = 1.0 - mask
-    flat_sum = flat_mask.sum().clamp_min(1.0)
-
-    loss_cos = (mask * (1.0 - cos_sim)).sum() / mask_sum
-    loss_flat = flat_weight * (flat_mask * pred_norm).sum() / flat_sum
-    loss = loss_cos + loss_flat
+    loss = (mask * (1.0 - cos_sim)).sum() / mask_sum
 
     if return_components:
         edge_term = (mask * (1.0 - cos_sim)).mean().detach()
-        flat_term = (flat_mask * pred_norm).mean().detach()
+        flat_term = torch.tensor(0.0, device=pred_rgb.device)
         return loss, edge_term, flat_term
     return loss
 
@@ -429,15 +356,11 @@ def gradient_loss(pred_rgb, gt_rgb=None, gt_grad_cached=None, gt_image_id=None, 
     
     # Build edge confidence mask from GT gradient (detached to avoid gradient path issues)
     # Higher values at edges, lower at flat regions
-    # Use adaptive percentile-based scaling for robustness across different scene types
+    # Use adaptive p80 + sigmoid for smooth transition (consistent with hybrid_edge_loss)
     eps = 1e-6
     G_gt_detached = G_gt_norm.detach()
-    # Use 95th percentile as reference scale (more robust than mean for bimodal distributions)
-    # Subsample by stride=4 to reduce quantile sorting cost (~16x speedup, negligible accuracy loss)
-    g_p95 = torch.quantile(G_gt_detached[..., ::4, ::4], 0.95).clamp(min=eps)
-    # Scale so that p95 maps to ~0.7, allowing headroom for stronger edges
-    grad_scale = g_p95 / 0.7 + eps
-    edge_confidence = torch.clamp(G_gt_detached / grad_scale, 0.0, 1.0)
+    g_ref = torch.quantile(G_gt_detached[..., ::4, ::4], 0.80).clamp(min=eps)
+    edge_confidence = torch.sigmoid(5.0 * (G_gt_detached / g_ref - 0.5))
     
     # Edge alignment term: match pred gradient to GT gradient at edge locations
     edge_term = torch.abs(G_pred_norm - G_gt_norm) * edge_confidence

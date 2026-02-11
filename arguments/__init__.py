@@ -164,8 +164,6 @@ class OptimizationParams(ParamGroup):
         self.opacity_reset_interval = 3000  # reset opacity to prevent over-saturation
         self.densify_from_iter = 500        # start densification after warmup
         self.densify_until_iter = 15_000    # LocoGS: 15K (stop densification)
-        # Mass-aware densification strength (xi). Larger = stronger pruning.
-        self.mass_aware_scale = 0.1
         
         # Mass-Aware Gate (GlowGS innovation: block large & transparent from clone/split)
         # This prevents "garbage duplication" - copying volumetric blobs that occlude fine details
@@ -189,16 +187,13 @@ class OptimizationParams(ParamGroup):
 
         # Edge-aware loss configuration (GlowGS innovation #2)
         # Controlled by --enable_edge_loss True/False in ModelParams; these are schedule params.
-        self.edge_loss_start_iter = 5000    # edge loss ramp start (begin transition)
-        self.edge_loss_end_iter = 7000      # edge loss ramp end (full strength)
-        self.lambda_grad = 0.05             # edge loss weight (cosine term is small; keep strong enough)
-        self.edge_flat_weight = 0.5         # flat region penalty weight (restores background denoising)
+        # IMPORTANT: edge loss starts AFTER densification ends to avoid interfering with
+        # gradient accumulation used for clone/split decisions.
+        self.edge_loss_start_iter = 15000   # edge loss ramp start (= densify_until_iter)
+        self.edge_loss_end_iter = 20000     # edge loss ramp end (5K ramp for smooth transition)
+        self.lambda_grad = 0.01             # edge loss weight (reduced to avoid conflict with pixel loss)
+        self.edge_flat_weight = 0.0         # flat region penalty disabled (causes texture over-smoothing)
         
-        # Warmup/Ramp configuration for step-free training (avoid 5k iteration discontinuity)
-        self.mass_aware_start_iter = 3000   # mass-aware gradient weighting ramp start
-        self.mass_aware_end_iter = 5000     # mass-aware gradient weighting ramp end
-        self.size_prune_start_iter = 4000   # size-aware pruning ramp start
-        self.size_prune_end_iter = 6000     # size-aware pruning ramp end
         # Profiling 相关参数（默认关闭）
         self.profile_iters = 0
         self.profile_wait = 2
@@ -207,15 +202,6 @@ class OptimizationParams(ParamGroup):
         self.profile_logdir = ""
         # Mixed precision training (AMP) - 可选启用以加速训练和减少显存
         self.use_amp = False  # Set to True to enable automatic mixed precision
-        
-        # Detail-aware densification/pruning (enabled by default)
-        # Reallocates Gaussian budget toward high-frequency detail regions
-        self.enable_detail_aware = True          # Master switch for detail-aware densify/prune
-        self.detail_ema_decay = 0.9              # EMA decay for per-Gaussian detail_importance
-        self.detail_importance_power_edge = 1.2  # Exponent for edge_strength in pixel_importance
-        self.detail_importance_power_error = 1.0 # Exponent for error_strength in pixel_importance
-        self.detail_densify_scale = 0.5          # k: effective_threshold = base / (1 + k * detail_importance)
-        self.detail_prune_weight = 0.2           # Weight for detail term in prune score
         
         # ========================================================================
         super().__init__(parser, "Optimization Parameters")

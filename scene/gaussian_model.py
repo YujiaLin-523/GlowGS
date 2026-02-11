@@ -153,7 +153,6 @@ class GaussianModel:
                  geo_resolution=128, geo_rank=48, geo_channels=32,
                  enable_vm: bool = True,
                  enable_mass_aware: bool = True,
-                 mass_aware_scale: float = 0.1,
                  enable_mass_gate: bool = True,
                  mass_gate_opacity_threshold: float = 0.3,
                  mass_gate_radius_percentile: float = 80.0):
@@ -162,9 +161,8 @@ class GaussianModel:
         # ── Ablation switches ──
         self._enable_vm = enable_vm
         self._enable_mass_aware = enable_mass_aware
-        # Mass-aware gradient weighting scale (xi): higher = stronger pruning, lower = softer
-        self._mass_aware_scale = mass_aware_scale
         # Mass Gate parameters (GlowGS innovation: block large & transparent from clone/split)
+        # Uses world-space scaling to identify large Gaussians (stable, view-independent).
         self._enable_mass_gate = enable_mass_gate if self._enable_mass_aware else False
         self._mass_gate_opacity_threshold = mass_gate_opacity_threshold
         self._mass_gate_radius_percentile = mass_gate_radius_percentile
@@ -1154,12 +1152,6 @@ class GaussianModel:
         densify_until = getattr(training_args, 'densify_until_iter', 15000)
         prune_interval = getattr(training_args, 'prune_interval', 1000)
         
-        # Store warmup/ramp schedule from training args
-        self.mass_aware_start_iter = getattr(training_args, 'mass_aware_start_iter', 3000)
-        self.mass_aware_end_iter = getattr(training_args, 'mass_aware_end_iter', 5000)
-        self.size_prune_start_iter = getattr(training_args, 'size_prune_start_iter', 4000)
-        self.size_prune_end_iter = getattr(training_args, 'size_prune_end_iter', 6000)
-        
         self.gaussian_capacity_config.update({
             "max_point_count": max_gaussians,
             "densify_until_iter": densify_until,
@@ -1628,8 +1620,9 @@ class GaussianModel:
         # high-frequency texture recovery. Inria 3DGS has no such constraint.
 
         # Mass Gate: block (large && transparent) Gaussians from cloning
-        # Prevents "garbage duplication" that occludes fine details
-        # Only affects clone selection, NOT pruning (safe: cannot cause point collapse)
+        # Prevents "garbage duplication" - copying volumetric blobs that occlude fine details.
+        # Uses world-space scaling (stable) instead of screen-space max_radii2D (view-dependent).
+        # Only affects clone selection, NOT pruning (safe: cannot cause point collapse).
         enable_mass_gate = getattr(self, '_enable_mass_gate', True)
         if enable_mass_gate:
             opacity = self.get_opacity.squeeze()
@@ -1637,13 +1630,14 @@ class GaussianModel:
             radius_pct = getattr(self, '_mass_gate_radius_percentile', 80.0)
             
             is_transparent = opacity < opacity_thresh
-            radii_valid = self.max_radii2D > 0
-            if radii_valid.sum() > 0:
-                radius_thresh = torch.quantile(
-                    self.max_radii2D[radii_valid].float(), 
+            world_scale = self.get_scaling.max(dim=1).values  # [N] world-space size
+            valid_scale = world_scale > 0
+            if valid_scale.sum() > 0:
+                scale_thresh = torch.quantile(
+                    world_scale[valid_scale].float(),
                     radius_pct / 100.0
                 )
-                is_large = self.max_radii2D > radius_thresh
+                is_large = world_scale > scale_thresh
                 mass_gate_reject = torch.logical_and(is_large, is_transparent)
                 selected_pts_mask = torch.logical_and(selected_pts_mask, ~mass_gate_reject)
 
@@ -1682,36 +1676,16 @@ class GaussianModel:
         #           f"p90={pcts[3]:.6f} p95={pcts[4]:.6f} p99={pcts[5]:.6f} "
         #           f"threshold={max_grad:.6f} select_ratio={sel_ratio:.3f}")
 
-        # Mass-aware bypass: when enable_mass_aware=False, skip size-decay weighting
-        # and use raw gradients for both clone and split (standard 3DGS behavior).
-        if not self._enable_mass_aware:
-            clone_grads = grads
-            split_grads = grads
-        else:
-            warmup_iter = 3000
-            tau = 0.5  # FIXED: Increased from 0.1 to reduce over-suppression (safe baseline)
-
-            if iteration < warmup_iter:
-                clone_grads = grads
-                split_grads = grads
-            else:
-                # Post-warmup: apply size-decay weight to clone, keep split raw
-                # CRITICAL FIX: Use world-space scaling, NOT screen-space max_radii2D
-                world_scale = self.get_scaling.max(dim=1).values  # [N] World-space Gaussian radius
-                extent_safe = max(extent, 1e-6)
-                decay = (world_scale / (tau * extent_safe)) ** 2
-                weight = 1.0 / (1.0 + decay)  # [N] Size-decay weight (0.0~1.0)
-                
-                raw_grad = grads.squeeze(-1)  # [N]
-                clone_grads = (raw_grad * weight).unsqueeze(1)
-                split_grads = raw_grad.unsqueeze(1)
+        # Mass-aware: size-decay removed (Option B). Clone/split both use raw gradients.
+        # Mass Gate in densify_and_clone provides the only mass-aware filtering:
+        # it blocks (large AND transparent) Gaussians from being cloned.
 
         self.update_attributes(force_update=True, iteration=iteration)
-        self.densify_and_clone(clone_grads, max_grad, extent, iteration=iteration)
+        self.densify_and_clone(grads, max_grad, extent, iteration=iteration)
         # Refresh attributes after clone (match LocoGS call sequence)
         # Ensures newly cloned points have correct encoder outputs before split decision
         self.update_attributes(force_update=True, iteration=iteration)
-        self.densify_and_split(split_grads, max_grad, extent, iteration=iteration)
+        self.densify_and_split(grads, max_grad, extent, iteration=iteration)
         self.update_attributes(force_update=True, iteration=iteration)
         # After attributes refresh, gather new-point stats for the slices recorded during densification
         self._finalize_new_point_stats()
