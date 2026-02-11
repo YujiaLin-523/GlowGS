@@ -156,7 +156,7 @@ class OptimizationParams(ParamGroup):
         # others
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
-        self.lambda_mask = 0.004
+        self.lambda_mask = 0.001
         self.lambda_sh_mask = 0.0001
         
         # Densification schedule (LocoGS defaults)
@@ -175,7 +175,7 @@ class OptimizationParams(ParamGroup):
         self.mass_gate_radius_percentile = 80.0   # Radius above this percentile = large (candidate for blocking)
         
         # densify_grad_threshold: gradient magnitude to trigger clone/split
-        self.densify_grad_threshold = 0.0002
+        self.densify_grad_threshold = 0.0004
         
         # Pruning thresholds (LocoGS defaults)
         # min_opacity: prune Gaussians with opacity below this (LocoGS: 0.005 in train.py)

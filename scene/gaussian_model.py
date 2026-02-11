@@ -1114,15 +1114,12 @@ class GaussianModel:
         if is_verbose():
             print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        xyz_min = fused_point_cloud.min(dim=0)[0]
-        xyz_max = fused_point_cloud.max(dim=0)[0]
-        # Add 10% margin to prevent edge points from being exactly on boundary
-        margin = (xyz_max - xyz_min) * 0.1
-        self._aabb = torch.cat([xyz_min - margin, xyz_max + margin]).float()
-        
-        if is_verbose():
-            print(f"[AABB] Computed from point cloud: min={xyz_min.cpu().numpy()}, max={xyz_max.cpu().numpy()}")
-            print(f"[AABB] With 10% margin: {self._aabb.cpu().numpy()}")
+        # Fixed AABB matching LocoGS: [-1, -1, -1, 1, 1, 1]
+        # contract_to_unisphere handles points outside this range via contraction
+        # This is critical for Hash grid consistency — the same [0,1]^3 input
+        # distribution that LocoGS (and original Instant-NGP) was designed for.
+        # Using a fixed AABB ensures the Hash grid resolution allocation is
+        # scene-independent and matches the published baseline.
 
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None]
@@ -1936,6 +1933,21 @@ class GaussianModel:
                       line_z=_to_np_fp16(geo_enc.line_z),
                       line_y=_to_np_fp16(geo_enc.line_y),
                       line_x=_to_np_fp16(geo_enc.line_x))
+        # Alignment / projection / channel_scale stored FP16 for quality.
+        alignment_save = {}
+        if hasattr(self._grid, 'linear_align'):
+            alignment_save['linear_align_weight'] = _to_np_fp16(self._grid.linear_align.weight)
+        if hasattr(self._grid, 'channel_scale'):
+            alignment_save['channel_scale'] = _to_np_fp16(self._grid.channel_scale)
+        if geo_enc is not None and hasattr(geo_enc, 'projection'):
+            alignment_save['projection_weight'] = _to_np_fp16(geo_enc.projection.weight)
+            alignment_save['projection_bias'] = _to_np_fp16(geo_enc.projection.bias)
+        if alignment_save:
+            _save_npz(os.path.join(path, "alignment_fp16.npz"), **alignment_save)
+        # Hash encoder params stored FP16 for quality.
+        if hasattr(self._grid, 'hash_encoder'):
+            _save_npz(os.path.join(path, "hash_encoder_fp16.npz"),
+                      params=_to_np_fp16(self._grid.hash_encoder.params))
         # Tinycudann heads stored FP16, no quantization.
         _save_npz(os.path.join(path, "mlps_fp16.npz"),
                   opacity=_to_np_fp16(self._opacity_head.state_dict()['params']),
@@ -2199,15 +2211,60 @@ class GaussianModel:
                 _strict_assign(geo_enc.line_y, _np_to_torch(vm_npz['line_y'], device='cuda', dtype=torch.float16), "line_y", vm_planes_fp16_path)
                 _strict_assign(geo_enc.line_x, _np_to_torch(vm_npz['line_x'], device='cuda', dtype=torch.float16), "line_x", vm_planes_fp16_path)
 
+        # Alignment / projection / channel_scale FP16 override
+        alignment_fp16_path = os.path.join(path, 'alignment_fp16.npz')
+        if os.path.exists(alignment_fp16_path):
+            al_npz = _load_npz(alignment_fp16_path)
+            if hasattr(self._grid, 'linear_align') and 'linear_align_weight' in al_npz:
+                _strict_assign(self._grid.linear_align.weight,
+                               _np_to_torch(al_npz['linear_align_weight'], device='cuda', dtype=torch.float16),
+                               "linear_align.weight", alignment_fp16_path)
+            if hasattr(self._grid, 'channel_scale') and 'channel_scale' in al_npz:
+                _strict_assign(self._grid.channel_scale,
+                               _np_to_torch(al_npz['channel_scale'], device='cuda', dtype=torch.float16),
+                               "channel_scale", alignment_fp16_path)
+            if geo_enc is not None and hasattr(geo_enc, 'projection'):
+                if 'projection_weight' in al_npz:
+                    _strict_assign(geo_enc.projection.weight,
+                                   _np_to_torch(al_npz['projection_weight'], device='cuda', dtype=torch.float16),
+                                   "projection.weight", alignment_fp16_path)
+                if 'projection_bias' in al_npz:
+                    _strict_assign(geo_enc.projection.bias,
+                                   _np_to_torch(al_npz['projection_bias'], device='cuda', dtype=torch.float16),
+                                   "projection.bias", alignment_fp16_path)
+
+        # Hash encoder params FP16 override
+        hash_fp16_path = os.path.join(path, 'hash_encoder_fp16.npz')
+        if os.path.exists(hash_fp16_path) and hasattr(self._grid, 'hash_encoder'):
+            h_npz = _load_npz(hash_fp16_path)
+            _strict_assign_param(self._grid.hash_encoder,
+                                 _np_to_torch(h_npz['params'], device='cuda', dtype=torch.float16),
+                                 "hash_encoder.params", hash_fp16_path)
+
         self.active_sh_degree = self.max_sh_degree
 
     def load_attributes(self, path):
         self.decompress_attributes(path)
         self.update_attributes()
-        sh_mask = self._sh_mask
-        sh_mask_degree = torch.ones_like(self._features_rest) # (N, 15, 3)
+
+        # _sh_mask may be raw logits (from FP16 quality-first path) or
+        # binary 0/1 (from legacy path).  Convert to probabilities via
+        # sigmoid so the downstream mask-multiply is always correct.
+        sh_mask_raw = self._sh_mask
+        # Heuristic: if any value is outside [−0.5, 1.5] it's logits
+        if sh_mask_raw.min() < -0.5 or sh_mask_raw.max() > 1.5:
+            sh_mask_prob = torch.sigmoid(sh_mask_raw)
+        else:
+            sh_mask_prob = sh_mask_raw  # already binary / probability
+
+        # Binarise with 0.5 threshold for clean SH masking (LocoGS semantics)
+        sh_mask_bin = (sh_mask_prob > 0.5).float()
+
+        # Cumulative masking: if degree d is off, all higher degrees are off
+        # (identical to LocoGS: *= from deg²-1 to end)
+        sh_mask_degree = torch.ones_like(self._features_rest)  # (N, 15, 3)
         for deg in range(1, self.active_sh_degree + 1):
-            sh_mask_degree[:, deg**2 - 1:, :] *= sh_mask[:, deg - 1:deg].unsqueeze(1)
-        
+            sh_mask_degree[:, deg**2 - 1:, :] *= sh_mask_bin[:, deg - 1:deg].unsqueeze(1)
+
         self._features_rest *= sh_mask_degree
-        self.sh_levels = sh_mask.sum(1).int()
+        self.sh_levels = sh_mask_bin.sum(1).int()

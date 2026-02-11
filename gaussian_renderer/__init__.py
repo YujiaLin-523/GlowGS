@@ -85,18 +85,16 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             # Fully vectorized SH mask application (no loop, faster)
             # Build cumulative mask: degree i masks all coefficients from degree i onward
             if pc.active_sh_degree > 0:
-                # Pre-compute degree boundaries: [1, 4, 9, 16, ...] for degrees [0, 1, 2, 3, ...]
-                # Mask structure: sh_mask is (N, max_degree) where sh_mask[:, d-1] applies to degree d
-                # We need to apply cumulative product of masks
+                # Cumulative SH masking: if degree d is masked off, all higher degrees
+                # are also masked off.  This matches LocoGS semantics:
+                #   sh_mask_expanded[:, deg**2:, :] *= sh_mask[:, deg-1:deg]
                 N, C, _ = shs_view.shape
                 sh_mask_expanded = torch.ones((N, C, 3), device=shs_view.device, dtype=shs_view.dtype)
                 
-                # Vectorized: apply mask to corresponding degree ranges
                 for degree in range(1, min(pc.active_sh_degree + 1, sh_mask.shape[1] + 1)):
                     start_idx = degree ** 2
-                    end_idx = min((degree + 1) ** 2, C) if degree < pc.max_sh_degree else C
-                    # Broadcast mask along the coefficient dimension
-                    sh_mask_expanded[:, start_idx:end_idx, :] *= sh_mask[:, degree - 1:degree, None]
+                    # Cumulative: mask from start_idx to the END (not just this degree's range)
+                    sh_mask_expanded[:, start_idx:, :] *= sh_mask[:, degree - 1:degree, None]
                 
                 shs_view = shs_view * sh_mask_expanded
             
@@ -118,8 +116,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 
                 for degree in range(1, min(pc.active_sh_degree + 1, sh_mask.shape[1] + 1)):
                     start_idx = degree ** 2
-                    end_idx = min((degree + 1) ** 2, C) if degree < pc.max_sh_degree else C
-                    sh_mask_expanded[:, start_idx:end_idx, :] *= sh_mask[:, degree - 1:degree, None]
+                    # Cumulative: mask from start_idx to the END
+                    sh_mask_expanded[:, start_idx:, :] *= sh_mask[:, degree - 1:degree, None]
                 
                 shs = shs * sh_mask_expanded
     else:
@@ -223,8 +221,8 @@ def render_eval(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Ten
 
         for degree in range(1, min(pc.active_sh_degree + 1, sh_mask.shape[1] + 1)):
             start_idx = degree ** 2
-            end_idx = min((degree + 1) ** 2, C) if degree < pc.max_sh_degree else C
-            sh_mask_expanded[:, start_idx:end_idx, :] *= sh_mask[:, degree - 1:degree, None]
+            # Cumulative: mask from start_idx to the END
+            sh_mask_expanded[:, start_idx:, :] *= sh_mask[:, degree - 1:degree, None]
 
     if override_color is None:
         if pipe.convert_SHs_python:

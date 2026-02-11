@@ -121,6 +121,7 @@ run_training() {
     
     local cmd="python train.py \
         -s $DATA_PATH \
+        -i images_4 \
         -m $model_path \
         --enable_vm $vm \
         --enable_mass_aware $ma \

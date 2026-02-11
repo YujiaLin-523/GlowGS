@@ -160,6 +160,17 @@ run_experiment() {
     local output_dir="$OUTPUT_BASE/${scene}_${model}"
     local log_file="$LOG_DIR/${scene}_${model}.log"
     
+    # Determine image resolution per scene (matching LocoGS convention)
+    local images_arg=""
+    case "$scene" in
+        bonsai|counter|kitchen|room)
+            images_arg="-i images_2"
+            ;;
+        bicycle|garden|stump|flowers|treehill)
+            images_arg="-i images_4"
+            ;;
+    esac
+    
     # Check for pre-generated point cloud
     local pcd_arg=""
     local pcd_path="output/${scene}/nerfacto/run/point_cloud.ply"
@@ -177,7 +188,7 @@ run_experiment() {
     echo ""
     
     if [ "$DRY_RUN" = true ]; then
-        echo "[DRY RUN] python -u train.py -s $scene_path -m $output_dir --iterations $ITERATIONS --eval --enable_vm $vm --enable_mass_aware $ma --enable_edge_loss $el --test_iterations $TEST_ITERATIONS --save_iterations $SAVE_ITERATIONS $pcd_arg"
+        echo "[DRY RUN] python -u train.py -s $scene_path $images_arg -m $output_dir --iterations $ITERATIONS --eval --enable_vm $vm --enable_mass_aware $ma --enable_edge_loss $el --test_iterations $TEST_ITERATIONS --save_iterations $SAVE_ITERATIONS $pcd_arg"
         echo ""
         return 0
     fi
@@ -191,6 +202,7 @@ run_experiment() {
     
     if ! python -u train.py \
         -s "$scene_path" \
+        $images_arg \
         -m "$output_dir" \
         --iterations $ITERATIONS \
         --eval \

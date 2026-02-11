@@ -15,18 +15,30 @@ echo ""
 train_scene() {
     local scene_path=$1
     local scene_name=$2
+    local images_dir=${3:-""}  # optional: images_2, images_4, etc.
     local output_dir="output/${scene_name}"
     
     echo "----------------------------------------"
     echo "Training: ${scene_name}"
     echo "Scene: ${scene_path}"
     echo "Output: ${output_dir}"
+    if [ -n "${images_dir}" ]; then
+        echo "Images: ${images_dir}"
+    fi
     echo "----------------------------------------"
     
-    python train.py \
-        -s "${scene_path}" \
-        -m "${output_dir}" \
-        --eval \
+    if [ -n "${images_dir}" ]; then
+        python train.py \
+            -s "${scene_path}" \
+            -i "${images_dir}" \
+            -m "${output_dir}" \
+            --eval
+    else
+        python train.py \
+            -s "${scene_path}" \
+            -m "${output_dir}" \
+            --eval
+    fi
     
     echo "✓ Completed: ${scene_name}"
     echo ""
@@ -34,15 +46,18 @@ train_scene() {
 
 # ============================================
 # MipNeRF360 (360_v2) Dataset
+# Resolution follows LocoGS convention:
+#   Indoor (bonsai, counter, kitchen, room): images_2
+#   Outdoor (bicycle, garden, stump):        images_4
 # ============================================
 echo "=== Training MipNeRF360 Dataset ==="
-train_scene "data/360_v2/bicycle" "bicycle"
-train_scene "data/360_v2/bonsai" "bonsai"
-train_scene "data/360_v2/counter" "counter"
-train_scene "data/360_v2/garden" "garden"
-train_scene "data/360_v2/kitchen" "kitchen"
-train_scene "data/360_v2/room" "room"
-train_scene "data/360_v2/stump" "stump"
+train_scene "data/360_v2/bicycle" "bicycle" "images_4"
+train_scene "data/360_v2/bonsai" "bonsai" "images_2"
+train_scene "data/360_v2/counter" "counter" "images_2"
+train_scene "data/360_v2/garden" "garden" "images_4"
+train_scene "data/360_v2/kitchen" "kitchen" "images_2"
+train_scene "data/360_v2/room" "room" "images_2"
+train_scene "data/360_v2/stump" "stump" "images_4"
 
 # ============================================
 # Tanks & Temples Dataset
