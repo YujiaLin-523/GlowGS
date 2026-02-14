@@ -214,9 +214,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         dataset.geo_resolution, dataset.geo_rank, dataset.geo_channels,
         enable_vm=enable_vm,
         enable_mass_aware=enable_mass_aware,
-        enable_mass_gate=getattr(opt, 'enable_mass_gate', True),
-        mass_gate_opacity_threshold=getattr(opt, 'mass_gate_opacity_threshold', 0.3),
-        mass_gate_radius_percentile=getattr(opt, 'mass_gate_radius_percentile', 80.0),
     )
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
@@ -638,9 +635,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             
             # Unified detailed logging every 1000 iterations
             if iteration % 1000 == 0:
-                pixel_loss_value = pixel_loss.item()
-                loss_mask_val = mask_loss.item()
-                loss_sh_mask_val = sh_mask_loss.item() if isinstance(sh_mask_loss, torch.Tensor) else sh_mask_loss
                 loss_total_val = loss.item()
                 gaussian_count = gaussians.get_xyz.shape[0]
                 edge_loss_value = Lgrad.item() if isinstance(Lgrad, torch.Tensor) else 0.0
@@ -660,9 +654,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     opacity_mean = opacity_vals.mean().item()
                 else:
                     opacity_p5 = opacity_p50 = opacity_p95 = opacity_mean = 0.0
+                scaling_vals = gaussians.get_scaling.detach()
+                if scaling_vals.numel() > 0:
+                    scale_max = scaling_vals.max(dim=1).values if scaling_vals.dim() > 1 else scaling_vals
+                    scale_p5 = torch.quantile(scale_max, 0.05).item()
+                    scale_p50 = torch.quantile(scale_max, 0.50).item()
+                    scale_p95 = torch.quantile(scale_max, 0.95).item()
+                else:
+                    scale_p5 = scale_p50 = scale_p95 = 0.0
+                mask_vals = gaussians.get_mask.detach().squeeze()
+                if mask_vals.numel() > 0:
+                    mask_p5 = torch.quantile(mask_vals, 0.05).item()
+                    mask_p50 = torch.quantile(mask_vals, 0.50).item()
+                    mask_p95 = torch.quantile(mask_vals, 0.95).item()
+                else:
+                    mask_p5 = mask_p50 = mask_p95 = 0.0
+                film_stats = gaussians.get_film_health_stats(sample=2048)
                 current_sh_degree = gaussians.active_sh_degree
                 if debug_full_gap:
-                    scaling_vals = gaussians.get_scaling.detach()
                     if scaling_vals.numel() > 0:
                         scale_max = scaling_vals.max(dim=1).values
                         scale_p90 = torch.quantile(scale_max, 0.90).item()
@@ -679,8 +688,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     dp_counters, dp_stats = gaussians.consume_densify_prune_stats(reset=True)
                 except Exception:
                     dp_counters, dp_stats = {}, {}
-                verbose_mode = is_verbose(opt)
-                dp_verbose = True  # Always emit densify/prune detail without requiring flags
+                dp_verbose = is_verbose(opt)
                 def _fmt_count(val):
                     if val is None:
                         return "N/A"
@@ -735,6 +743,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("-" * 90)
                 print(f"  Gaussians   │  N = {gaussian_count:,}  │  Capacity = {cap_pct:.1f}%  │  SH Degree = {current_sh_degree}")
                 print(f"  Opacity     │  p5 = {opacity_p5:.3f}  │  p50 = {opacity_p50:.3f}  │  p95 = {opacity_p95:.3f}")
+                print(f"  Scale       │  p5 = {scale_p5:.5f}  │  p50 = {scale_p50:.5f}  │  p95 = {scale_p95:.5f}")
+                print(f"  Mask        │  p5 = {mask_p5:.3f}  │  p50 = {mask_p50:.3f}  │  p95 = {mask_p95:.3f}")
+                if isinstance(film_stats, dict):
+                    print(
+                        f"  FiLM        │  ||gamma|| mean = {film_stats['gamma_norm_mean']:.4f}  p95 = {film_stats['gamma_norm_p95']:.4f}  "
+                        f"│  ||beta|| mean = {film_stats['beta_norm_mean']:.4f}  p95 = {film_stats['beta_norm_p95']:.4f}"
+                    )
+                else:
+                    print("  FiLM        │  ||gamma|| mean = N/A  p95 = N/A  │  ||beta|| mean = N/A  p95 = N/A")
                 print(densify_line)
                 print(prune_line)
                 if dp_verbose:
@@ -770,31 +787,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     print(f"  Densify(new/split): op p50={nso50} p95={nso95} | logS p50={nss50} p95={nss95} | r2d p95={nsr95} p99={nsr99} max={nsr_max} mean={nsr_mean}")
                     print(f"  Prune(pruned): op p50={po50} p95={po95} | logS p50={ps50} p95={ps95} | r2d p95={pr95_str} p99={pr99_str} max={pr_max}")
                 
-                # ── Encoder residual energy diagnostics (computed from cached b/r/f) ──
-                _enc_cache = getattr(gaussians._grid, '_dbg_cache', None)
-                if _enc_cache is not None:
-                    _b = _enc_cache["b"]
-                    _r = _enc_cache["r"]
-                    _f = _enc_cache["f"]
-                    # Shape consistency guard
-                    if _b.shape == _r.shape == _f.shape:
-                        nb_vec = _b.norm(dim=1)
-                        nr_vec = _r.norm(dim=1)
-                        nb_val = nb_vec.mean().item()
-                        nr_val = nr_vec.mean().item()
-                        rho_val = nr_val / (nb_val + 1e-8)
-                        cos_val = ((_b * _r).sum(dim=1) / (nb_vec * nr_vec + 1e-8)).mean().item()
-                        print(f"  Encoder(residual)  │  nb={nb_val:.4f}  nr={nr_val:.4f}  rho={rho_val:.4f}  cos={cos_val:.4f}")
-                        # Consistency check: f must equal b+r (first 5 summaries)
-                        _summary_count = getattr(training, '_enc_check_count', 0)
-                        if _summary_count < 5:
-                            err_val = (_f - (_b + _r)).abs().mean().item()
-                            print(f"  Encoder(check)     │  err={err_val:.2e}  shape(b)={list(_b.shape)}  shape(r)={list(_r.shape)}  shape(f)={list(_f.shape)}")
-                            training._enc_check_count = _summary_count + 1
-                    else:
-                        print(f"  Encoder(residual)  │  SHAPE MISMATCH b={list(_b.shape)} r={list(_r.shape)} f={list(_f.shape)}")
-                elif getattr(gaussians._grid, 'enable_vm', True) is False:
-                    print(f"  Encoder(residual)  │  N/A (enable_vm=False, hash-only mode)")
                 print("-" * 90)
                 print(f"  Loss Total  │  {loss_total_val:.6f}")
                 print(f"  Loss RGB    │  L1 = {Ll1.item():.6f}  │  SSIM = {(1.0 - ssim(image, gt_image)).item():.6f}")
@@ -945,6 +937,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Model size calculation: sum of compression directory
             compression_dir = os.path.join(dataset.model_path, "compression")
             total_bytes = get_dir_size_bytes(compression_dir)
+            disk_bytes = get_directory_size_bytes(compression_dir, verbose=verbose_flag)
+            bytes_match = (
+                total_bytes >= 0
+                and disk_bytes is not None
+                and int(total_bytes) == int(disk_bytes)
+            )
             size_mb = None if total_bytes < 0 else total_bytes / (1024 * 1024)
             
             # Extract scene name from source_path
@@ -970,6 +968,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 "ssim": round(avg_ssim, 4),
                 "lpips": round(avg_lpips, 4),
                 "compression_size_bytes": total_bytes if total_bytes >= 0 else None,
+                "compression_size_disk_bytes": int(disk_bytes) if disk_bytes is not None else None,
+                "size_bytes_match": bool(bytes_match) if disk_bytes is not None and total_bytes >= 0 else None,
                 "compression_size_mb": round(size_mb, 2) if size_mb is not None else None,
                 "size_mb": round(size_mb, 2) if size_mb is not None else None,
                 "fps": round(fps, 1) if fps is not None else None,
@@ -992,6 +992,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             size_str = f"{size_mb:.2f} MB" if size_mb is not None else "N/A"
             fps_str = f"{fps:.2f}" if fps is not None else "N/A"
             print(f"  Size: {size_str}  |  FPS: {fps_str}")
+            if total_bytes >= 0 and disk_bytes is not None:
+                print(f"  Size Check: total_bytes={int(total_bytes)}  |  disk_bytes={int(disk_bytes)}  |  match={bytes_match}")
             print(f"  Gaussians: {gaussians.get_xyz.shape[0]:,}")
             print(f"\n  Stats saved to: {stats_path}")
         else:

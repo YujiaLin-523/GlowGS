@@ -229,7 +229,7 @@ def render_eval(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Ten
 
             shs_view = shs_masked.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
             dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(features.shape[0], 1))
-            dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
+            dir_pp_normalized = dir_pp / (dir_pp.norm(dim=1, keepdim=True) + 1e-7)  # Add epsilon for stability
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             # FIX: DC bias aligned with eval mode (no mask in render_eval, always use 0.5)
             colors_precomp = torch.clamp(sh2rgb + 0.5, 0.0, 1.0)

@@ -255,21 +255,21 @@ for scene in "${SCENES[@]}"; do
 done
 
 # ==============================================================================
-# Aggregate results into CSV
+# Collect results into CSV
 # ==============================================================================
 echo ""
 echo "========================================================================"
-echo "  Aggregating Results to CSV"
+echo "  Collecting Results to CSV"
 echo "========================================================================"
 echo ""
 
 if [ "$DRY_RUN" = true ]; then
-    echo "[DRY RUN] Would aggregate stats.json files to $RESULTS_CSV"
+    echo "[DRY RUN] Would collect stats.json files to $RESULTS_CSV"
 else
     # Create CSV header
     echo "Model,Scene,PSNR,SSIM,LPIPS,Size(MB),FPS,Gaussians" > "$RESULTS_CSV"
     
-    # Python one-liner to aggregate all stats.json files
+    # Python one-liner to collect all stats.json files
     python3 << 'PYTHON_SCRIPT'
 import os
 import json
@@ -308,7 +308,7 @@ with open(csv_path, 'a') as f:
         line = f"{row['model']},{row['scene']},{row['psnr']},{row['ssim']},{row['lpips']},{row['size_mb']},{row['fps']},{row['gaussians']}"
         f.write(line + "\n")
 
-print(f"\n  Total: {len(rows)} experiments aggregated")
+print(f"\n  Total: {len(rows)} experiments collected")
 print(f"  CSV saved to: {csv_path}")
 PYTHON_SCRIPT
 

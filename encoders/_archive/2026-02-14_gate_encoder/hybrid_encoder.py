@@ -116,53 +116,6 @@ class GeometryAppearanceEncoder(nn.Module):
 
         return shared_latent, geometry_latent, appearance_latent
 
-    @torch.no_grad()
-    def film_norm_stats(self, coordinates: torch.Tensor, sample: int = 4096):
-        """
-        Compute FiLM gamma/beta norm statistics on sampled coordinates.
-        Returns mean/p95 for ||gamma|| and ||beta||, or None if disabled.
-        """
-        if not self.enable_vm:
-            return None
-        if coordinates is None or not isinstance(coordinates, torch.Tensor) or coordinates.numel() == 0:
-            return None
-
-        n = int(coordinates.shape[0])
-        if n <= 0:
-            return None
-        s = min(int(sample), n)
-        if s <= 0:
-            return None
-
-        if n > s:
-            idx = torch.randperm(n, device=coordinates.device)[:s]
-            coords = coordinates[idx]
-        else:
-            coords = coordinates
-
-        geo_latent = self.geo_encoder(coords)
-        g_params = self.geometry_film(geo_latent)
-        a_params = self.appearance_film(geo_latent)
-        g_gamma, g_beta = g_params.chunk(2, dim=-1)
-        a_gamma, a_beta = a_params.chunk(2, dim=-1)
-
-        gamma_norm = torch.cat(
-            (torch.norm(g_gamma, dim=-1), torch.norm(a_gamma, dim=-1)), dim=0
-        ).float()
-        beta_norm = torch.cat(
-            (torch.norm(g_beta, dim=-1), torch.norm(a_beta, dim=-1)), dim=0
-        ).float()
-
-        if gamma_norm.numel() == 0 or beta_norm.numel() == 0:
-            return None
-
-        return {
-            "gamma_norm_mean": float(gamma_norm.mean().item()),
-            "gamma_norm_p95": float(torch.quantile(gamma_norm, 0.95).item()),
-            "beta_norm_mean": float(beta_norm.mean().item()),
-            "beta_norm_p95": float(torch.quantile(beta_norm, 0.95).item()),
-        }
-
     # ── public forward ───────────────────────────────────────────────────
     def forward(
         self, coordinates: torch.Tensor

@@ -128,21 +128,29 @@ class GaussianModel:
         # Move encoder and its submodules to GPU
         self._grid = self._grid.cuda()
         
-        # Get encoder output dimensions (unified: all heads use same fused_dim)
+        # Get encoder output dimensions
         base_dim, geometry_dim, appearance_dim = get_encoder_output_dims(self._grid)
-        assert geometry_dim == appearance_dim, (
-            f"Unified encoder requires geometry_dim == appearance_dim, "
-            f"got {geometry_dim} vs {appearance_dim}"
-        )
-        fused_dim = geometry_dim  # == appearance_dim == 32
         
-        # MLP heads for Gaussian attributes (all use unified fused_dim)
-        self._scaling_head = tcnn.Network(n_input_dims=fused_dim, n_output_dims=3, network_config=self.network_config)
-        self._rotation_head = tcnn.Network(n_input_dims=fused_dim, n_output_dims=4, network_config=self.network_config)
-        self._opacity_head = tcnn.Network(n_input_dims=fused_dim, n_output_dims=1, network_config=self.network_config)
+        # MLP heads for Gaussian attributes (input dim = base_dim = hash_dim)
+        self._scaling_head = tcnn.Network(n_input_dims=base_dim, n_output_dims=3, network_config=self.network_config)
+        self._rotation_head = tcnn.Network(n_input_dims=base_dim, n_output_dims=4, network_config=self.network_config)
+        self._opacity_head = tcnn.Network(n_input_dims=base_dim, n_output_dims=1, network_config=self.network_config)
+        self._features_rest_head = tcnn.Network(n_input_dims=base_dim, n_output_dims=(self.max_sh_degree + 1) ** 2 * 3 - 3, network_config=self.network_config)
         
-        # Appearance head: same fused_dim input
-        self._features_rest_head = tcnn.Network(n_input_dims=fused_dim, n_output_dims=(self.max_sh_degree + 1) ** 2 * 3 - 3, network_config=self.network_config)
+        # Role-split projections: map geometry/appearance latent to head input dim
+        # When encoder returns 3-tuple with role split, geometry_dim may differ from base_dim
+        if geometry_dim != base_dim:
+            self._geometry_input_proj = nn.Linear(geometry_dim, base_dim, bias=True).cuda()
+            self._appearance_input_proj = nn.Linear(appearance_dim, base_dim, bias=True).cuda()
+            nn.init.normal_(self._geometry_input_proj.weight, std=0.01)
+            nn.init.zeros_(self._geometry_input_proj.bias)
+            nn.init.normal_(self._appearance_input_proj.weight, std=0.01)
+            nn.init.zeros_(self._appearance_input_proj.bias)
+            self._use_role_split = True
+        else:
+            self._geometry_input_proj = None
+            self._appearance_input_proj = None
+            self._use_role_split = True  # Always use 3-tuple routing with FiLM encoder
         
         self._aabb = torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], dtype=torch.float, device='cuda')
 
@@ -150,22 +158,14 @@ class GaussianModel:
         self._opacity_init = torch.tensor([[np.log(0.1 / (1 - 0.1))]], dtype=torch.float, device='cuda')
 
     def __init__(self, sh_degree: int, hash_size=19, width=64, depth=2,
-                 geo_resolution=128, geo_rank=48, geo_channels=32,
+                 geo_resolution=96, geo_rank=12, geo_channels=8,
                  enable_vm: bool = True,
-                 enable_mass_aware: bool = True,
-                 enable_mass_gate: bool = True,
-                 mass_gate_opacity_threshold: float = 0.3,
-                 mass_gate_radius_percentile: float = 80.0):
+                 enable_mass_aware: bool = True):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree
         # ── Ablation switches ──
         self._enable_vm = enable_vm
         self._enable_mass_aware = enable_mass_aware
-        # Mass Gate parameters (GlowGS innovation: block large & transparent from clone/split)
-        # Uses world-space scaling to identify large Gaussians (stable, view-independent).
-        self._enable_mass_gate = enable_mass_gate if self._enable_mass_aware else False
-        self._mass_gate_opacity_threshold = mass_gate_opacity_threshold
-        self._mass_gate_radius_percentile = mass_gate_radius_percentile
         # Alert threshold for large prune events (fraction of points removed in one call)
         self._prune_alert_thresh = 0.20
         # Store GeoEncoder parameters for serialization/deserialization
@@ -367,17 +367,17 @@ class GaussianModel:
         """
         Update implicit Gaussian attributes from encoder output.
         
-        Coordinate pipeline (matching LocoGS):
-            raw xyz → contract_to_unisphere(xyz, aabb) → [0,1]^3
-            → Hash branch (tcnn expects [0,1]^3)
-            → VM branch (internally maps [0,1] → [-1,1] for grid_sample)
+        Feature role-split routing (enable_vm=True):
+            encoder → (shared, geometry_latent, appearance_latent)
+            geometry_latent  → opacity, scaling, rotation heads
+            appearance_latent → SH / colour head
         
-        Unified feature routing:
-            fused_feat = VM scaffold + λ · aligned Hash residual
-            → all four heads (opacity, scaling, rotation, SH/color)
+        Hash-only fallback (enable_vm=False):
+            encoder → (hash, hash, hash)  — all heads use hash features
         
         Args:
-            force_update: If True, bypass cache and force recomputation
+            force_update: If True, bypass cache and force recomputation.
+            iteration:    Current training iteration (for diagnostics).
         """
         # Fast path: use precomputed cache if available (for inference)
         if self._precomputed_cache is not None and not force_update:
@@ -388,8 +388,6 @@ class GaussianModel:
                 self._features_rest = self._precomputed_cache['features_rest']
             return
         
-        # Smart caching: Only recompute if xyz changed or during densification
-        # This saves ~28ms per iteration (profiler shows 569ms / 20 calls)
         N = self._xyz.shape[0]
         if N == 0:
             return
@@ -397,35 +395,26 @@ class GaussianModel:
         # Training needs a fresh graph every iteration; disable caching when grads are enabled
         caching_enabled = not torch.is_grad_enabled()
         if not caching_enabled:
-            force_update = True  # always recompute under autograd to avoid stale graphs
-            self._cached_attributes_hash = None  # invalidate cache when switching back to training
+            force_update = True
+            self._cached_attributes_hash = None
             
         # Check if we can use cached attributes
         if caching_enabled and not force_update and hasattr(self, '_cached_attributes_hash'):
-            # Use xyz tensor data pointer as a cheap hash (changes on densify/prune/optimizer step)
             current_hash = (self._xyz.data_ptr(), N, self._xyz.requires_grad)
             if current_hash == self._cached_attributes_hash:
-                # Cache hit - skip expensive recomputation
                 if not hasattr(self, '_cache_hit_count'):
                     self._cache_hit_count = 0
                 self._cache_hit_count += 1
                 return
         
-        # Cache miss - need to recompute
         if not hasattr(self, '_cache_miss_count'):
             self._cache_miss_count = 0
         self._cache_miss_count += 1
         
-        # Contract coordinates to [0,1]^3 (matching LocoGS pipeline).
-        # This unified input goes to BOTH Hash (tcnn expects [0,1]^3)
-        # and VM (internally maps [0,1] → [-1,1] for grid_sample).
-        contracted_xyz = contract_to_unisphere(self.get_xyz.detach(), self._aabb)
+        contracted_xyz = self.get_contracted_xyz
 
-        # Optimize chunk size: use larger chunks or process all at once if memory allows
         chunk_size = min(131072, N) if N > 65536 else N
 
-        # Unified feature routing: all heads receive the same fused feature
-        # (VM scaffold + aligned Hash residual, or hash-only if enable_vm=False)
         opacity_chunks = []
         scaling_chunks = []
         rotation_chunks = []
@@ -434,19 +423,37 @@ class GaussianModel:
         for i in range(0, N, chunk_size):
             end_idx = min(i + chunk_size, N)
             coords = contracted_xyz[i:end_idx]
-            fused_feat, _ = self._grid(coords)
 
-            # All heads use the same unified fused feature
-            # .float() casts tcnn FP16 output to FP32 (matching LocoGS)
-            scaling_chunks.append(self._scaling_head(fused_feat).float())
-            rotation_chunks.append(self._rotation_head(fused_feat).float() + self._rotation_init)
-            opacity_chunks.append(self._opacity_head(fused_feat).float() + self._opacity_init)
+            # Encoder returns 3-tuple: (shared, geometry, appearance)
+            shared, geometry_feat, appearance_feat = self._grid(coords)
 
-            # Appearance head: SH features (same fused feature input)
+            # Project geometry/appearance latent if role-split projections exist
+            if self._geometry_input_proj is not None:
+                geometry_feat = torch.clamp(
+                    self._geometry_input_proj(geometry_feat), -10.0, 10.0
+                )
+            if self._appearance_input_proj is not None:
+                appearance_feat = torch.clamp(
+                    self._appearance_input_proj(appearance_feat), -10.0, 10.0
+                )
+
+            # Geometry heads: opacity, scaling, rotation
+            opacity_chunks.append(
+                self._opacity_head(geometry_feat).float() + self._opacity_init
+            )
+            scaling_chunks.append(
+                self._scaling_head(geometry_feat).float()
+            )
+            rotation_chunks.append(
+                self._rotation_head(geometry_feat).float() + self._rotation_init
+            )
+
+            # Appearance head: SH / colour
             if self.max_sh_degree > 0:
                 features_rest_chunks.append(
-                    self._features_rest_head(fused_feat).view(
-                        -1, (self.max_sh_degree + 1) ** 2 - 1, 3).float()
+                    self._features_rest_head(appearance_feat)
+                    .view(-1, (self.max_sh_degree + 1) ** 2 - 1, 3)
+                    .float()
                 )
 
         self._opacity = torch.cat(opacity_chunks, dim=0)
@@ -570,7 +577,7 @@ class GaussianModel:
         return payload
 
     # ------------------------------------------------------------------
-    # Mass-debug helpers (gated by DEBUG_MASS env flag)
+    # Mass-debug helpers (controlled by DEBUG_MASS env flag)
     # ------------------------------------------------------------------
     def _mass_debug_enabled(self) -> bool:
         return bool(self._debug_mass)
@@ -1012,6 +1019,16 @@ class GaussianModel:
             'total_calls': total,
             'hit_rate_percent': hit_rate
         }
+
+    def get_film_health_stats(self, sample: int = 4096):
+        """Expose FiLM gamma/beta norm statistics for training telemetry."""
+        grid = getattr(self, "_grid", None)
+        if grid is None or not hasattr(grid, "film_norm_stats"):
+            return None
+        try:
+            return grid.film_norm_stats(self.get_contracted_xyz, sample=sample)
+        except Exception:
+            return None
     
     def reset_cache_stats(self):
         """Reset cache statistics counters."""
@@ -1615,32 +1632,6 @@ class GaussianModel:
         is_small_ws = torch.max(self.get_scaling, dim=1).values <= self.percent_dense * scene_extent
         selected_pts_mask = torch.logical_and(selected_pts_mask, is_small_ws)
         
-        # [REMOVED] Screen-space size constraint (max_radii2D > 2.0)
-        # Reason: This filter blocked sub-pixel Gaussians from cloning, preventing
-        # high-frequency texture recovery. Inria 3DGS has no such constraint.
-
-        # Mass Gate: block (large && transparent) Gaussians from cloning
-        # Prevents "garbage duplication" - copying volumetric blobs that occlude fine details.
-        # Uses world-space scaling (stable) instead of screen-space max_radii2D (view-dependent).
-        # Only affects clone selection, NOT pruning (safe: cannot cause point collapse).
-        enable_mass_gate = getattr(self, '_enable_mass_gate', True)
-        if enable_mass_gate:
-            opacity = self.get_opacity.squeeze()
-            opacity_thresh = getattr(self, '_mass_gate_opacity_threshold', 0.3)
-            radius_pct = getattr(self, '_mass_gate_radius_percentile', 80.0)
-            
-            is_transparent = opacity < opacity_thresh
-            world_scale = self.get_scaling.max(dim=1).values  # [N] world-space size
-            valid_scale = world_scale > 0
-            if valid_scale.sum() > 0:
-                scale_thresh = torch.quantile(
-                    world_scale[valid_scale].float(),
-                    radius_pct / 100.0
-                )
-                is_large = world_scale > scale_thresh
-                mass_gate_reject = torch.logical_and(is_large, is_transparent)
-                selected_pts_mask = torch.logical_and(selected_pts_mask, ~mass_gate_reject)
-
         num_sel = int(selected_pts_mask.sum().item()) if selected_pts_mask.numel() > 0 else 0
         if num_sel == 0:
             return
@@ -1654,7 +1645,6 @@ class GaussianModel:
         new_sh_mask = self._sh_mask[selected_pts_mask]
 
         self.densification_postfix(new_xyz, new_features_dc, new_scaling_base, new_mask, new_sh_mask, iteration=iteration, kind="clone")
-        self.update_attributes(force_update=True, iteration=iteration)
         self._debug_scale_stats(tag="after_densify_clone", tensor=self._scaling_base, iteration=iteration, force=True, check_assert=True)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, iteration=0, mask_prune_threshold=0.01):
@@ -1677,7 +1667,7 @@ class GaussianModel:
         #           f"threshold={max_grad:.6f} select_ratio={sel_ratio:.3f}")
 
         # Mass-aware: size-decay removed (Option B). Clone/split both use raw gradients.
-        # Mass Gate in densify_and_clone provides the only mass-aware filtering:
+        # Mass-aware filtering in densify_and_clone provides the only mass-aware filtering:
         # it blocks (large AND transparent) Gaussians from being cloned.
 
         self.update_attributes(force_update=True, iteration=iteration)
@@ -1818,9 +1808,9 @@ class GaussianModel:
         
         Per copilot-instructions.md:
         "Mass-aware is a resource allocation signal for Gaussian budget management 
-        (gate/rank/prune), while densify trigger stats must stay RAW (unweighted)."
+        (allocation/rank/prune), while densify trigger stats must stay RAW (unweighted)."
         
-        Mass-Aware Gate is applied in densify_and_clone/split, NOT here.
+        Mass-aware filtering is applied in densify_and_clone/split, NOT here.
         
         Args:
             viewspace_point_tensor: Tensor with .grad containing screen-space gradients
@@ -1890,49 +1880,7 @@ class GaussianModel:
         # G-PCC encoding (geometry stays as legacy GPCC path)
         encode_xyz(xyz, path)
 
-        # -------- Quality-first artifacts (preferred for rendering fidelity) --------
-        # DC in FP16 to preserve SH0/base color fidelity.
-        _save_npz(os.path.join(path, "f_dc_fp16.npz"), data=_to_np_fp16(self._features_dc))
-        # Log-scale base stored in FP16 to avoid exp-amplified quantization error.
-        _save_npz(os.path.join(path, "scale_base_fp16.npz"), data=_to_np_fp16(self._scaling_base))
-        # Mask / SH mask stored as logits (no binarization) to keep activation semantics.
-        _save_npz(os.path.join(path, "mask_logits_fp16.npz"), data=_to_np_fp16(self._mask))
-        _save_npz(os.path.join(path, "sh_mask_logits_fp16.npz"), data=_to_np_fp16(self._sh_mask))
-        # VM parameters (3 planes + 3 lines) stored in FP16 to avoid implicit attribute drift.
-        geo_enc = getattr(self._grid, 'geo_encoder', None)
-        if geo_enc is not None and hasattr(geo_enc, 'plane_xy'):
-            _save_npz(os.path.join(path, "vm_planes_fp16.npz"),
-                      plane_xy=_to_np_fp16(geo_enc.plane_xy),
-                      plane_xz=_to_np_fp16(geo_enc.plane_xz),
-                      plane_yz=_to_np_fp16(geo_enc.plane_yz),
-                      line_z=_to_np_fp16(geo_enc.line_z),
-                      line_y=_to_np_fp16(geo_enc.line_y),
-                      line_x=_to_np_fp16(geo_enc.line_x))
-        # Alignment / projection / channel_scale stored FP16 for quality.
-        alignment_save = {}
-        if hasattr(self._grid, 'linear_align'):
-            alignment_save['linear_align_weight'] = _to_np_fp16(self._grid.linear_align.weight)
-        if hasattr(self._grid, 'channel_scale'):
-            alignment_save['channel_scale'] = _to_np_fp16(self._grid.channel_scale)
-        if geo_enc is not None and hasattr(geo_enc, 'projection'):
-            alignment_save['projection_weight'] = _to_np_fp16(geo_enc.projection.weight)
-            alignment_save['projection_bias'] = _to_np_fp16(geo_enc.projection.bias)
-        if alignment_save:
-            _save_npz(os.path.join(path, "alignment_fp16.npz"), **alignment_save)
-        # Hash encoder params stored FP16 for quality.
-        if hasattr(self._grid, 'hash_encoder'):
-            _save_npz(os.path.join(path, "hash_encoder_fp16.npz"),
-                      params=_to_np_fp16(self._grid.hash_encoder.params))
-        # Tinycudann heads stored FP16, no quantization.
-        _save_npz(os.path.join(path, "mlps_fp16.npz"),
-                  opacity=_to_np_fp16(self._opacity_head.state_dict()['params']),
-                  scaling=_to_np_fp16(self._scaling_head.state_dict()['params']),
-                  rotation=_to_np_fp16(self._rotation_head.state_dict()['params']),
-                  features_rest=_to_np_fp16(self._features_rest_head.state_dict()['params']),
-                  opacity_numel=np.array([self._opacity_head.state_dict()['params'].numel()]),
-                  scaling_numel=np.array([self._scaling_head.state_dict()['params'].numel()]),
-                  rotation_numel=np.array([self._rotation_head.state_dict()['params'].numel()]),
-                  features_rest_numel=np.array([self._features_rest_head.state_dict()['params'].numel()]))
+        # (FP16 artifacts removed for size efficiency; only legacy quantized files are saved)
 
         # -------- Legacy quantized artifacts (kept for backward compatibility) --------
         f_dc_quant, f_dc_scale, f_dc_min = quantize(f_dc, bit=8)
@@ -2180,33 +2128,19 @@ class GaussianModel:
             _strict_assign(geo_enc.plane_xy, _np_to_torch(vm_npz['plane_xy'], device='cuda', dtype=torch.float16), "plane_xy", vm_planes_fp16_path)
             _strict_assign(geo_enc.plane_xz, _np_to_torch(vm_npz['plane_xz'], device='cuda', dtype=torch.float16), "plane_xz", vm_planes_fp16_path)
             _strict_assign(geo_enc.plane_yz, _np_to_torch(vm_npz['plane_yz'], device='cuda', dtype=torch.float16), "plane_yz", vm_planes_fp16_path)
-            # Lines may be absent in older checkpoints — only restore if present
-            if 'line_z' in vm_npz:
-                _strict_assign(geo_enc.line_z, _np_to_torch(vm_npz['line_z'], device='cuda', dtype=torch.float16), "line_z", vm_planes_fp16_path)
-                _strict_assign(geo_enc.line_y, _np_to_torch(vm_npz['line_y'], device='cuda', dtype=torch.float16), "line_y", vm_planes_fp16_path)
-                _strict_assign(geo_enc.line_x, _np_to_torch(vm_npz['line_x'], device='cuda', dtype=torch.float16), "line_x", vm_planes_fp16_path)
 
-        # Alignment / projection / channel_scale FP16 override
+        # GeoEncoder projection FP16 override
         alignment_fp16_path = os.path.join(path, 'alignment_fp16.npz')
-        if os.path.exists(alignment_fp16_path):
+        if os.path.exists(alignment_fp16_path) and geo_enc is not None and hasattr(geo_enc, 'projection'):
             al_npz = _load_npz(alignment_fp16_path)
-            if hasattr(self._grid, 'linear_align') and 'linear_align_weight' in al_npz:
-                _strict_assign(self._grid.linear_align.weight,
-                               _np_to_torch(al_npz['linear_align_weight'], device='cuda', dtype=torch.float16),
-                               "linear_align.weight", alignment_fp16_path)
-            if hasattr(self._grid, 'channel_scale') and 'channel_scale' in al_npz:
-                _strict_assign(self._grid.channel_scale,
-                               _np_to_torch(al_npz['channel_scale'], device='cuda', dtype=torch.float16),
-                               "channel_scale", alignment_fp16_path)
-            if geo_enc is not None and hasattr(geo_enc, 'projection'):
-                if 'projection_weight' in al_npz:
-                    _strict_assign(geo_enc.projection.weight,
-                                   _np_to_torch(al_npz['projection_weight'], device='cuda', dtype=torch.float16),
-                                   "projection.weight", alignment_fp16_path)
-                if 'projection_bias' in al_npz:
-                    _strict_assign(geo_enc.projection.bias,
-                                   _np_to_torch(al_npz['projection_bias'], device='cuda', dtype=torch.float16),
-                                   "projection.bias", alignment_fp16_path)
+            if 'projection_weight' in al_npz:
+                _strict_assign(geo_enc.projection.weight,
+                               _np_to_torch(al_npz['projection_weight'], device='cuda', dtype=torch.float16),
+                               "projection.weight", alignment_fp16_path)
+            if 'projection_bias' in al_npz:
+                _strict_assign(geo_enc.projection.bias,
+                               _np_to_torch(al_npz['projection_bias'], device='cuda', dtype=torch.float16),
+                               "projection.bias", alignment_fp16_path)
 
         # Hash encoder params FP16 override
         hash_fp16_path = os.path.join(path, 'hash_encoder_fp16.npz')

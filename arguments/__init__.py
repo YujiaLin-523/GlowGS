@@ -82,15 +82,15 @@ class ModelParams(ParamGroup):
         self.hash_size = 19          # log2_hashmap_size: 19 → 512K entries (balance of size/quality)
         self.width = 64              # MLP hidden width
         self.depth = 2               # MLP depth
-        # GeoEncoder (VM decomposition) parameters
-        self.geo_resolution = 128    # VM initial resolution
-        self.geo_rank = 48           # VM rank (increased for sum aggregation)
-        self.geo_channels = 32       # VM output feature channels
+        # GeoEncoder (tri-plane) parameters
+        self.geo_resolution = 96     # Tri-plane resolution (96×96)
+        self.geo_rank = 12           # Low-rank factorisation rank
+        self.geo_channels = 8        # Output feature channels
         
         # ── Three ablation switches (unified, --flag True/False) ──
         self.enable_vm = True              # VM tri-plane branch in encoder
-        self.enable_mass_aware = True      # Mass-aware densification gating
-        self.enable_edge_loss = True       # Edge-aware gradient loss
+        self.enable_mass_aware = False     # Mass-aware densification gating (default off for baseline)
+        self.enable_edge_loss = False      # Edge-aware gradient loss (default off for baseline)
         
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -156,7 +156,7 @@ class OptimizationParams(ParamGroup):
         # others
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
-        self.lambda_mask = 0.001
+        self.lambda_mask = 0.004
         self.lambda_sh_mask = 0.0001
         
         # Densification schedule (LocoGS defaults)
@@ -165,15 +165,8 @@ class OptimizationParams(ParamGroup):
         self.densify_from_iter = 500        # start densification after warmup
         self.densify_until_iter = 15_000    # LocoGS: 15K (stop densification)
         
-        # Mass-Aware Gate (GlowGS innovation: block large & transparent from clone/split)
-        # This prevents "garbage duplication" - copying volumetric blobs that occlude fine details
-        # Gate only affects clone/split selection, NOT pruning (safe: cannot cause point collapse)
-        self.enable_mass_gate = True              # Master switch for Mass Gate in clone/split
-        self.mass_gate_opacity_threshold = 0.3    # Opacity below this = transparent (candidate for blocking)
-        self.mass_gate_radius_percentile = 80.0   # Radius above this percentile = large (candidate for blocking)
-        
         # densify_grad_threshold: gradient magnitude to trigger clone/split
-        self.densify_grad_threshold = 0.0004
+        self.densify_grad_threshold = 0.0002
         
         # Pruning thresholds (LocoGS defaults)
         # min_opacity: prune Gaussians with opacity below this (LocoGS: 0.005 in train.py)
@@ -246,9 +239,9 @@ def get_combined_args(parser : ArgumentParser):
     
     # Ensure GeoEncoder parameters have defaults
     geo_defaults = {
-        'geo_resolution': 128,
-        'geo_rank': 48,
-        'geo_channels': 32,
+        'geo_resolution': 96,
+        'geo_rank': 12,
+        'geo_channels': 8,
     }
     for key, default_val in geo_defaults.items():
         if key not in merged_dict:

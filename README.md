@@ -117,7 +117,7 @@ Control three key innovations via CLI switches (all default **True**):
 | Parameter | Disable | Default | Description |
 |-----------|---------|---------|-------------|
 | `--enable_vm` | `--enable_vm False` | True | VM tri-plane geometry branch in encoder |
-| `--enable_mass_aware` | `--enable_mass_aware False` | True | Mass-aware densification (gate + prune + budget) |
+| `--enable_mass_aware` | `--enable_mass_aware False` | True | Mass-aware densification (prune + budget) |
 | `--enable_edge_loss` | `--enable_edge_loss False` | True | Edge-aware gradient supervision |
 
 ### Examples
